@@ -10,6 +10,9 @@ final class AppModel {
 
     let monitor = StatusMonitor()
     let client = BitJitaClient()
+    /// Live passive crafts + plants via BitJita's SpacetimeDB relay. While
+    /// live, the REST poll for those is ignored (it lags behind).
+    let relay = RelayFeed()
     let experience: ExperienceTracker
     let stamina: StaminaTracker
     let satiation: SatiationTracker
@@ -74,6 +77,12 @@ final class AppModel {
         client.onEvent = { [weak self] channel, data in
             self?.route(channel: channel, data: data)
         }
+        relay.onPassiveCrafts = { [weak self] crafts in
+            self?.passiveCrafts.update(crafts: crafts)
+        }
+        relay.onPlants = { [weak self] plants in
+            self?.applyPlants(plants)
+        }
         setUpNotifications()
         connect()
         evaluate()
@@ -94,6 +103,7 @@ final class AppModel {
         crafts.reset()
         plants.reset()
         passiveCrafts.reset()
+        relay.stop()
         reportedSignedIn = nil
         lastLiveEventAt = nil
         isOffline = false
@@ -268,6 +278,9 @@ final class AppModel {
             let player = try await BitJitaAPI.player(id: userId)
             guard !Task.isCancelled, self.userId == userId else { return }
             reportedSignedIn = player.signedIn
+            if let region = player.regionId {
+                relay.start(userId: userId, region: region)
+            }
             reconnectIfFeedStale()
             if username != player.username { setUsername(player.username) }
             evaluate()
@@ -303,24 +316,37 @@ final class AppModel {
     private func refreshPlaceables(userId: String) async {
         do {
             let placeables = try await BitJitaAPI.placeables(userId: userId)
-            guard !Task.isCancelled else { return }
-            // Growing plants without a reported end time: look up the crop's
-            // growth duration once, for an estimate.
-            for id in plants.missingDurations(in: placeables) {
-                if let duration = try? await BitJitaAPI.placeable(id: id).growthDuration {
-                    plants.setGrowthDuration(duration, for: id)
-                }
-            }
-            plants.update(from: placeables)
+            guard !Task.isCancelled, !relay.isLive else { return }
+            applyPlants(placeables.instances.map(PlantTracker.Plant.init))
         } catch {
             print("Failed to fetch placeables: \(error)")
         }
     }
 
+    /// Growing plants without a reported end time: look up the crop's growth
+    /// duration once (catalog), for an estimate; then apply.
+    private func applyPlants(_ list: [PlantTracker.Plant]) {
+        plants.update(plants: list)
+        let missing = plants.missingDurations(in: list)
+        guard !missing.isEmpty else { return }
+        Task { [weak self] in
+            var found = false
+            for id in missing {
+                if let duration = try? await BitJitaAPI.placeable(id: id).growthDuration {
+                    self?.plants.setGrowthDuration(duration, for: id)
+                    found = true
+                }
+            }
+            if found { self?.plants.update(plants: list) }
+        }
+    }
+
     private func refreshPassiveCrafts(userId: String) async {
+        // Fed live by the relay; skip the (slow) request.
+        guard !relay.isLive else { return }
         do {
             let passive = try await BitJitaAPI.passiveCrafts(userId: userId)
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, !relay.isLive else { return }
             // Duration per recipe: looked up once via the crafted item.
             for missing in passiveCrafts.missingDurations(in: passive) {
                 if let item = try? await BitJitaAPI.item(id: missing.itemId),

@@ -287,10 +287,17 @@ struct StatusPanelView: View {
     }
 
     private var connectionText: String {
-        switch model.client.state {
+        let live: String = switch model.client.state {
         case .connected: "Connected"
         case .connecting: "Connecting…"
         case .disconnected: "Disconnected"
         }
+        // Passive crafts + plants: live via the relay, or polled.
+        let relay: String = switch model.relay.state {
+        case .live: " · relay"
+        case .connecting: " · relay…"
+        case .off, .unavailable: ""
+        }
+        return live + relay
     }
 }

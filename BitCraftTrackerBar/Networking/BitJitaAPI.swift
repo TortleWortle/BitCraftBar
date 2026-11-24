@@ -96,6 +96,8 @@ enum BitJitaAPI {
         let entityId: String
         let username: String
         let signedIn: Bool?
+        /// Region the character is in (BitCraft region id, e.g. 14).
+        let regionId: Int?
 
         var id: String { entityId }
     }

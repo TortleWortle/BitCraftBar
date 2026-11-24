@@ -144,6 +144,7 @@ Networking/
   BitJitaClient.swift  Websocket: subscribe, dynamic subscribe, reconnect w/ backoff,
                        keepalive ping, reconnect on wake / network change
   BitJitaMessages.swift  Websocket message types + channel names
+  RelayFeed.swift      Live passive crafts + plants via BitJita's SpacetimeDB relay
   BitJitaAPI.swift     REST: /players?q=, /players/<id>, /crafts, /passive-crafts,
                        /stats, /placeables, /items/<id>,
                        /placeables/<placeableId>; BitJitaDate (flexible timestamps)
@@ -216,6 +217,50 @@ Views/
   `players/<id>` if missing). Default `userId` is the original user's character.
 
 ## Data sources (BitJita)
+
+### SpacetimeDB relay (passive crafts + plants, live)
+
+BitCraft runs on SpacetimeDB. BitJita runs a read-only relay ("BITCONNECT",
+https://relay.bitjita.com) that mirrors it; **no account or BitCraft token**
+(the relay issues its own identities; connecting without one works too).
+Unofficial, no published terms/limits; could change without notice, hence the
+REST fallback. Connecting to Clockwork's own SpacetimeDB with the player's
+game token was rejected: account risk, and the relay has the same data.
+
+- `wss://relay.bitjita.com/v1/database/idc-<region>/subscribe`, websocket
+  subprotocol `v1.json.spacetimedb`. One database per region; region = the
+  player's `regionId` from `players/<id>`. Mirrored: idc-global and
+  7, 8, 9, 12, 13, 14, 17, 18, 19 (others: `SubscriptionError` → REST,
+  retried every 5 min). While the relay restarts it refuses with "module is
+  still loading its initial state from upstream; retry shortly" (`/healthz`
+  503, observed for 8+ min); that's retried with the normal backoff. Placeables/crafts in a different region than the player is in are
+  not seen.
+- Protocol: send `{"Subscribe":{"query_strings":[SQL…],"request_id":1}}`
+  (replaces the whole set; also used to add lookups) → `InitialSubscription`
+  (all current rows) → `TransactionUpdate`s (`deletes` + `inserts` per table).
+  Rows are JSON strings of arrays in column order; sums `[tag, payload]`,
+  timestamps `[micros]`. Joins (`SELECT a.* FROM a JOIN b ON … WHERE …`)
+  work and can repeat a row once per match → row store is ref-counted.
+  `LIMIT` / HTTP `/sql` aren't available. Schema:
+  `GET /v1/database/idc-14/schema?version=9`.
+- Tables used (column indices in `RelayFeed`): `passive_craft_state`
+  (entity, owner, recipe_id, building_entity_id, timestamp, status
+  Queued/Processing/Complete, slot), `crafting_recipe_desc` (name,
+  time_requirement = duration, crafted_item_stacks), `item_desc`,
+  `building_state` → `building_desc` (names), `placeable_state` (owner,
+  placeable_id) → `placeable_desc` (name, tag, tier), `growth_state`
+  (end_timestamp; empty for crops when checked).
+- **Private** (subscribe error): `passive_craft_timer`, so passive end times
+  are still start + recipe duration. Processing crafts run in parallel slots
+  (`slot = some(n)`); a `Queued` craft is shown without an end time until it
+  turns Processing. No Queued rows were seen in region 14.
+- Crop growth start isn't stored; it's recorded when a plant is seen
+  switching to `Growing …` live (estimate `~` = that + catalog duration). Plants
+  already growing at launch have no time left.
+- While the relay is live (`RelayFeed.isLive`), the REST passive-crafts and
+  placeables results are ignored. Popover header shows `· relay`.
+
+### BitJita live websocket and REST
 
 Websocket `wss://live.bitjita.com/`, subscribe with
 `{"type":"subscribe","channels":[...]}`. Server acks with

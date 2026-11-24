@@ -7,6 +7,8 @@ import Observation
 /// time is computed as start + the recipe's `timeRequirement` (looked up once
 /// per recipe via the crafted item). A craft counts as finished when BitJita
 /// says `complete` or when its computed end time has passed.
+///
+/// Fed by the live relay (`RelayFeed`) when available, else the REST poll.
 @Observable
 final class PassiveCraftTracker {
     struct Craft: Identifiable {
@@ -101,10 +103,11 @@ final class PassiveCraftTracker {
         durations[recipeId] = duration
     }
 
+    /// From the REST endpoint (durations from `setDuration`).
     func update(from response: BitJitaAPI.PassiveCraftsResponse, now: Date = .now) {
         let itemNames = Dictionary(response.items.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
 
-        crafts = response.craftResults.map { result in
+        let crafts = response.craftResults.map { result in
             let itemId = result.craftedItem.first?.itemId
             let itemName = itemId.flatMap { itemNames[$0] }
             return Craft(
@@ -118,6 +121,12 @@ final class PassiveCraftTracker {
                 duration: durations[result.recipeId]
             )
         }
+        update(crafts: crafts, now: now)
+    }
+
+    /// Replace the craft list (from either source).
+    func update(crafts: [Craft], now: Date = .now) {
+        self.crafts = crafts
 
         if !hasLoaded {
             // Already finished before we started watching: don't notify.

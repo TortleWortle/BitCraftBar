@@ -155,7 +155,7 @@ final class BitJitaClient {
 
     /// Pings until cancelled. If a pong doesn't arrive in time, cancels the
     /// socket, which makes `receive()` throw and the run loop reconnect.
-    private static func keepAlive(_ socket: URLSessionWebSocketTask) async {
+    static func keepAlive(_ socket: URLSessionWebSocketTask) async {
         while !Task.isCancelled {
             try? await Task.sleep(for: pingInterval)
             guard !Task.isCancelled else { return }

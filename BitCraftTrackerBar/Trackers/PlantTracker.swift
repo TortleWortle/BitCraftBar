@@ -6,7 +6,8 @@ import Observation
 /// Crop lifecycle (from the BitJita placeable catalog):
 /// `Planted …` → (Fertilizer) → `Fertilized Planted …` → (Water) →
 /// `Growing …` (timer) → `Grown …`.
-/// Data comes from the REST placeables endpoint (polled).
+/// Data comes from the live relay (`RelayFeed`) when available, else the REST
+/// placeables endpoint (polled).
 @Observable
 final class PlantTracker {
     enum Stage {
@@ -32,6 +33,39 @@ final class PlantTracker {
         var isAllGrown: Bool { total > 0 && grown == total }
         /// When the last growing plant in this tier is done.
         var allGrownAt: Date? { growthEnds.max() }
+    }
+
+    /// One placeable, from either source.
+    struct Plant {
+        let placeableId: Int
+        let name: String
+        let tier: Int
+        /// Lowercased verb phrases of the available interactions (REST only).
+        let interactions: Set<String>
+        let reportedEnd: Date?
+        /// When it started growing, if known (for the estimate).
+        let startedGrowingAt: Date?
+
+        init(placeableId: Int, name: String, tier: Int, interactions: Set<String>, reportedEnd: Date?, startedGrowingAt: Date?) {
+            self.placeableId = placeableId
+            self.name = name
+            self.tier = tier
+            self.interactions = interactions
+            self.reportedEnd = reportedEnd
+            self.startedGrowingAt = startedGrowingAt
+        }
+
+        /// REST instance. Assumes `updatedAt` is when it started growing.
+        init(_ instance: BitJitaAPI.PlaceablesResponse.Instance) {
+            self.init(
+                placeableId: instance.placeableId,
+                name: instance.placeable.name,
+                tier: instance.placeable.tier,
+                interactions: Set((instance.availableInteractions ?? []).map { $0.verbPhrase.lowercased() }),
+                reportedEnd: (instance.growthEndTimestamp ?? instance.nextStateAt)?.date,
+                startedGrowingAt: instance.updatedAt?.date
+            )
+        }
     }
 
     private(set) var tiers: [TierSummary] = []
@@ -70,13 +104,14 @@ final class PlantTracker {
     /// Placeable ids of growing plants with no reported end time and no
     /// cached duration; fetch these from the catalog and pass them to
     /// `setGrowthDuration`.
-    func missingDurations(in response: BitJitaAPI.PlaceablesResponse) -> Set<Int> {
-        Set(response.instances.compactMap { instance in
-            guard Self.stage(of: instance) == .growing,
-                  Self.reportedEnd(of: instance) == nil,
-                  growthDurations[instance.placeableId] == nil
+    func missingDurations(in plants: [Plant]) -> Set<Int> {
+        Set(plants.compactMap { plant in
+            guard Self.stage(of: plant) == .growing,
+                  plant.reportedEnd == nil,
+                  plant.startedGrowingAt != nil,
+                  growthDurations[plant.placeableId] == nil
             else { return nil }
-            return instance.placeableId
+            return plant.placeableId
         })
     }
 
@@ -84,11 +119,11 @@ final class PlantTracker {
         growthDurations[placeableId] = duration
     }
 
-    func update(from response: BitJitaAPI.PlaceablesResponse) {
+    func update(plants: [Plant]) {
         var byTier: [Int: TierSummary] = [:]
-        for instance in response.instances {
-            guard let stage = Self.stage(of: instance) else { continue }
-            let tier = instance.placeable.tier
+        for plant in plants {
+            guard let stage = Self.stage(of: plant) else { continue }
+            let tier = plant.tier
             var summary = byTier[tier] ?? TierSummary(tier: tier)
             summary.total += 1
             switch stage {
@@ -97,11 +132,10 @@ final class PlantTracker {
             case .grown: summary.grown += 1
             case .growing:
                 summary.growing += 1
-                if let end = Self.reportedEnd(of: instance) {
+                if let end = plant.reportedEnd {
                     summary.growthEnds.append(end)
-                } else if let duration = growthDurations[instance.placeableId],
-                          let start = instance.updatedAt?.date {
-                    // Estimate: assumes `updatedAt` is when it started growing.
+                } else if let duration = growthDurations[plant.placeableId],
+                          let start = plant.startedGrowingAt {
                     summary.growthEnds.append(start.addingTimeInterval(duration))
                     summary.isEstimate = true
                 }
@@ -123,14 +157,10 @@ final class PlantTracker {
         hasLoaded = true
     }
 
-    static func reportedEnd(of instance: BitJitaAPI.PlaceablesResponse.Instance) -> Date? {
-        (instance.growthEndTimestamp ?? instance.nextStateAt)?.date
-    }
-
     /// Crop stage, or nil if this placeable isn't a crop.
-    static func stage(of instance: BitJitaAPI.PlaceablesResponse.Instance) -> Stage? {
-        let name = instance.placeable.name
-        let verbs = Set((instance.availableInteractions ?? []).map { $0.verbPhrase.lowercased() })
+    static func stage(of plant: Plant) -> Stage? {
+        let name = plant.name
+        let verbs = plant.interactions
 
         if name.hasPrefix("Grown ") { return .grown }
         if name.hasPrefix("Growing ") { return .growing }
