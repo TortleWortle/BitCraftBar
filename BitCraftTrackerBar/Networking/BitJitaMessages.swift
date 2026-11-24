@@ -42,6 +42,22 @@ struct SatiationState: Decodable {
     let timestamp: Int64
 }
 
+/// `character_stats_state:<entity_id>`: same `values` array as the REST
+/// `players/<id>/stats`. Only sent when a stat changes (e.g. gear swap).
+struct CharacterStatsState: Decodable {
+    let values: [Double]
+
+    /// Stat id 1 = "Maximum Stamina" (see `BitJitaAPI.StatsResponse`).
+    var maxStamina: Double? {
+        values.indices.contains(1) ? values[1] : nil
+    }
+
+    /// Stat id 19 = max satiation.
+    var maxSatiation: Double? {
+        values.indices.contains(19) ? values[19] : nil
+    }
+}
+
 /// `progressive_action_state:<craft_entity_id>`, one event per craft action.
 struct ProgressiveActionState: Decodable {
     let entityId: String
@@ -55,6 +71,7 @@ enum BitJitaChannel {
     static func experience(_ userId: String) -> String { "experience_state:\(userId)" }
     static func stamina(_ userId: String) -> String { "stamina_state:\(userId)" }
     static func satiation(_ userId: String) -> String { "satiation_state:\(userId)" }
+    static func characterStats(_ userId: String) -> String { "character_stats_state:\(userId)" }
     static let craftPrefix = "progressive_action_state:"
     static func craft(_ craftId: String) -> String { craftPrefix + craftId }
 }

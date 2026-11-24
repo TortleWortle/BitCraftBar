@@ -4,7 +4,11 @@ import SwiftUI
 /// The item shown in the macOS menu bar:
 /// a status-colored ring around a stamina pie in the same color, then the last skill,
 /// craft percentage, plant summary (after a dash) and any active issues.
+/// While loading: an orange (warning) empty ring and "Loading…".
+/// Offline: only the issues (red "Offline" first), no skill/craft/plants.
 struct MenuBarLabel: View {
+    var isLoading = false
+    var isOffline = false
     let status: HealthStatus
     let staminaFraction: Double?
     let skillName: String?
@@ -15,11 +19,28 @@ struct MenuBarLabel: View {
     var body: some View {
         // Menu bar labels are template-rendered (monochrome) and ignore most
         // SwiftUI layout, so draw everything into one non-template NSImage.
-        Image(nsImage: Self.render(
-            status: status,
-            staminaFraction: staminaFraction,
-            text: Self.text(skillName: skillName, craftPercent: craftPercent, plantSummary: plantSummary, issues: issues)
-        ))
+        if isLoading {
+            Image(nsImage: Self.render(
+                color: HealthStatus.warning.nsColor,
+                staminaFraction: 0,
+                text: NSAttributedString(string: "Loading…", attributes: [
+                    .font: NSFont.menuBarFont(ofSize: 0),
+                    .foregroundColor: HealthStatus.warning.nsColor,
+                ])
+            ))
+        } else if isOffline {
+            Image(nsImage: Self.render(
+                color: status.nsColor,
+                staminaFraction: staminaFraction,
+                text: Self.text(skillName: nil, craftPercent: nil, issues: issues)
+            ))
+        } else {
+            Image(nsImage: Self.render(
+                color: status.nsColor,
+                staminaFraction: staminaFraction,
+                text: Self.text(skillName: skillName, craftPercent: craftPercent, plantSummary: plantSummary, issues: issues)
+            ))
+        }
     }
 
     static func text(skillName: String?, craftPercent: String?, plantSummary: String? = nil, issues: [StatusMonitor.Report]) -> NSAttributedString {
@@ -27,7 +48,7 @@ struct MenuBarLabel: View {
         let result = NSMutableAttributedString()
         let separator = NSAttributedString(
             string: " · ",
-            attributes: [.font: font, .foregroundColor: NSColor.secondaryLabelColor]
+            attributes: [.font: font, .foregroundColor: NSColor.labelColor]
         )
         func append(_ string: String, _ color: NSColor, font: NSFont = font, separated: Bool = true) {
             if separated, result.length > 0 { result.append(separator) }
@@ -57,6 +78,10 @@ struct MenuBarLabel: View {
     }
 
     static func render(status: HealthStatus, staminaFraction: Double?, text: NSAttributedString) -> NSImage {
+        render(color: status.nsColor, staminaFraction: staminaFraction, text: text)
+    }
+
+    static func render(color: NSColor, staminaFraction: Double?, text: NSAttributedString) -> NSImage {
         let diameter: CGFloat = 16
         let ringWidth: CGFloat = 1.5
         let gap: CGFloat = 1.5
@@ -69,8 +94,6 @@ struct MenuBarLabel: View {
         // light/dark menu bar.
         let image = NSImage(size: NSSize(width: width, height: height), flipped: false) { _ in
             let outer = NSRect(x: 0, y: (height - diameter) / 2, width: diameter, height: diameter)
-
-            let color = status.nsColor
 
             // Status ring.
             let ring = NSBezierPath(ovalIn: outer.insetBy(dx: ringWidth / 2, dy: ringWidth / 2))

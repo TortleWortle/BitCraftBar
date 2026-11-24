@@ -45,6 +45,11 @@ enum BitJitaAPI {
         var maxStamina: Double? {
             stats.values.indices.contains(1) ? stats.values[1] : nil
         }
+
+        /// Stat id 19 ("maxSatiation" in BitJita's frontend stat list).
+        var maxSatiation: Double? {
+            stats.values.indices.contains(19) ? stats.values[19] : nil
+        }
     }
 
     /// Player's placeables (crops, sift collectors, ...).

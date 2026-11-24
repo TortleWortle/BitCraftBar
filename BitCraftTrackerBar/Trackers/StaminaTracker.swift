@@ -1,13 +1,10 @@
 import Foundation
 import Observation
 
-/// Tracks stamina, when it last regenerated, and an estimate of max stamina.
-/// Reports `.warning` to the status monitor when stamina drops below `lowThreshold`.
+/// Tracks stamina, when it last regenerated/drained, and max stamina.
+/// Purely a data source; status rules live in the checks (see `ActivityCheck`).
 @Observable
 final class StaminaTracker {
-    static let source = "Stamina"
-
-    let lowThreshold: Double
     /// Fallback when max stamina hasn't been loaded from the API: estimate it
     /// as the highest value seen within this window.
     let maxWindow: TimeInterval
@@ -37,11 +34,8 @@ final class StaminaTracker {
     var isFull: Bool { isAtLeast(1) }
 
     @ObservationIgnored private var samples: [(date: Date, value: Double)] = []
-    @ObservationIgnored private let monitor: StatusMonitor
 
-    init(monitor: StatusMonitor, lowThreshold: Double = 10, maxWindow: TimeInterval = 10 * 60) {
-        self.monitor = monitor
-        self.lowThreshold = lowThreshold
+    init(maxWindow: TimeInterval = 10 * 60) {
         self.maxWindow = maxWindow
     }
 
@@ -52,7 +46,6 @@ final class StaminaTracker {
         lastRegenAt = nil
         lastDrainAt = nil
         samples = []
-        monitor.clear(Self.source)
     }
 
     func handle(_ state: StaminaState, at now: Date = .now) {
@@ -64,12 +57,6 @@ final class StaminaTracker {
         stamina = state.stamina
         samples.append((now, state.stamina))
         updateMax(now: now)
-
-        if state.stamina < lowThreshold {
-            monitor.report(Self.source, .warning, "Low stamina (\(Int(state.stamina)))")
-        } else {
-            monitor.report(Self.source, .healthy, "Stamina \(Int(state.stamina))")
-        }
     }
 
     func hasRegenerated(within window: TimeInterval, now: Date = .now) -> Bool {

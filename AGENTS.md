@@ -21,7 +21,7 @@ while the user is AFK-crafting/gathering, without tabbing into the game.
 **Menu bar label** (drawn as a single non-template `NSImage`):
 
 ```
-(◔) Leatherworking 22% — T2 grown; T1 needs water · Low stamina (7)
+(◔) Leatherworking 22% — T2 grown; T1 needs water · Resting
 ```
 
 1. **Status indicator**: a thin ring in the overall status color, around a
@@ -40,10 +40,23 @@ while the user is AFK-crafting/gathering, without tabbing into the game.
 5. **Active issues**: messages of all non-healthy status reports, colored by
    severity, worst first, separated by `·`.
 
+**Offline**: when the character is signed out of BitCraft, a `Player`
+report goes **alert / "Offline"** (red ring, red `Offline` in the label; user
+asked for red). The label then shows **only the issues**: no skill, craft or
+plant summary (user asked to hide plants while offline). Going offline is an
+error-state notification (the report is `healthy / Online` while online, so
+it's a transition). Activity and Satiation reports are **cleared** while
+offline (idling offline isn't a problem, and clearing means coming back online
+is a "first report", so it never notifies). Detection: BitJita's
+`players/<id>` `signedIn` (polled every 60s), overridden to *online* by any
+live websocket event in the last 30s, since `signedIn` can lag. Unknown
+`signedIn` counts as online.
+
 **Popover panel**: overall status + per-source reports, stamina bar with
 `current / max`, total XP, last skill, last gain, list of crafts (progress
 bar, percent, Paused/Done), plants, character picker, Quit. The stats grid
-also shows satiation (red at/below the alert threshold).
+also shows a **satiation bar** like the stamina bar, `current / max`
+(green, red at/below the alert threshold).
 
 Passive crafts section: grouped by building + item, with running count, time
 until the whole group is done, and how many are ready to collect. Running
@@ -61,11 +74,25 @@ Colors: green = healthy, orange = warning, red = alert. Overall = worst report.
 
 | Source | Condition | Status | Message |
 |---|---|---|---|
-| Activity | no counting XP, stamina "ready" (API max known) | alert | Idle: stamina full / Idle: stamina above N% |
+| Activity | last action was a craft and it completed | warning | Craft finished |
+| Activity | no counting XP, stamina "ready" (API max known) | alert | Idle: stamina full / Idle: stamina above N% (or Craft idle (N%) if the last action was an unfinished craft) |
 | Activity | stamina regenerating (immediately, even with recent XP) | warning | Resting |
 | Activity | counting XP | healthy | Gaining experience |
+| Activity | last action was an unfinished craft, no XP, no regen | alert | Craft idle (N%) |
 | Activity | no XP, no regen in 10s (= no food active) | alert | Idle: no XP, no regen |
 | Activity | nothing received yet | alert | No XP or regen yet |
+
+**Craft rules** (user request: yellow when a craft just finished, red when
+the last craft still needs progress but you're idle). "Last action was a
+craft" = `CraftTracker.lastWorkedCraft` (last craft with live progress, kept
+after completion since REST drops completed crafts) progressed no more than
+5s before the last XP gain. XP later than that means you moved on (e.g. a new
+craft REST hasn't discovered yet), and the normal rules apply. "Craft
+finished" stays until then; resting during an unfinished craft is still
+"Resting".
+
+There is **no low-stamina warning** (removed): you run out of stamina exactly
+when you stop to regenerate, so it only duplicated "Resting".
 
 Rows are checked top to bottom. **Counting XP** = XP gained in the last 20s
 *and* after stamina last went up: XP while regenerating is improbable (user's
@@ -73,8 +100,8 @@ rule), so once regen starts, earlier XP no longer means "active".
 **Regenerating** = stamina went up in the last 10s and hasn't gone down since
 (`StaminaTracker.isRegenerating`); spending stamina ends it immediately, so
 resuming work flips straight back to green.
-| Stamina | stamina < 10 | warning | Low stamina (N) |
 | Satiation | satiation ≤ 15 | alert | Low satiation (N) |
+| Player | signed out / signed in | alert / healthy | Offline / Online |
 | Connection | connected / connecting / disconnected | healthy / warning / alert | Connected / Connecting… / Disconnected |
 
 "Ready" depends on the last skill that gained XP (`ActivityCheck.readyFractionBySkill`):
@@ -114,14 +141,15 @@ Status/
   HealthStatus.swift   healthy < warning < alert (Comparable) + colors
   StatusMonitor.swift  Keyed reports from independent sources; overall = max
 Networking/
-  BitJitaClient.swift  Websocket: subscribe, dynamic subscribe, reconnect w/ backoff
+  BitJitaClient.swift  Websocket: subscribe, dynamic subscribe, reconnect w/ backoff,
+                       keepalive ping, reconnect on wake / network change
   BitJitaMessages.swift  Websocket message types + channel names
   BitJitaAPI.swift     REST: /players?q=, /players/<id>, /crafts, /passive-crafts,
                        /stats, /placeables, /items/<id>,
                        /placeables/<placeableId>; BitJitaDate (flexible timestamps)
 Trackers/
   ExperienceTracker.swift  XP totals, last gain time/amount/skill (data only)
-  StaminaTracker.swift     stamina, regen time, max stamina; reports low stamina
+  StaminaTracker.swift     stamina, regen/drain times, max stamina (data only)
   SatiationTracker.swift   satiation; reports low satiation
   CraftTracker.swift       crafts from REST + live progress; active craft
   PassiveCraftTracker.swift  passive crafts, computed end times, grouping
@@ -141,6 +169,9 @@ Views/
   indicator shows the worst. Trackers collect data; rules that combine sources
   live in their own check (`ActivityCheck`). Add new warnings by adding a
   report source, not by touching existing ones.
+- **No gray text in the menu bar**: `secondaryLabelColor` is hard to read
+  there (user feedback). Neutral text and `·` separators use `labelColor`;
+  loading uses the warning color.
 - **Menu bar label is one drawn `NSImage`**, not SwiftUI views. MenuBarExtra
   labels are template-rendered (monochrome) and ignore most layout, so colors
   and spacing are only reliable when drawn manually. The image uses a drawing
@@ -154,7 +185,29 @@ Views/
   Channels added while the handshake is in flight are sent right after the
   initial subscribe; previously they were silently dropped, which made active
   crafts show as "Paused".
-- **Reconnect** with exponential backoff 1s → 30s.
+- **Reconnect** with exponential backoff 1s → 30s when send/receive fails.
+- **Silent dead connections** (sleep, Wi-Fi switch) don't make `receive()`
+  fail, so the client also: pings every 15s and reconnects if no pong within
+  10s; reconnects immediately on `NSWorkspace.didWakeNotification`; and
+  reconnects (debounced 2s) when `NWPathMonitor` reports a changed, usable
+  network. Deliberate reconnects (`reconnect()`) show "Connecting…", not
+  "Disconnected", so they don't trigger an error notification.
+- **Stale feed**: BitJita can stop delivering events on a connection that
+  otherwise stays healthy (pings answered), observed after an outage on their
+  side, while a fresh connection gets them. So if `players/<id>` says
+  `signedIn` but no live event arrived for 60s on a connection at least 60s
+  old, the client reconnects (`AppModel.reconnectIfFeedStale`, checked on the
+  60s poll). Relies on satiation updating ~1/s while signed in; a wrong
+  `signedIn` only costs a reconnect per minute.
+- **Loading state** (`AppModel.isLoading`): at launch and after switching
+  character, until the websocket is connected and the core REST requests
+  (crafts, stats, placeables, player) finished, capped at 20s. Menu bar shows an orange
+  (warning) ring + orange "Loading…", the popover a spinner instead of the data sections, and
+  no notifications fire. Typically 1–2s.
+- **REST polling**: every 60s, the requests of a round run **in parallel**.
+  Initial loading doesn't wait for passive crafts: that endpoint sometimes
+  takes ~10s+ (BitJita cache seems cold; fast on repeat), so the popover shows
+  a "Passive crafts — Loading…" placeholder until it arrives.
 - **Character selection** is by username search (`Views/CharacterPicker.swift`),
   not a raw ID field: the panel shows the tracked character's name with a
   *Change* button that opens a debounced (300ms) search. Picking a result
@@ -174,6 +227,7 @@ doesn't prove a channel exists). Events: `{"type":"event","channel":...,"data":{
 | `experience_state:<player id>` | `experience_stacks[{skill_id, quantity}]` | **No snapshot on subscribe**, only updates. First update counts as a gain (no baseline); skill is known from the second update on. |
 | `stamina_state:<player id>` | `stamina` (Double) | ~1/s while regenerating. **Stops sending when full.** |
 | `satiation_state:<player id>` | `satiation` (Double) | ~1/s while it changes (slowly decreasing). |
+| `character_stats_state:<player id>` | `values[1]` = max stamina | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe, so the REST poll still provides the initial value. Keeps max stamina in sync between polls. |
 | `progressive_action_state:<craft entity id>` | `progress`, `entity_id` | One event per craft action (+ a duplicate `preparation: true` event). |
 
 REST `https://bitjita.com/api/`:
@@ -183,19 +237,23 @@ REST `https://bitjita.com/api/`:
 | `players/<id>/crafts` | Craft list: `entityId`, `progress`, `totalActionsRequired`, `completed`, `craftedItem[].item_id` → `items[].name`, `buildingName`. Polled every 60s to discover new crafts. |
 | `players/<id>/passive-crafts` | Passive crafts (tanning tub, kiln, smelter, loom, ...). Same envelope as crafts (`craftResults`, `items`) but each result only has `entityId`, `buildingName`, `recipeId`, `recipeName` (e.g. `"Weave {0}"`, `{0}` = item), `status`, start `timestamp`, `craftedItem`, `slot`. **No progress or end time.** Only `status: "complete"` has been observed; any other value is treated as running. Completed crafts stay listed until collected. Polled every 60s. |
 | `items/<itemId>` | `craftingRecipes[]` with `id`, `timeRequirement` (seconds), `isPassive`. Used to get a passive recipe's **duration** (e.g. Weave Rough Cloth Strip = 180s); end = start `timestamp` + duration. Looked up once per recipe. |
-| `players/<id>/stats` | `stats.values[1]` = **max stamina** (stat id 1 is named "Maximum Stamina" in `players/<id>/equipment`). Polled every 60s. Inferred mapping, not documented. |
+| `players/<id>/stats` | `stats.values[1]` = **max stamina**, `stats.values[19]` = **max satiation** (index order from BitJita's frontend stat list: maxHealth, maxStamina, …, satiationRegenRate (18), maxSatiation (19), …; was 100) (stat id 1 is named "Maximum Stamina" in `players/<id>/equipment`). Polled every 60s. Inferred mapping, not documented. |
 | `players/<id>/placeables` | `instances[]`: `placeable{name, tag, tier}`, `placeableId`, `availableInteractions[].verbPhrase`, `updatedAt`, `nextStateAt`, `growthEndTimestamp`. Polled every 60s. Crops have tag `Farmed Crop`. Other placeables (e.g. sift collectors, tag `Sift`) are ignored. The `urgency` field is not useful for crops (grown crops report `idle`). |
 | `placeables/<placeableId>` | Catalog entry for one placeable type; `growth[].time` = `[min, max]` seconds for timed stages (e.g. Growing Basic Starbulb: 300s). Fetched once per type, only for growing plants without a reported end time. |
 | `placeables?q=<text>` | Catalog search; used to discover crop stage names. |
 | `players?q=<text>` | Player search: case-insensitive substring on username, **≥ 2 chars**, **max 50 results, alphabetical, no paging** (`page`/`offset`/`limit` ignored). Re-ranked client-side: exact, then prefix, then rest. UI hints to type more when 50 come back. |
-| `players/<id>` | `player.username` (name lookup). `skillMap` was the source for `Skill.swift` (hardcoded, not fetched). |
+| `players/<id>` | `player.username` (name lookup), `player.signedIn` (offline state; polled every 60s). `skillMap` was the source for `Skill.swift` (hardcoded, not fetched). |
 
 Channels probed that produced no events: `character_stats`, `player_state`,
-`character_stats_state`, `health_state`, `active_buff_state`.
+`health_state`, `active_buff_state`. BitJita's frontend also uses
+`health_state`, `active_buff_state`, `passive_craft_state:owner_e…`,
+`placeable_state`, `growth_state` (not used here yet); like
+`character_stats_state` they probably only send on change.
 
 ### Data decisions
 
-- **Max stamina**: API value when available; if current stamina exceeds it
+- **Max stamina**: API value when available (REST poll + live
+  `character_stats_state`, whichever came last); if current stamina exceeds it
   (API lagging after a gear change), use current. Fallback without API: highest
   stamina seen in the last 10 minutes (current value always included, since
   updates stop at full).
@@ -266,4 +324,4 @@ Channels probed that produced no events: `character_stats`, `player_state`,
 - Craft channels are never unsubscribed when crafts finish (harmless, cleared
   on reconnect/user change).
 - Warning color is orange (`systemOrange`); user has called it "yellow".
-  Changing it affects low stamina too.
+  Changing it affects every warning (Resting, Connecting…).

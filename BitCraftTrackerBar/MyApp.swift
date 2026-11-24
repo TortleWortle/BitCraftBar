@@ -8,6 +8,8 @@ import SwiftUI
             StatusPanelView(model: model)
         } label: {
             MenuBarLabel(
+                isLoading: model.isLoading,
+                isOffline: model.isOffline,
                 status: model.monitor.overall,
                 staminaFraction: model.stamina.fraction,
                 skillName: model.experience.lastSkillName,

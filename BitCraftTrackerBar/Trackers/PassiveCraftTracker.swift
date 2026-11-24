@@ -53,7 +53,8 @@ final class PassiveCraftTracker {
     /// Ids already finished (or finished when first seen), so each finish is
     /// reported once and pre-existing finished crafts never are.
     @ObservationIgnored private var finishedIds: Set<String> = []
-    @ObservationIgnored private var hasLoaded = false
+    /// False until the first fetch was applied (for a loading placeholder).
+    private(set) var hasLoaded = false
 
     func reset() {
         crafts = []

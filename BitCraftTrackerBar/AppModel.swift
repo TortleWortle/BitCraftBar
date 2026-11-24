@@ -24,6 +24,28 @@ final class AppModel {
     /// Updated every second so time-based UI (active/paused crafts) re-renders.
     private(set) var now = Date()
 
+    /// True while starting up (or after switching character) until the
+    /// websocket is connected and the first round of REST requests is done,
+    /// so the UI doesn't jump around as data trickles in. Capped by
+    /// `loadingTimeout` so it can never get stuck.
+    private(set) var isLoading = true
+    static let loadingTimeout: TimeInterval = 20
+    @ObservationIgnored private var loadingStartedAt = Date()
+    @ObservationIgnored private var initialRestDone = false
+
+    /// The character is signed out of BitCraft. Activity/satiation rules are
+    /// paused (being idle offline isn't a problem) and the UI shows "Offline".
+    /// Based on BitJita's `signedIn` (polled), overridden by live events: any
+    /// within `liveEventWindow` means online, since `signedIn` can lag.
+    private(set) var isOffline = false
+    static let liveEventWindow: TimeInterval = 30
+    static let playerSource = "Player"
+    /// Signed in but no live event for this long on a connection at least
+    /// this old → the feed is stale; reconnect (see `refreshPlayer`).
+    static let staleFeedWindow: TimeInterval = 60
+    @ObservationIgnored private var reportedSignedIn: Bool?
+    @ObservationIgnored private var lastLiveEventAt: Date?
+
     /// The craft currently being worked on.
     var activeCraft: CraftTracker.Craft? {
         crafts.activeCraft(now: now)
@@ -44,7 +66,7 @@ final class AppModel {
 
     init() {
         experience = ExperienceTracker()
-        stamina = StaminaTracker(monitor: monitor)
+        stamina = StaminaTracker()
         satiation = SatiationTracker(monitor: monitor)
         userId = UserDefaults.standard.string(forKey: Self.userIdKey) ?? Self.defaultUserId
         username = UserDefaults.standard.string(forKey: Self.usernameKey)
@@ -72,16 +94,38 @@ final class AppModel {
         crafts.reset()
         plants.reset()
         passiveCrafts.reset()
+        reportedSignedIn = nil
+        lastLiveEventAt = nil
+        isOffline = false
+        startLoading()
         evaluate()
         connect()
         startRestRefresh()
+    }
+
+    private func startLoading() {
+        isLoading = true
+        loadingStartedAt = .now
+        initialRestDone = false
+    }
+
+    private func updateLoading() {
+        guard isLoading else { return }
+        let ready = initialRestDone && client.state == .connected
+        let timedOut = Date().timeIntervalSince(loadingStartedAt) >= Self.loadingTimeout
+        if ready || timedOut {
+            isLoading = false
+            // Re-evaluate now that data is in, before the UI shows it.
+            evaluate()
+        }
     }
 
     private func setUpNotifications() {
         // Error state: a source turning red from a known non-red state. The
         // first report of a source (e.g. "no XP yet" at launch) doesn't count.
         monitor.onChange = { [weak self] previous, report in
-            guard let self, report.status == .alert,
+            // Nothing during loading: startup states aren't news.
+            guard let self, !self.isLoading, report.status == .alert,
                   let previous, previous != .alert
             else { return }
             let now = Date()
@@ -131,10 +175,12 @@ final class AppModel {
             BitJitaChannel.experience(userId),
             BitJitaChannel.stamina(userId),
             BitJitaChannel.satiation(userId),
+            BitJitaChannel.characterStats(userId),
         ])
     }
 
     private func route(channel: String, data: Data) {
+        lastLiveEventAt = .now
         do {
             if channel == BitJitaChannel.experience(userId) {
                 experience.handle(try decoder.decode(EventEnvelope<ExperienceState>.self, from: data).data)
@@ -142,6 +188,10 @@ final class AppModel {
                 stamina.handle(try decoder.decode(EventEnvelope<StaminaState>.self, from: data).data)
             } else if channel == BitJitaChannel.satiation(userId) {
                 satiation.handle(try decoder.decode(EventEnvelope<SatiationState>.self, from: data).data)
+            } else if channel == BitJitaChannel.characterStats(userId) {
+                let stats = try decoder.decode(EventEnvelope<CharacterStatsState>.self, from: data).data
+                if let max = stats.maxStamina { stamina.setReportedMax(max) }
+                satiation.setReportedMax(stats.maxSatiation)
             } else if channel.hasPrefix(BitJitaChannel.craftPrefix) {
                 crafts.handle(try decoder.decode(EventEnvelope<ProgressiveActionState>.self, from: data).data)
             }
@@ -158,6 +208,7 @@ final class AppModel {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(1))
                 guard let self else { return }
+                self.updateLoading()
                 self.now = .now
                 self.stamina.tick()
                 self.passiveCrafts.tick(now: self.now)
@@ -174,57 +225,137 @@ final class AppModel {
         let userId = userId
         restRefreshTask = Task { [weak self] in
             while !Task.isCancelled {
-                do {
-                    let response = try await BitJitaAPI.crafts(userId: userId)
-                    guard let self, !Task.isCancelled else { return }
-                    let ids = self.crafts.update(from: response)
-                    self.client.subscribe(ids.map { BitJitaChannel.craft($0) })
-                } catch {
-                    print("Failed to fetch crafts: \(error)")
-                }
-                do {
-                    let stats = try await BitJitaAPI.stats(userId: userId)
-                    guard let self, !Task.isCancelled else { return }
-                    self.stamina.setReportedMax(stats.maxStamina)
-                } catch {
-                    print("Failed to fetch stats: \(error)")
-                }
-                do {
-                    let placeables = try await BitJitaAPI.placeables(userId: userId)
-                    guard let self, !Task.isCancelled else { return }
-                    // Growing plants without a reported end time: look up the
-                    // crop's growth duration once, for an estimate.
-                    for id in self.plants.missingDurations(in: placeables) {
-                        if let duration = try? await BitJitaAPI.placeable(id: id).growthDuration {
-                            self.plants.setGrowthDuration(duration, for: id)
-                        }
-                    }
-                    self.plants.update(from: placeables)
-                } catch {
-                    print("Failed to fetch placeables: \(error)")
-                }
-                do {
-                    let passive = try await BitJitaAPI.passiveCrafts(userId: userId)
-                    guard let self, !Task.isCancelled else { return }
-                    // Duration per recipe: looked up once via the crafted item.
-                    for missing in self.passiveCrafts.missingDurations(in: passive) {
-                        if let item = try? await BitJitaAPI.item(id: missing.itemId),
-                           let recipe = item.craftingRecipes.first(where: { $0.id == missing.recipeId }) {
-                            self.passiveCrafts.setDuration(recipe.timeRequirement, forRecipe: missing.recipeId)
-                        }
-                    }
-                    self.passiveCrafts.update(from: passive)
-                } catch {
-                    print("Failed to fetch passive crafts: \(error)")
-                }
+                // Strong reference only for the round, not during the sleep.
+                if let self { await self.refreshRound(userId: userId) } else { return }
                 try? await Task.sleep(for: .seconds(60))
             }
         }
     }
 
+    /// One round of REST requests, in parallel, so a round takes as long as
+    /// the slowest request, not the sum. Initial loading only waits for the
+    /// core requests: passive crafts can take ~10s when BitJita's cache is
+    /// cold, so the panel shows a placeholder for them instead.
+    private func refreshRound(userId: String) async {
+        async let passive: Void = refreshPassiveCrafts(userId: userId)
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { await self.refreshCrafts(userId: userId) }
+            group.addTask { await self.refreshStats(userId: userId) }
+            group.addTask { await self.refreshPlaceables(userId: userId) }
+            group.addTask { await self.refreshPlayer(userId: userId) }
+        }
+        if !Task.isCancelled, !initialRestDone {
+            // Core round done (successful or not): loading can end.
+            initialRestDone = true
+            updateLoading()
+        }
+        await passive
+    }
+
+    private func refreshCrafts(userId: String) async {
+        do {
+            let response = try await BitJitaAPI.crafts(userId: userId)
+            guard !Task.isCancelled else { return }
+            let ids = crafts.update(from: response)
+            client.subscribe(ids.map { BitJitaChannel.craft($0) })
+        } catch {
+            print("Failed to fetch crafts: \(error)")
+        }
+    }
+
+    private func refreshPlayer(userId: String) async {
+        do {
+            let player = try await BitJitaAPI.player(id: userId)
+            guard !Task.isCancelled, self.userId == userId else { return }
+            reportedSignedIn = player.signedIn
+            reconnectIfFeedStale()
+            if username != player.username { setUsername(player.username) }
+            evaluate()
+        } catch {
+            print("Failed to fetch player: \(error)")
+        }
+    }
+
+    /// BitJita can stop delivering events on a connection that otherwise
+    /// stays healthy (pings answered), e.g. after an outage on their side;
+    /// a fresh connection gets them again. Satiation updates ~1/s while
+    /// signed in, so silence while signed in means the feed is stale.
+    private func reconnectIfFeedStale() {
+        guard reportedSignedIn == true, let connectedAt = client.connectedAt else { return }
+        let now = Date()
+        let lastEvent = max(lastLiveEventAt ?? .distantPast, connectedAt)
+        guard now.timeIntervalSince(lastEvent) >= Self.staleFeedWindow else { return }
+        print("Signed in but no live events for \(Int(now.timeIntervalSince(lastEvent)))s; reconnecting")
+        client.reconnect()
+    }
+
+    private func refreshStats(userId: String) async {
+        do {
+            let stats = try await BitJitaAPI.stats(userId: userId)
+            guard !Task.isCancelled else { return }
+            stamina.setReportedMax(stats.maxStamina)
+            satiation.setReportedMax(stats.maxSatiation)
+        } catch {
+            print("Failed to fetch stats: \(error)")
+        }
+    }
+
+    private func refreshPlaceables(userId: String) async {
+        do {
+            let placeables = try await BitJitaAPI.placeables(userId: userId)
+            guard !Task.isCancelled else { return }
+            // Growing plants without a reported end time: look up the crop's
+            // growth duration once, for an estimate.
+            for id in plants.missingDurations(in: placeables) {
+                if let duration = try? await BitJitaAPI.placeable(id: id).growthDuration {
+                    plants.setGrowthDuration(duration, for: id)
+                }
+            }
+            plants.update(from: placeables)
+        } catch {
+            print("Failed to fetch placeables: \(error)")
+        }
+    }
+
+    private func refreshPassiveCrafts(userId: String) async {
+        do {
+            let passive = try await BitJitaAPI.passiveCrafts(userId: userId)
+            guard !Task.isCancelled else { return }
+            // Duration per recipe: looked up once via the crafted item.
+            for missing in passiveCrafts.missingDurations(in: passive) {
+                if let item = try? await BitJitaAPI.item(id: missing.itemId),
+                   let recipe = item.craftingRecipes.first(where: { $0.id == missing.recipeId }) {
+                    passiveCrafts.setDuration(recipe.timeRequirement, forRecipe: missing.recipeId)
+                }
+            }
+            passiveCrafts.update(from: passive)
+        } catch {
+            print("Failed to fetch passive crafts: \(error)")
+        }
+    }
+
     private func evaluate() {
-        activity.evaluate(experience: experience, stamina: stamina, monitor: monitor)
+        updateOnline()
+        if isOffline {
+            // Cleared, not reported: coming back online then is a "first
+            // report", so it never triggers an error notification.
+            monitor.clear(ActivityCheck.source)
+            monitor.clear(SatiationTracker.source)
+            monitor.report(Self.playerSource, .alert, "Offline")
+        } else {
+            // Reported as healthy (not cleared) so going offline is a
+            // transition to red and notifies.
+            monitor.report(Self.playerSource, .healthy, "Online")
+            activity.evaluate(experience: experience, stamina: stamina, lastCraft: crafts.lastWorkedCraft, monitor: monitor)
+            satiation.reportCurrent()
+        }
         updateConnectionReport()
+    }
+
+    private func updateOnline() {
+        let liveRecently = lastLiveEventAt.map { Date().timeIntervalSince($0) <= Self.liveEventWindow } ?? false
+        let offline = !liveRecently && reportedSignedIn == false
+        if offline != isOffline { isOffline = offline }
     }
 
     private func updateConnectionReport() {

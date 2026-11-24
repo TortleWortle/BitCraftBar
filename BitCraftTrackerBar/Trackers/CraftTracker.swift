@@ -25,6 +25,10 @@ final class CraftTracker {
     let activeWindow: TimeInterval
 
     private(set) var crafts: [String: Craft] = [:]
+    /// The craft that last made live progress. Kept after it completes (REST
+    /// drops completed crafts from `crafts`), for the "craft finished/idle"
+    /// status. Cleared if it disappears without completing (cancelled).
+    private(set) var lastWorkedCraft: Craft?
 
     /// Called once when a tracked craft reaches 100%.
     @ObservationIgnored var onCraftCompleted: ((Craft) -> Void)?
@@ -53,6 +57,7 @@ final class CraftTracker {
 
     func reset() {
         crafts = [:]
+        lastWorkedCraft = nil
         completionReported = []
     }
 
@@ -74,6 +79,7 @@ final class CraftTracker {
             if var craft = crafts[result.entityId] {
                 craft.progress = max(craft.progress, craft.total)
                 reportCompletionIfNeeded(craft)
+                if lastWorkedCraft?.id == craft.id { lastWorkedCraft = craft }
             }
         }
 
@@ -102,6 +108,9 @@ final class CraftTracker {
         for id in crafts.keys where !seen.contains(id) {
             crafts[id] = nil
         }
+        if let last = lastWorkedCraft, !last.isComplete, !seen.contains(last.id) {
+            lastWorkedCraft = nil
+        }
         return Array(seen)
     }
 
@@ -112,6 +121,7 @@ final class CraftTracker {
         craft.progress = state.progress
         craft.lastProgressAt = now
         crafts[state.entityId] = craft
+        lastWorkedCraft = craft
         reportCompletionIfNeeded(craft)
     }
 }

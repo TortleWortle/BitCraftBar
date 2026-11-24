@@ -8,7 +8,7 @@ struct StatusPanelView: View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
                 Circle()
-                    .fill(model.monitor.overall.color)
+                    .fill(model.isLoading ? HealthStatus.warning.color : model.monitor.overall.color)
                     .frame(width: 12, height: 12)
                 Text("BitCraft Tracker")
                     .font(.headline)
@@ -18,71 +18,97 @@ struct StatusPanelView: View {
                     .foregroundStyle(.secondary)
             }
 
-            VStack(alignment: .leading, spacing: 6) {
-                ForEach(model.monitor.sortedReports) { report in
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(report.status.color)
-                            .frame(width: 8, height: 8)
-                        Text(report.source)
-                            .fontWeight(.medium)
-                        Text(report.message)
-                            .foregroundStyle(.secondary)
-                    }
-                    .font(.callout)
+            if model.isLoading {
+                HStack(spacing: 8) {
+                    ProgressView().controlSize(.small)
+                    Text("Loading \(model.username ?? "character")…")
+                        .foregroundStyle(.secondary)
                 }
-            }
-
-            Divider()
-
-            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
-                GridRow {
-                    Text("Stamina").foregroundStyle(.secondary)
-                    HStack {
-                        ProgressView(value: model.stamina.fraction ?? 0)
-                            .tint(model.monitor.overall.color)
-                            .frame(minWidth: 40, maxWidth: .infinity)
-                        Text(staminaText)
-                            .fixedSize()
+                .font(.callout)
+                .frame(maxWidth: .infinity, minHeight: 60)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(model.monitor.sortedReports) { report in
+                        HStack(spacing: 8) {
+                            Circle()
+                                .fill(report.status.color)
+                                .frame(width: 8, height: 8)
+                            Text(report.source)
+                                .fontWeight(.medium)
+                            Text(report.message)
+                                .foregroundStyle(.secondary)
+                        }
+                        .font(.callout)
                     }
                 }
-                GridRow {
-                    Text("Satiation").foregroundStyle(.secondary)
-                    Text(model.satiation.satiation.map { String(format: "%.1f", $0) } ?? "–")
-                        .foregroundStyle(satiationColor)
-                }
-                GridRow {
-                    Text("Total XP").foregroundStyle(.secondary)
-                    Text(model.experience.totalExperience.map { $0.formatted() } ?? "–")
-                }
-                GridRow {
-                    Text("Last skill").foregroundStyle(.secondary)
-                    Text(model.experience.lastSkillName ?? "–")
-                }
-                GridRow {
-                    Text("Last gain").foregroundStyle(.secondary)
-                    lastGainText
-                }
-            }
-            .font(.callout)
-            .monospacedDigit()
 
-            if !model.plants.tiers.isEmpty {
                 Divider()
-                plantsSection
-            }
 
-            if !model.passiveCrafts.crafts.isEmpty {
-                Divider()
-                passiveCraftsSection
-            }
+                Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                    GridRow {
+                        Text("Stamina").foregroundStyle(.secondary)
+                        HStack {
+                            ProgressView(value: model.stamina.fraction ?? 0)
+                                .tint(model.monitor.overall.color)
+                                .frame(minWidth: 40, maxWidth: .infinity)
+                            Text(staminaText)
+                                .fixedSize()
+                        }
+                    }
+                    GridRow {
+                        Text("Satiation").foregroundStyle(.secondary)
+                        HStack {
+                            ProgressView(value: model.satiation.fraction ?? 0)
+                                .tint(satiationColor)
+                                .frame(minWidth: 40, maxWidth: .infinity)
+                            Text(satiationText)
+                                .foregroundStyle(satiationIsLow ? HealthStatus.alert.color : .primary)
+                                .fixedSize()
+                        }
+                    }
+                    GridRow {
+                        Text("Total XP").foregroundStyle(.secondary)
+                        Text(model.experience.totalExperience.map { $0.formatted() } ?? "–")
+                    }
+                    GridRow {
+                        Text("Last skill").foregroundStyle(.secondary)
+                        Text(model.experience.lastSkillName ?? "–")
+                    }
+                    GridRow {
+                        Text("Last gain").foregroundStyle(.secondary)
+                        lastGainText
+                    }
+                }
+                .font(.callout)
+                .monospacedDigit()
 
-            if !model.crafts.sortedCrafts.isEmpty {
-                Divider()
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Crafts").font(.subheadline.weight(.semibold))
-                    ForEach(model.crafts.sortedCrafts) { craft in
-                        craftRow(craft)
+                if !model.plants.tiers.isEmpty {
+                    Divider()
+                    plantsSection
+                }
+
+                if !model.passiveCrafts.hasLoaded {
+                    // Placeholder so the section doesn't pop in later (this
+                    // request can be slow).
+                    Divider()
+                    HStack(spacing: 6) {
+                        Text("Passive crafts").font(.subheadline.weight(.semibold))
+                        Spacer()
+                        ProgressView().controlSize(.mini)
+                        Text("Loading…").font(.caption).foregroundStyle(.secondary)
+                    }
+                } else if !model.passiveCrafts.crafts.isEmpty {
+                    Divider()
+                    passiveCraftsSection
+                }
+
+                if !model.crafts.sortedCrafts.isEmpty {
+                    Divider()
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Crafts").font(.subheadline.weight(.semibold))
+                        ForEach(model.crafts.sortedCrafts) { craft in
+                            craftRow(craft)
+                        }
                     }
                 }
             }
@@ -239,11 +265,19 @@ struct StatusPanelView: View {
         return nil
     }
 
+    private var satiationIsLow: Bool {
+        guard let value = model.satiation.satiation else { return false }
+        return value <= model.satiation.alertThreshold
+    }
+
+    /// Red when low, green otherwise.
     private var satiationColor: Color {
-        guard let value = model.satiation.satiation,
-              value <= model.satiation.alertThreshold
-        else { return .primary }
-        return HealthStatus.alert.color
+        satiationIsLow ? HealthStatus.alert.color : HealthStatus.healthy.color
+    }
+
+    private var satiationText: String {
+        guard let current = model.satiation.satiation else { return "–" }
+        return "\(Int(current)) / \(Int(model.satiation.maxSatiation))"
     }
 
     private var staminaText: String {
