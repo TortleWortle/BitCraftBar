@@ -305,6 +305,24 @@ pub fn duration_string(seconds: f64) -> String {
     if h > 0 { format!("{h}h {m:02}m") } else { format!("{m}m {s:02}s") }
 }
 
+/// Plant timers: "1h 05m", "4m", or "42s" (seconds only under a minute;
+/// user preference).
+pub fn coarse_duration_string(seconds: f64) -> String {
+    let total = seconds.max(0.0).ceil() as i64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        // Round up so it never shows "0m" with time left.
+        match m + (s > 0) as i64 {
+            60 => "1h 00m".to_string(),
+            rounded => format!("{rounded}m"),
+        }
+    } else {
+        format!("{s}s")
+    }
+}
+
 fn dot(color: impl Into<Hsla>, size: f32) -> impl IntoElement {
     div().size(px(size)).flex_none().rounded_full().bg(color.into())
 }
@@ -588,7 +606,7 @@ impl Panel {
         let time_left = move |tier: &TierSummary| match tier.all_grown_at() {
             None => "–".to_string(),
             Some(end) if end <= now => "any moment".into(),
-            Some(end) => format!("{}{} left", if tier.is_estimate { "~" } else { "" }, duration_string(end - now)),
+            Some(end) => format!("{}{} left", if tier.is_estimate { "~" } else { "" }, coarse_duration_string(end - now)),
         };
         let need_row = |label: &str, color: u32, count: fn(&TierSummary) -> usize| {
             let tiers: Vec<String> = m
@@ -810,4 +828,18 @@ fn group_thousands(n: i64) -> String {
         out.push(ch);
     }
     if n < 0 { format!("-{out}") } else { out }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn coarse_durations() {
+        assert_eq!(coarse_duration_string(42.0), "42s");
+        assert_eq!(coarse_duration_string(60.0), "1m");
+        assert_eq!(coarse_duration_string(252.0), "5m");
+        assert_eq!(coarse_duration_string(3599.0), "1h 00m");
+        assert_eq!(coarse_duration_string(3900.0), "1h 05m");
+    }
 }

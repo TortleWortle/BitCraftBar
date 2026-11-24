@@ -71,7 +71,8 @@ crafts (progress bar, percent, Paused/Done), character picker, Quit.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
   currently growing** (count + time until the whole tier is grown, `~` when
-  estimated), then separate rows for *Needs fertilizer*, *Needs water* and
+  estimated; `coarse_duration_string`: `1h 05m`, `4m` (minutes rounded up),
+  seconds only under a minute, `42s`; user preference), then separate rows for *Needs fertilizer*, *Needs water* and
   *Ready to harvest* with per-tier counts (user asked for growing-only in the
   tracker and the needs shown separately).
 - **Passive crafts section**: grouped by building + item, with running count,
