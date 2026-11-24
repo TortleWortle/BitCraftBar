@@ -1,4 +1,4 @@
-# BitCraftTrackerBar
+# BitCraft Tracker
 
 > **Keep this file up to date.** Any agent (or human) changing behavior, data
 > sources, status rules, UI layout, or project settings must update the
@@ -8,69 +8,82 @@
 
 ## What it is
 
-A macOS menu bar app that shows, at a glance, the status of the user's
-character in the game **BitCraft**. Data comes from the community site
-[BitJita](https://bitjita.com) (live websocket + REST API). There is no Dock
-icon or main window; everything lives in the menu bar item and its popover.
+A tray / menu bar app (macOS, Windows, Linux) that shows, at a glance, the
+status of the user's character in the game **BitCraft**. Written in Rust with
+[GPUI](https://gpui.rs) (Zed's UI framework). Data comes from the community
+site [BitJita](https://bitjita.com): live websocket, REST API, and its
+read-only SpacetimeDB relay. There is no main window or Dock icon; everything
+lives in the tray icon and its popup panel.
 
 The goal is a quick "is my character still doing something useful?" check
 while the user is AFK-crafting/gathering, without tabbing into the game.
 
+**History**: this started as a native macOS SwiftUI app (`MenuBarExtra`); it
+was ported to Rust/GPUI to run on Windows and Linux too, and the Swift app
+was then removed. Behavior was kept identical; decisions below that mention
+"user preference" came from that app's development.
+
 ## What it shows
 
-**Menu bar label** (drawn as a single non-template `NSImage`):
-
-```
-(◔) Leatherworking 22% — T2 grown; T1 needs water · Resting
-```
+**Tray icon** (`src/tray.rs`, drawn with tiny-skia, 36px for HiDPI):
 
 1. **Status indicator**: a thin ring in the overall status color, around a
    **stamina pie** in the same color (filled slice = current/max stamina,
-   faint tint = empty part). Pie starts at 12 o'clock and fills
-   **counter-clockwise** (user preference; clockwise "felt wrong").
-2. **Last skill** that received experience.
-3. **Craft progress** of the actively worked-on craft, as **percent done**,
+   faint tint = empty part, solid dot when stamina is unknown). Pie starts at
+   12 o'clock and fills **counter-clockwise** (user preference; clockwise
+   "felt wrong").
+
+**Label text** (`Model::label_text`), e.g.
+`Leatherworking 22% — T2 grown; T1 needs water · Resting`. On **macOS** it's
+shown next to the icon (`set_title`, plain text, one color). Windows/Linux
+trays can't show text, so it's the **tooltip** there.
+
+1. **Last skill** that received experience.
+2. **Craft progress** of the actively worked-on craft, as **percent done**,
    directly after the skill name (no icon, no separator; user preference).
    Hidden when no craft progressed in the last 30s.
-4. **Plant summary**, after an em dash, parts joined with `; `:
+3. **Plant summary**, after an em dash, parts joined with `; `:
    `T1, T2 grown` (tiers where *every* plant is grown),
    `T1 needs fertilizer` / `T2 needs water` (tiers where *any* plant needs it).
-   Hidden when there's nothing to report. Informational text,
-   not a status report (doesn't change the indicator color).
-5. **Active issues**: messages of all non-healthy status reports, colored by
-   severity, worst first, separated by `·`.
+   Hidden when there's nothing to report. Informational text, not a status
+   report (doesn't change the indicator color).
+4. **Active issues**: messages of all non-healthy status reports, worst
+   first, separated by `·`.
 
 **Offline**: when the character is signed out of BitCraft, a `Player`
-report goes **alert / "Offline"** (red ring, red `Offline` in the label; user
-asked for red). The label then shows **only the issues**: no skill, craft or
-plant summary (user asked to hide plants while offline). Going offline is an
-error-state notification (the report is `healthy / Online` while online, so
-it's a transition). Activity and Satiation reports are **cleared** while
-offline (idling offline isn't a problem, and clearing means coming back online
-is a "first report", so it never notifies). Detection: BitJita's
-`players/<id>` `signedIn` (polled every 60s), overridden to *online* by any
-live websocket event in the last 30s, since `signedIn` can lag. Unknown
-`signedIn` counts as online.
+report goes **alert / "Offline"** (red ring; user asked for red). The label
+then shows **only the issues**: no skill, craft or plant summary (user asked
+to hide plants while offline). Going offline is an error-state notification
+(the report is `healthy / Online` while online, so it's a transition).
+Activity and Satiation reports are **cleared** while offline (idling offline
+isn't a problem, and clearing means coming back online is a "first report",
+so it never notifies). Detection: BitJita's `players/<id>` `signedIn` (polled
+every 60s), overridden to *online* by any live websocket event in the last
+30s, since `signedIn` can lag. Unknown `signedIn` counts as online.
 
-**Popover panel**: overall status + per-source reports, stamina bar with
-`current / max`, total XP, last skill, last gain, list of crafts (progress
-bar, percent, Paused/Done), plants, character picker, Quit. The stats grid
-also shows a **satiation bar** like the stamina bar, `current / max`
-(green, red at/below the alert threshold).
+**Popup panel** (`src/ui.rs`, `Panel`), opened by clicking the tray icon:
+header (status dot, connection state, `· relay` while the relay is live),
+per-source status reports, stats rows (stamina bar `current / max` in the
+overall status color; **satiation bar** `current / max`, green, red at/below
+the alert threshold; total XP; last skill; last gain), plants, passive crafts,
+crafts (progress bar, percent, Paused/Done), character picker, Quit.
 
-Passive crafts section: grouped by building + item, with running count, time
-until the whole group is done, and how many are ready to collect. Running
-groups first. Not shown in the menu bar (user didn't ask for it).
-
-Plants section: a **growth tracker listing only tiers with plants currently
-growing** (count + time until the whole tier is grown, `~` when estimated),
-then separate rows for *Needs fertilizer*, *Needs water* and *Ready to
-harvest* with per-tier counts (user asked for growing-only in the tracker and
-the needs shown separately).
+- **Plants section**: a **growth tracker listing only tiers with plants
+  currently growing** (count + time until the whole tier is grown, `~` when
+  estimated), then separate rows for *Needs fertilizer*, *Needs water* and
+  *Ready to harvest* with per-tier counts (user asked for growing-only in the
+  tracker and the needs shown separately).
+- **Passive crafts section**: grouped by building + item, with running count,
+  time until the whole group is done, and how many are ready to collect.
+  Running groups first. Not in the label (user didn't ask for it).
+- Light/dark colors follow the window appearance (`Theme`).
 
 ## Status rules
 
 Colors: green = healthy, orange = warning, red = alert. Overall = worst report.
+Implemented in `src/core/trackers.rs` (`ActivityCheck::evaluate`,
+`SatiationTracker::report_current`) and `src/model.rs` (`Model::evaluate`:
+Player, Connection).
 
 | Source | Condition | Status | Message |
 |---|---|---|---|
@@ -81,87 +94,94 @@ Colors: green = healthy, orange = warning, red = alert. Overall = worst report.
 | Activity | last action was an unfinished craft, no XP, no regen | alert | Craft idle (N%) |
 | Activity | no XP, no regen in 10s (= no food active) | alert | Idle: no XP, no regen |
 | Activity | nothing received yet | alert | No XP or regen yet |
-
-**Craft rules** (user request: yellow when a craft just finished, red when
-the last craft still needs progress but you're idle). "Last action was a
-craft" = `CraftTracker.lastWorkedCraft` (last craft with live progress, kept
-after completion since REST drops completed crafts) progressed no more than
-5s before the last XP gain. XP later than that means you moved on (e.g. a new
-craft REST hasn't discovered yet), and the normal rules apply. "Craft
-finished" stays until then; resting during an unfinished craft is still
-"Resting".
-
-There is **no low-stamina warning** (removed): you run out of stamina exactly
-when you stop to regenerate, so it only duplicated "Resting".
-
-Rows are checked top to bottom. **Counting XP** = XP gained in the last 20s
-*and* after stamina last went up: XP while regenerating is improbable (user's
-rule), so once regen starts, earlier XP no longer means "active".
-**Regenerating** = stamina went up in the last 10s and hasn't gone down since
-(`StaminaTracker.isRegenerating`); spending stamina ends it immediately, so
-resuming work flips straight back to green.
 | Satiation | satiation ≤ 15 | alert | Low satiation (N) |
 | Player | signed out / signed in | alert / healthy | Offline / Online |
 | Connection | connected / connecting / disconnected | healthy / warning / alert | Connected / Connecting… / Disconnected |
 
-"Ready" depends on the last skill that gained XP (`ActivityCheck.readyFractionBySkill`):
-full stamina by default, **20% for Fishing** (`Skill.fishing`), because fishing rarely
-needs full stamina to continue. Add other skills there if they need a
-different threshold.
+Activity rows are checked top to bottom.
 
-The XP window is **20s** (was 5s) to bridge gaps between XP ticks during
-activity; regeneration overrides it (see above).
-Use `Skill` cases rather than raw skill ids in rules.
-
-Messages are kept short because they're shown in the menu bar.
+- **Counting XP** = XP gained in the last 20s *and* after stamina last went
+  up: XP while regenerating is improbable (user's rule), so once regen starts,
+  earlier XP no longer means "active". The 20s window (was 5s) bridges gaps
+  between XP ticks; regeneration overrides it.
+- **Regenerating** = stamina went up in the last 10s and hasn't gone down since
+  (`StaminaTracker::is_regenerating`); spending stamina ends it immediately,
+  so resuming work flips straight back to green.
+- **"Ready"** depends on the last skill that gained XP
+  (`ActivityCheck::ready_fraction`): full stamina by default, **20% for
+  Fishing**, because fishing rarely needs full stamina to continue. Add other
+  skills there if they need a different threshold. Use `Skill` variants, not
+  raw ids.
+- **Craft rules** (user request: yellow when a craft just finished, red when
+  the last craft still needs progress but you're idle). "Last action was a
+  craft" = `CraftTracker::last_worked` (last craft with live progress, kept
+  after completion since REST drops completed crafts) progressed no more than
+  5s before the last XP gain. XP later than that means you moved on (e.g. a
+  new craft REST hasn't discovered yet), and the normal rules apply. "Craft
+  finished" stays until then; resting during an unfinished craft is still
+  "Resting".
+- There is **no low-stamina warning** (removed): you run out of stamina
+  exactly when you stop to regenerate, so it only duplicated "Resting".
+- Messages are kept short because they're shown in the label.
 
 ## Notifications
 
-macOS notifications with the default sound (`Notifier.swift`, UserNotifications;
-banners also shown while the app is active). If permission is denied, only a
-sound plays (`NSSound "Glass"`). Sent for:
+Desktop notifications via `notify-rust` (`src/notifier.rs`; macOS
+Notification Center, Windows toasts, freedesktop on Linux), sent from a
+thread. Produced by `Model` (`collect_notifications`,
+`collect_alert_notifications`), never while loading. Sent for:
 
 | Event | Rule |
 |---|---|
-| Error state | A status source changes **to alert from a known non-alert status** (`StatusMonitor.onChange`). A source's *first* report doesn't count, so the red "No XP or regen yet" at launch is silent. **5 min cooldown per source** (e.g. flapping connection). Alert → alert (message change) is silent. |
+| Error state | A status source changes **to alert from a known non-alert status**. A source's *first* report doesn't count, so the red "No XP or regen yet" at launch is silent. **5 min cooldown per source** (e.g. flapping connection). Alert → alert (message change) is silent. |
 | Craft finished | Once per craft, when live progress reaches the total, or when REST reports a tracked craft as `completed` (if the live event was missed). |
-| Passive craft finished | When a passive craft's computed end time passes (1s tick) or BitJita reports it `complete`, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished on first load are silent, and so are those in the first list after switching source (REST ↔ relay): BitJita's REST once listed no passive crafts while the relay had 3 finished ones, which notified as "finished". |
-| Plants grown | Per tier, between two placeable polls: growing count drops to 0 **and** grown count increased. Not on the first load. Lags with BitJita's placeable data. |
+| Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished on first load are silent, and so are those in the first list after **switching source** (REST ↔ relay): REST once listed no passive crafts while the relay had 3 finished ones, which notified as "finished" (`Model::switch_source`). |
+| Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first load or the first list after a source switch. |
 
 Connection reports `healthy` when connected (instead of clearing) so a later
 disconnect is a transition and notifies.
 
+**macOS**: notifications must be sent "as" an app bundle.
+`notifier::init()` sets it at startup: our bundle id when packaged as a
+`.app`, else Terminal's (`cargo run` has none). Unset,
+`mac-notification-sys` looks up an app named "use_default" via AppleScript,
+which pops up a "Where is use_default?" dialog that also steals focus (and
+closes the popup).
+
 ## Architecture
 
 ```
-MyApp.swift            MenuBarExtra (.window style), owns AppModel
-Notifier.swift         macOS notifications + sound fallback
-AppModel.swift         Wires everything; 1s tick; 60s REST refresh; routes events
-Status/
-  HealthStatus.swift   healthy < warning < alert (Comparable) + colors
-  StatusMonitor.swift  Keyed reports from independent sources; overall = max
-Networking/
-  BitJitaClient.swift  Websocket: subscribe, dynamic subscribe, reconnect w/ backoff,
-                       keepalive ping, reconnect on wake / network change
-  BitJitaMessages.swift  Websocket message types + channel names
-  RelayFeed.swift      Live passive crafts + plants via BitJita's SpacetimeDB relay
-  BitJitaAPI.swift     REST: /players?q=, /players/<id>, /crafts, /passive-crafts,
-                       /stats, /placeables, /items/<id>,
-                       /placeables/<placeableId>; BitJitaDate (flexible timestamps)
-Trackers/
-  ExperienceTracker.swift  XP totals, last gain time/amount/skill (data only)
-  StaminaTracker.swift     stamina, regen/drain times, max stamina (data only)
-  SatiationTracker.swift   satiation; reports low satiation
-  CraftTracker.swift       crafts from REST + live progress; active craft
-  PassiveCraftTracker.swift  passive crafts, computed end times, grouping
-  PlantTracker.swift       crops per tier by stage, growth end times
-  ActivityCheck.swift      combines XP + stamina into the "Activity" report
-  Skill.swift              `enum Skill: Int` (raw value = skill id) + display names
-Views/
-  MenuBarLabel.swift   Renders the menu bar image (ring, pie, text, symbols)
-  StatusPanelView.swift  Popover content
-  CharacterPicker.swift  Tracked character name + username search
+src/main.rs        GPUI app; tray click → popup placement; keepalive window
+src/ui.rs          AppState (model + tray + popup + search) and the Panel view
+src/model.rs       Routes network events into trackers; loading/offline;
+                   status evaluation; notifications; label text
+src/platform.rs    Native bits GPUI lacks: tray DPI scale, hide Dock icon,
+                   set popup window frame (macOS AppKit / Win32)
+src/core/          No GPUI, no I/O (unit-tested):
+  status.rs        HealthStatus (healthy < warning < alert) + StatusMonitor
+  trackers.rs      Experience/Stamina/Satiation/Craft/Plant/PassiveCraft
+                   trackers + ActivityCheck
+  skill.rs         `enum Skill` (value = skill id) + display names
+  types.rs         Data passed from net → model (CraftInfo, PassiveCraft,
+                   Plant, PlayerSummary); times are Unix seconds (f64)
+src/net/           Background Tokio runtime ("network" thread):
+  mod.rs           Command/Outgoing channels; per-character tracking
+                   (live task + 60s REST poll + relay); caches
+  live.rs          BitJita websocket: subscribe, ping, reconnect w/ backoff
+  api.rs           BitJita REST + flexible date parsing (`parse_date`)
+  relay.rs         SpacetimeDB relay: passive crafts + plants, live
+src/tray.rs        Tray icon rendering/updates
+src/notifier.rs    Desktop notifications
+src/settings.rs    settings.json (tracked character)
 ```
+
+**Data flow is one way**: the network thread sends `net::Outgoing` messages
+(per-character events tagged with the user id, search results) over an
+`async_channel`; a GPUI foreground task feeds them into `Model::handle`. The
+model produces `net::Command`s (track character, subscribe, reconnect,
+search) and notifications, which `AppState::flush` forwards, then updates the
+tray. A 1s tick (`Model::tick`) re-evaluates time-based rules. Events for a
+character that's no longer tracked are dropped.
 
 ### Key design decisions
 
@@ -170,55 +190,65 @@ Views/
   indicator shows the worst. Trackers collect data; rules that combine sources
   live in their own check (`ActivityCheck`). Add new warnings by adding a
   report source, not by touching existing ones.
-- **No gray text in the menu bar**: `secondaryLabelColor` is hard to read
-  there (user feedback). Neutral text and `·` separators use `labelColor`;
-  loading uses the warning color.
-- **Menu bar label is one drawn `NSImage`**, not SwiftUI views. MenuBarExtra
-  labels are template-rendered (monochrome) and ignore most layout, so colors
-  and spacing are only reliable when drawn manually. The image uses a drawing
-  handler so `labelColor` etc. resolve per light/dark appearance. Avoid emoji
-  in the label: they don't follow dark mode (⏱ was nearly invisible); if an
-  icon is needed, draw an SF Symbol tinted with `labelColor` at draw time.
-- **Everything runs on the main actor** (project default isolation). Message
-  volume is tiny, so no background processing.
-- **Websocket subscriptions are tracked as a set** and re-sent on reconnect.
-  `subscribe()` adds channels at runtime (used for crafts discovered via REST).
-  Channels added while the handshake is in flight are sent right after the
-  initial subscribe; previously they were silently dropped, which made active
-  crafts show as "Paused".
-- **Reconnect** with exponential backoff 1s → 30s when send/receive fails.
-- **Silent dead connections** (sleep, Wi-Fi switch) don't make `receive()`
-  fail, so the client also: pings every 15s and reconnects if no pong within
-  10s; reconnects immediately on `NSWorkspace.didWakeNotification`; and
-  reconnects (debounced 2s) when `NWPathMonitor` reports a changed, usable
-  network. Deliberate reconnects (`reconnect()`) show "Connecting…", not
-  "Disconnected", so they don't trigger an error notification.
+- **Core logic has no GPUI/I/O** (`src/core`), so rules are unit-testable
+  (`cargo test`). Add a test when changing a status rule.
+- **No gray text in the menu bar** (macOS user feedback: hard to read). The
+  tray title is plain text anyway. Loading uses the warning color (orange
+  ring, empty pie) and the text "Loading…".
+- **Websocket subscriptions are tracked as a set** and re-sent on reconnect;
+  `Command::Subscribe` adds channels at runtime (crafts discovered via REST).
+  Channels added while (re)connecting are kept and sent with the next
+  subscribe (losing them once made active crafts show as "Paused").
+- **Reconnect** with exponential backoff 1s → 30s. **Keepalive**: ping every
+  15s; a ping still unanswered at the next tick (> 10s) fails the connection
+  (silent dead sockets after sleep / Wi-Fi switch). No explicit
+  reconnect-on-wake or network-change handling (the Swift app had both); the
+  ping detects it within ~30s.
 - **Stale feed**: BitJita can stop delivering events on a connection that
   otherwise stays healthy (pings answered), observed after an outage on their
   side, while a fresh connection gets them. So if `players/<id>` says
   `signedIn` but no live event arrived for 60s on a connection at least 60s
-  old, the client reconnects (`AppModel.reconnectIfFeedStale`, checked on the
-  60s poll). Relies on satiation updating ~1/s while signed in; a wrong
-  `signedIn` only costs a reconnect per minute.
-- **Loading state** (`AppModel.isLoading`): at launch and after switching
+  old, the model sends `Command::ReconnectLive` (`reconnect_if_feed_stale`,
+  checked on the 60s poll). Relies on satiation updating ~1/s while signed
+  in; a wrong `signedIn` only costs a reconnect per minute.
+- **Loading state** (`Model::is_loading`): at launch and after switching
   character, until the websocket is connected and the core REST requests
-  (crafts, stats, placeables, player) finished, capped at 20s. Menu bar shows an orange
-  (warning) ring + orange "Loading…", the popover a spinner instead of the data sections, and
-  no notifications fire. Typically 1–2s.
-- **REST polling**: every 60s, the requests of a round run **in parallel**.
-  Initial loading doesn't wait for passive crafts: that endpoint sometimes
-  takes ~10s+ (BitJita cache seems cold; fast on repeat), so the popover shows
-  a "Passive crafts — Loading…" placeholder until it arrives.
-- **Character selection** is by username search (`Views/CharacterPicker.swift`),
-  not a raw ID field: the panel shows the tracked character's name with a
-  *Change* button that opens a debounced (300ms) search. Picking a result
-  switches tracking. `UserDefaults` stores `userId` (entity ID, what all
-  channels/endpoints use) and `username` (display only; looked up via
-  `players/<id>` if missing). Default `userId` is the original user's character.
+  (crafts, stats, placeables, player) finished, capped at 20s. Tray shows the
+  orange ring + "Loading…", the panel "Loading <name>…" instead of the data
+  sections, and no notifications fire. Typically 1–2s.
+- **REST polling**: every 60s, the requests of a round run **in parallel**
+  (`tokio::join!`). Loading doesn't wait for passive crafts: that endpoint
+  sometimes takes ~10s+ (BitJita cache seems cold; fast on repeat), so the
+  panel shows a "Passive crafts — Loading…" placeholder until it arrives.
+- **Character selection** is by username search in the panel: the
+  tracked character's name with a *Change* button that opens a search field
+  (typed via key events; GPUI has no text input widget), debounced 300ms,
+  results clickable, Enter picks the first, Escape cancels. `settings.json`
+  stores `user_id` (entity ID, what all channels/endpoints use) and `username`
+  (display only; refreshed from `players/<id>`). Default `user_id` is the
+  original user's character.
+- **Popup window**: a borderless `WindowKind::PopUp` window under the tray
+  icon (above it when the tray is in the bottom half of the screen, e.g. the
+  Windows taskbar); closes when it loses focus. A click that just closed it
+  (focus loss happens before the tray click) doesn't reopen it (400ms).
+  **Sized to content**: GPUI has no size-to-content or move API, so the panel
+  is measured after layout (`on_children_prepainted` → `fit_window`) and the
+  native window frame is set (`platform::set_window_frame`: AppKit `setFrame`
+  on macOS, `SetWindowPos` on Windows, GPUI `resize` on Linux), keeping the
+  edge next to the tray fixed (GPUI's own `resize` on macOS keeps the bottom
+  edge, so the popup would slide under the menu bar). Taller than the screen
+  → scrolls. On Wayland the compositor positions windows.
+- **Keepalive window**: GPUI quits on Linux/Windows when the last window
+  closes, so an invisible 1×1 window stays open (not needed on macOS).
+- **No tray available** (e.g. GNOME without the AppIndicator extension): the
+  panel opens as a window at startup instead. `--open` opens it at launch
+  regardless.
+- **macOS**: activation policy set to Accessory at startup (no Dock icon;
+  GPUI starts as a regular app).
 
 ## Data sources (BitJita)
 
-### SpacetimeDB relay (passive crafts + plants, live)
+### SpacetimeDB relay (passive crafts + plants, live) — `src/net/relay.rs`
 
 BitCraft runs on SpacetimeDB. BitJita runs a read-only relay ("BITCONNECT",
 https://relay.bitjita.com) that mirrors it; **no account or BitCraft token**
@@ -229,40 +259,42 @@ game token was rejected: account risk, and the relay has the same data.
 
 - `wss://relay.bitjita.com/v1/database/idc-<region>/subscribe`, websocket
   subprotocol `v1.json.spacetimedb`. One database per region; region = the
-  player's `regionId` from `players/<id>`. Mirrored: idc-global and
-  7, 8, 9, 12, 13, 14, 17, 18, 19 (others: `SubscriptionError` → REST,
-  retried every 5 min). While the relay restarts it refuses with "module is
-  still loading its initial state from upstream; retry shortly" (`/healthz`
-  503, observed for 8+ min); that's retried with the normal backoff. Placeables/crafts in a different region than the player is in are
-  not seen.
+  player's `regionId` from `players/<id>` (relay started/restarted by the
+  poll loop when it's known or changes). Mirrored: idc-global and 7, 8, 9,
+  12, 13, 14, 17, 18, 19 (others: `SubscriptionError` → REST, retried every
+  5 min). While the relay restarts it refuses with "module is still loading
+  its initial state from upstream; retry shortly" (`/healthz` 503, observed
+  for 8+ min); that's retried with the normal backoff. Placeables/crafts in a
+  different region than the player is in are not seen.
 - Protocol: send `{"Subscribe":{"query_strings":[SQL…],"request_id":1}}`
   (replaces the whole set; also used to add lookups) → `InitialSubscription`
   (all current rows) → `TransactionUpdate`s (`deletes` + `inserts` per table).
   Rows are JSON strings of arrays in column order; sums `[tag, payload]`,
   timestamps `[micros]`. Joins (`SELECT a.* FROM a JOIN b ON … WHERE …`)
-  work and can repeat a row once per match → row store is ref-counted.
-  `LIMIT` / HTTP `/sql` aren't available. Schema:
+  work and can repeat a row once per match → the row store is ref-counted.
+  `LIMIT` / HTTP `/sql` aren't available. Schema (column order/types):
   `GET /v1/database/idc-14/schema?version=9`.
-- Tables used (column indices in `RelayFeed`): `passive_craft_state`
+- Tables used (column indices in `relay.rs`): `passive_craft_state`
   (entity, owner, recipe_id, building_entity_id, timestamp, status
   Queued/Processing/Complete, slot), `crafting_recipe_desc` (name,
   time_requirement = duration, crafted_item_stacks), `item_desc`,
-  `building_state` → `building_desc` (names), `placeable_state` (owner,
-  placeable_id) → `placeable_desc` (name, tag, tier), `growth_state`
-  (end_timestamp; empty for crops when checked).
+  `building_state` → `building_desc` (names; second lookup round),
+  `placeable_state` (owner, placeable_id) → `placeable_desc` (name, tag,
+  tier), `growth_state` (end_timestamp; empty for crops when checked).
 - **Private** (subscribe error): `passive_craft_timer`, so passive end times
   are still start + recipe duration. Processing crafts run in parallel slots
   (`slot = some(n)`); a `Queued` craft is shown without an end time until it
-  turns Processing. No Queued rows were seen in region 14.
+  turns Processing. No Queued rows were seen in region 14 (51,769 rows:
+  47,933 complete, 3,836 processing).
 - Crop growth start isn't stored; it's recorded when a plant is seen
-  switching to `Growing …` live (estimate `~` = that + catalog duration). Plants
-  already growing at launch have no time left.
-- While the relay is live (`RelayFeed.isLive`), the REST passive-crafts and
-  placeables results are ignored. Popover header shows `· relay`.
+  switching to `Growing …` live (estimate `~` = that + catalog duration).
+  Plants already growing at launch have no time left.
+- While the relay is live (shared `AtomicBool` in `net/mod.rs`), the REST
+  passive-crafts and placeables requests are skipped / their results dropped.
 
-### BitJita live websocket and REST
+### BitJita live websocket — `src/net/live.rs`
 
-Websocket `wss://live.bitjita.com/`, subscribe with
+`wss://live.bitjita.com/`, subscribe with
 `{"type":"subscribe","channels":[...]}`. Server acks with
 `{"type":"subscribed","channels":[...]}` (it acks *any* channel name, so an ack
 doesn't prove a channel exists). Events: `{"type":"event","channel":...,"data":{...}}`.
@@ -270,30 +302,32 @@ doesn't prove a channel exists). Events: `{"type":"event","channel":...,"data":{
 | Channel | Data used | Notes |
 |---|---|---|
 | `experience_state:<player id>` | `experience_stacks[{skill_id, quantity}]` | **No snapshot on subscribe**, only updates. First update counts as a gain (no baseline); skill is known from the second update on. |
-| `stamina_state:<player id>` | `stamina` (Double) | ~1/s while regenerating. **Stops sending when full.** |
-| `satiation_state:<player id>` | `satiation` (Double) | ~1/s while it changes (slowly decreasing). |
-| `character_stats_state:<player id>` | `values[1]` = max stamina | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe, so the REST poll still provides the initial value. Keeps max stamina in sync between polls. |
+| `stamina_state:<player id>` | `stamina` | ~1/s while regenerating. **Stops sending when full.** |
+| `satiation_state:<player id>` | `satiation` | ~1/s while it changes (slowly decreasing). |
+| `character_stats_state:<player id>` | `values[1]` = max stamina, `values[19]` = max satiation | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe, so the REST poll provides the initial value. |
 | `progressive_action_state:<craft entity id>` | `progress`, `entity_id` | One event per craft action (+ a duplicate `preparation: true` event). |
-
-REST `https://bitjita.com/api/`:
-
-| Endpoint | Used for |
-|---|---|
-| `players/<id>/crafts` | Craft list: `entityId`, `progress`, `totalActionsRequired`, `completed`, `craftedItem[].item_id` → `items[].name`, `buildingName`. Polled every 60s to discover new crafts. |
-| `players/<id>/passive-crafts` | Passive crafts (tanning tub, kiln, smelter, loom, ...). Same envelope as crafts (`craftResults`, `items`) but each result only has `entityId`, `buildingName`, `recipeId`, `recipeName` (e.g. `"Weave {0}"`, `{0}` = item), `status`, start `timestamp`, `craftedItem`, `slot`. **No progress or end time.** Only `status: "complete"` has been observed; any other value is treated as running. Completed crafts stay listed until collected. Polled every 60s. |
-| `items/<itemId>` | `craftingRecipes[]` with `id`, `timeRequirement` (seconds), `isPassive`. Used to get a passive recipe's **duration** (e.g. Weave Rough Cloth Strip = 180s); end = start `timestamp` + duration. Looked up once per recipe. |
-| `players/<id>/stats` | `stats.values[1]` = **max stamina**, `stats.values[19]` = **max satiation** (index order from BitJita's frontend stat list: maxHealth, maxStamina, …, satiationRegenRate (18), maxSatiation (19), …; was 100) (stat id 1 is named "Maximum Stamina" in `players/<id>/equipment`). Polled every 60s. Inferred mapping, not documented. |
-| `players/<id>/placeables` | `instances[]`: `placeable{name, tag, tier}`, `placeableId`, `availableInteractions[].verbPhrase`, `updatedAt`, `nextStateAt`, `growthEndTimestamp`. Polled every 60s. Crops have tag `Farmed Crop`. Other placeables (e.g. sift collectors, tag `Sift`) are ignored. The `urgency` field is not useful for crops (grown crops report `idle`). |
-| `placeables/<placeableId>` | Catalog entry for one placeable type; `growth[].time` = `[min, max]` seconds for timed stages (e.g. Growing Basic Starbulb: 300s). Fetched once per type, only for growing plants without a reported end time. |
-| `placeables?q=<text>` | Catalog search; used to discover crop stage names. |
-| `players?q=<text>` | Player search: case-insensitive substring on username, **≥ 2 chars**, **max 50 results, alphabetical, no paging** (`page`/`offset`/`limit` ignored). Re-ranked client-side: exact, then prefix, then rest. UI hints to type more when 50 come back. |
-| `players/<id>` | `player.username` (name lookup), `player.signedIn` (offline state; polled every 60s). `skillMap` was the source for `Skill.swift` (hardcoded, not fetched). |
 
 Channels probed that produced no events: `character_stats`, `player_state`,
 `health_state`, `active_buff_state`. BitJita's frontend also uses
-`health_state`, `active_buff_state`, `passive_craft_state:owner_e…`,
-`placeable_state`, `growth_state` (not used here yet); like
-`character_stats_state` they probably only send on change.
+`health_state`, `active_buff_state`, `passive_craft_state:owner_entity_id:<id>`,
+`placeable_state`, `growth_state`; like `character_stats_state` they probably
+only send on change.
+
+### BitJita REST — `src/net/api.rs`
+
+`https://bitjita.com/api/` (sent with a plain `BitCraftTracker/0.1` user
+agent: Python's default `urllib` agent got 403).
+
+| Endpoint | Used for |
+|---|---|
+| `players/<id>/crafts` | Craft list: `entityId`, `progress`, `totalActionsRequired`, `completed`, `craftedItem[].item_id` → `items[].name`, `buildingName`. Polled every 60s to discover new crafts (then followed live). |
+| `players/<id>/passive-crafts` | Passive crafts (fallback when the relay isn't live). Same envelope as crafts (`craftResults`, `items`) but each result only has `entityId`, `buildingName`, `recipeId`, `recipeName` (e.g. `"Weave {0}"`, `{0}` = item), `status`, start `timestamp`, `craftedItem`, `slot`. **No progress or end time.** Only `status: "complete"` observed; anything else = running. Completed crafts stay listed until collected. Can lag behind the game considerably (reason for the relay). |
+| `items/<itemId>` | `craftingRecipes[]` with `id`, `timeRequirement` (seconds). A passive recipe's **duration** (e.g. Weave Rough Cloth Strip = 180s); end = start `timestamp` + duration. Cached per recipe. |
+| `players/<id>/stats` | `stats.values[1]` = **max stamina**, `stats.values[19]` = **max satiation** (index order from BitJita's frontend stat list: maxHealth, maxStamina, …, satiationRegenRate (18), maxSatiation (19), …). Polled every 60s. Inferred mapping, not documented. |
+| `players/<id>/placeables` | Plants fallback. `instances[]`: `placeable{name, tag, tier}`, `placeableId`, `availableInteractions[].verbPhrase`, `updatedAt`, `nextStateAt`, `growthEndTimestamp`. Crops have tag `Farmed Crop`; others (e.g. sift collectors, `Sift`) are ignored. `urgency` is not useful for crops. |
+| `placeables/<placeableId>` | Catalog entry; `growth[].time` = `[min, max]` seconds for timed stages (e.g. Growing Basic Starbulb: 300s). Cached per type; only fetched for growing plants with a start time and no reported end. |
+| `players?q=<text>` | Player search: case-insensitive substring on username, **≥ 2 chars**, **max 50 results, alphabetical, no paging**. Re-ranked client-side: exact, then prefix, then rest. UI hints to type more when 50 come back. |
+| `players/<id>` | `username`, `signedIn` (offline state), `regionId` (relay database). Polled every 60s. `skillMap` was the source for `skill.rs` (hardcoded). |
 
 ### Data decisions
 
@@ -306,80 +340,89 @@ Channels probed that produced no events: `character_stats`, `player_state`,
   estimate equals the current value while regenerating, so any fraction of it
   would look reached. Without the API max, only the no-regen rule applies.
 - **XP gain** = any skill's quantity increased vs the previous update. Last
-  skill = skill with the largest increase in that update.
+  skill = skill with the largest increase in that update. (Observed: XP the
+  user expected as Forestry arrived as skill 12 = Fishing; ids follow
+  BitJita's `skillMap`.)
 - **Craft time remaining was removed** (rate-based ETA was too inaccurate).
   Show percent done instead, rounded down so it never shows 100% early.
 - A craft is **active** if it progressed in the last 30s; otherwise "Paused".
-- **Passive craft done** = BitJita `status == "complete"` **or** computed end
-  time passed (computed time is usually earlier than the 60s poll). Duration
-  doesn't account for any speed bonuses, so it's an estimate.
+- **Passive craft done** = reported complete **or** computed end time passed.
+  Duration doesn't account for speed bonuses, so it's an estimate.
 - **Crop lifecycle** (same for all 132 crop placeables in the catalog):
   `Planted …` → *Fertilizer* action (e.g. 3× Basic Fertilizer) →
   `Fertilized Planted …` → *Water* action (1× Water Bucket) →
   `Growing …` (timer) → `Grown …` → *Harvest*.
-- **Stage detection** (`PlantTracker.stage`): `Grown `/`Growing ` name prefix
-  first; otherwise the available interaction (`Fertilizer` / `Water`), falling
-  back to the `Fertilized Planted ` / `Planted ` name prefix. Non-crops → nil.
-  Grouped by `placeable.tier`.
-- **Time left**: `growthEndTimestamp` (or `nextStateAt`) when reported. These
-  were always null when checked (nothing was growing), so the format is
-  unverified; `BitJitaDate` accepts Postgres-style strings, ISO 8601, and
-  epoch seconds/ms. Fallback estimate = `updatedAt` + catalog growth duration
-  (max), marked with `~`; it assumes `updatedAt` is when growing started.
-
-## Rust / GPUI port (`gpui/`)
-
-A cross-platform (macOS, Windows, Linux) port of this app in Rust with
-[GPUI](https://gpui.rs), requested so it runs beyond macOS. **Same rules and
-data sources as described in this file**; when changing behavior, change both
-apps (or note here which one lags). Port-specific details, platform
-requirements and differences (tray text is a tooltip on Windows/Linux, no
-wake/network-change reconnect, keepalive window, rustls+ring) are in
-`gpui/README.md`. Structure mirrors the Swift app: `core/trackers.rs`
-(trackers + `ActivityCheck`), `model.rs` (`AppModel`), `net/` (live websocket,
-REST, relay), `ui.rs` (panel). `cargo test` covers the main status rules.
-Verified on macOS only (live data, panel); Windows/Linux builds are untested.
+- **Stage detection** (`PlantTracker::stage`): `Grown `/`Growing ` name prefix
+  first; otherwise the available interaction (`fertilizer` / `water`, REST
+  only), falling back to the `Fertilized Planted ` / `Planted ` name prefix.
+  Non-crops → None. Grouped by tier.
+- **Time left**: reported end (relay `growth_state`, REST
+  `growthEndTimestamp` / `nextStateAt`) when present — always empty/null when
+  checked. Fallback estimate = start + catalog growth duration (max), marked
+  `~`; start = seen-switching-to-growing (relay) or `updatedAt` (REST,
+  assumed to be when growing started). `api::parse_date` accepts
+  Postgres-style strings, ISO 8601 and epoch seconds/ms.
 
 ## Project settings
 
-- macOS only (`SUPPORTED_PLATFORMS = macosx`); template was multiplatform but
-  `MenuBarExtra` is macOS-only. Deployment target macOS 27.
-- `INFOPLIST_KEY_LSUIElement = YES` (no Dock icon).
-- App Sandbox on, `ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES` (websocket + REST).
-- Swift 5 mode, `SWIFT_DEFAULT_ACTOR_ISOLATION = MainActor`. Watch for
-  "main actor-isolated … nonisolated context" warnings when passing functions
-  as values (e.g. `map(Skill.name)`); use a closure instead.
-- **SwiftUI in the popover**: the MenuBarExtra window sizes to its content,
-  so a `ScrollView` collapses to almost no height (`maxHeight` only caps it).
-  Give scrollable lists an explicit `.frame(height:)` (see `CharacterPicker`:
-  fixed row height × min(count, 10)). Use `.fixedSize()` on text that must not
-  be truncated (e.g. the stamina value).
-- Files are in a file-system-synchronized group: new files in
-  `BitCraftTrackerBar/` are picked up without editing the pbxproj.
-- Scheme is named `MyApp`. Build:
-  `xcodebuild -project BitCraftTrackerBar.xcodeproj -scheme MyApp -destination 'platform=macOS' build`
+- **Build/run**: `cargo run --release` (tray), `cargo run -- --open` (also
+  open the panel), `BITCRAFT_DEBUG=1` (log label/status changes and
+  notifications to stderr; the only way to observe the app without a
+  screen), `BITCRAFT_NO_NOTIFY=1` (suppress notifications). `cargo test` for
+  the core rules and date parsing.
+- **Settings file**: `<config dir>/bitcraft-tracker/settings.json` (macOS
+  `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`).
+- **GPUI** 0.2.2 with `runtime_shaders`: Metal shaders compile at runtime,
+  so building on macOS doesn't need Xcode's Metal toolchain (it wasn't
+  installed).
+- **TLS**: rustls with the **`ring`** provider, installed at the top of
+  `main` (reqwest uses `rustls-no-provider`). With both ring and aws-lc
+  compiled in, rustls panicked on the first connection ("Could not
+  automatically determine the process-level CryptoProvider"); ring also
+  builds on Windows without cmake/NASM. Keep `aws-lc-rs` out of the tree
+  (`cargo tree -i aws-lc-rs` should find nothing).
+- **Tray**: `tray-icon` without default features; on Linux the `ksni`
+  (D-Bus StatusNotifierItem) backend, so no GTK. Works on KDE, XFCE, etc.;
+  GNOME needs the *AppIndicator and KStatusNotifierItem* extension. Tray
+  events are forwarded through `TrayIconEvent::set_event_handler` into an
+  async channel (wakes GPUI immediately). Click coordinates are physical
+  pixels → divided by `platform::scale_factor()`.
+- **Dev profile** has no debug info and no incremental cache to keep
+  `target/` around 2 GB (the dev machine had only a few GB of free disk).
+- **Platform requirements**: Windows needs the MSVC toolchain; Linux needs
+  GPUI's libs (Vulkan, xkbcommon, wayland/X11, fontconfig), e.g.
+  `sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan1 libfontconfig-dev`.
+- **Verified on macOS only** (live data, panel, notifications). Windows and
+  Linux haven't been built or run yet; cross-checking Windows from macOS
+  fails in `ring`'s build script (needs an MSVC C toolchain).
 
 ## Known limitations / ideas
 
-- **Food buff tracking was tried and removed**: `players/<id>/buffs` exists
-  (food regen = stat "Passive Stamina Regeneration Rate" > 0), but BitJita
-  doesn't keep buffs up to date, so the "No food buff" alert was unreliable.
-  Food is inferred instead from stamina regen (Activity rule) and satiation.
-
-- Passive crafts: the in-progress `status` value and whether `slot` implies
-  queueing (crafts in one building running one after another rather than in
-  parallel) are unverified; all were `complete` with `slot: null` when checked.
-  If crafts turn out to queue, end times must chain instead of all starting at
-  their own `timestamp`.
-- BitJita returns 403 for Python's default `urllib` user agent; curl and
-  URLSession work.
-
-- Placeable data freshness depends on BitJita: when first checked, every
-  instance had the same `updatedAt` (likely synced periodically or on login),
-  so "grown" may lag behind the game. No websocket channel for it was found.
-
+- **Food buff tracking** (not implemented). BitJita's REST
+  `players/<id>/buffs` was tried in the Swift app and removed: BitJita doesn't
+  keep buffs up to date, so a "No food buff" alert was unreliable. Food is
+  inferred instead from stamina regen (Activity rule) and satiation. The
+  **relay** has the game's own data and looks promising (unverified):
+  `active_buff_state` (pk entity_id) = `[entity_id, [[buff_id,
+  [start], duration, [values]], …]]`; most entries have start `[0]` /
+  duration 0 (inactive); an active one looked like `[9, [1795550691], 15,
+  []]` (start probably Unix seconds). `buff_desc` (id, buff_type_id,
+  description, priority, duration, warn_time, `online_timestamp` = timer only
+  runs while online?, beneficial, …, stats), `buff_type_desc` (id, name,
+  category), `food_desc` (item_id, hp, stamina, hunger, …, `buffs[{buff_id,
+  duration?}]`) map food items → buffs. `player_state` has `time_signed_in`,
+  `sign_in_timestamp`, `signed_in` (possibly needed for online-time buffs, and
+  a live alternative to REST `signedIn`).
+- Passive crafts: whether crafts in one building queue (end times would need
+  chaining) is unverified; only Processing (parallel slots) and Complete were
+  seen.
+- Placeable data freshness via REST depends on BitJita (all instances had the
+  same `updatedAt` when first checked); the relay fixes this when live.
 - Skill names are hardcoded; unknown ids show as "Skill N".
-- Craft channels are never unsubscribed when crafts finish (harmless, cleared
-  on reconnect/user change).
-- Warning color is orange (`systemOrange`); user has called it "yellow".
-  Changing it affects every warning (Resting, Connecting…).
+- Craft channels are never unsubscribed when crafts finish (harmless, reset on
+  character change).
+- Warning color is orange; the user has called it "yellow". Changing it
+  affects every warning (Resting, Connecting…, Craft finished).
+- The tray label on macOS is single-colored plain text (the Swift app colored
+  issues by severity). Coloring would need rendering the text into the icon
+  image.

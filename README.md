@@ -1,8 +1,9 @@
-# BitCraft Tracker (Rust / GPUI)
+# BitCraft Tracker
 
-Cross-platform (macOS, Windows, Linux) port of the macOS menu bar app in
-`../BitCraftTrackerBar`. Same behavior, rules and data sources; those are
-documented in `../AGENTS.md` (keep both apps in sync with it).
+Cross-platform (macOS, Windows, Linux) tray app showing the status of a
+BitCraft character, built with Rust and [GPUI](https://gpui.rs). Data comes
+from [BitJita](https://bitjita.com). Behavior, status rules, data sources and
+design decisions are documented in [`AGENTS.md`](AGENTS.md).
 
 ## Run
 
@@ -46,7 +47,7 @@ channel; a GPUI foreground task feeds them into `Model`, which produces
 commands (subscribe, reconnect, track character) and notifications that
 `AppState::flush` forwards.
 
-## Differences from the macOS app
+## Platform notes
 
 - **Menu bar text**: macOS shows the label next to the icon (plain text, one
   color). Windows/Linux trays only show icons, so the label is the tooltip.
