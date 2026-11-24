@@ -14,9 +14,13 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::{NetEvent, RelayState};
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{PassiveCraft, Plant, now};
+use crate::core::types::{FoodBuff, FoodState, PassiveCraft, Plant, now};
 
 const HOST: &str = "relay.bitjita.com";
+/// `buff_type_desc` ids: "Food Regen" (every food) and "Food Buffs" (extras).
+const FOOD_REGEN_TYPE: i64 = 1790361536;
+const FOOD_BUFFS_TYPE: i64 = 861783812;
+
 /// Refused for another reason than "still loading" (e.g. region not mirrored).
 const REFUSED_RETRY: Duration = Duration::from_secs(5 * 60);
 
@@ -127,6 +131,11 @@ impl Feed {
             format!("SELECT placeable_desc.* FROM placeable_desc JOIN placeable_state ON placeable_desc.id = placeable_state.placeable_id WHERE placeable_state.owner_entity_id = {u}"),
             format!("SELECT growth_state.* FROM growth_state JOIN placeable_state ON growth_state.entity_id = placeable_state.entity_id WHERE placeable_state.owner_entity_id = {u}"),
         ];
+        // Food buffs: the character's active buffs + the food buff types'
+        // descriptions (names).
+        q.push(format!("SELECT * FROM active_buff_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
+        q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
         q.extend(self.building_desc_ids.iter().map(|id| format!("SELECT * FROM building_desc WHERE id = {id}")));
         q
@@ -149,6 +158,42 @@ impl Feed {
         self.item_ids.extend(items);
         self.building_desc_ids.extend(buildings);
         true
+    }
+
+    /// Active food buffs: `active_buff_state.active_buffs[]` =
+    /// `[buff_id, [start (Unix s)], duration (s), values]`; inactive entries
+    /// have start 0. Only food types are subscribed in `buff_desc`, so a
+    /// match there means it's a food buff.
+    fn food_buffs(&self) -> Vec<(i64, FoodBuff)> {
+        let now = now();
+        let Some(row) = self.store.rows("active_buff_state").next() else { return vec![] };
+        row.get(1)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|buff| {
+                let buff = buff.as_array()?;
+                let id = buff.first().and_then(int)?;
+                let start = buff.get(1)?.as_array()?.first()?.as_f64()?;
+                let duration = buff.get(2)?.as_f64()?;
+                let desc = self.store.get("buff_desc", &id.to_string())?;
+                let ends_at = start + duration;
+                (start > 0.0 && ends_at > now).then(|| {
+                    (
+                        id,
+                        FoodBuff {
+                            name: desc.get(2).and_then(Value::as_str).unwrap_or("Food buff").to_string(),
+                            is_regen: desc.get(1).and_then(int) == Some(FOOD_REGEN_TYPE),
+                            ends_at,
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
+    fn food(&self) -> FoodState {
+        FoodState { buffs: self.food_buffs().into_iter().map(|(_, b)| b).collect() }
     }
 
     fn passive_crafts(&self) -> Vec<PassiveCraft> {
@@ -295,6 +340,7 @@ async fn session(
                 emit(NetEvent::Relay(RelayState::Live));
                 emit(NetEvent::RelayPassiveCrafts(feed.passive_crafts()));
                 emit(NetEvent::RelayPlants(feed.plants(initial)));
+                emit(NetEvent::RelayFood(feed.food()));
                 if feed.add_missing_lookups() && sink.send(feed.subscribe_message()).await.is_err() {
                     return Ok(());
                 }

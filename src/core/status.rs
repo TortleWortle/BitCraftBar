@@ -29,9 +29,9 @@ pub struct Report {
     pub message: String,
 }
 
-/// A source changed: (previous status, new report). `previous` is None the
+/// A source changed: (previous report, new report). `previous` is None the
 /// first time a source reports (or after `clear`).
-pub type Change = (Option<HealthStatus>, Report);
+pub type Change = (Option<Report>, Report);
 
 #[derive(Default)]
 pub struct StatusMonitor {
@@ -43,11 +43,10 @@ pub struct StatusMonitor {
 impl StatusMonitor {
     pub fn report(&mut self, source: &str, status: HealthStatus, message: impl Into<String>) {
         let new = Report { source: source.to_string(), status, message: message.into() };
-        let previous = self.reports.get(source);
-        if previous != Some(&new) {
-            let previous_status = previous.map(|r| r.status);
+        let previous = self.reports.get(source).cloned();
+        if previous.as_ref() != Some(&new) {
             self.reports.insert(source.to_string(), new.clone());
-            self.changes.push((previous_status, new));
+            self.changes.push((previous, new));
         }
     }
 

@@ -59,6 +59,54 @@ pub struct Plant {
     pub growth_duration: Option<f64>,
 }
 
+/// One active food buff (relay `active_buff_state` + `buff_desc`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct FoodBuff {
+    /// e.g. "Level 3 Food Regen", "Level 2 Deluxe Action Speed".
+    pub name: String,
+    /// Buff type "Food Regen" (the stamina/health regen every food gives);
+    /// otherwise "Food Buffs" (extra effects of better food).
+    pub is_regen: bool,
+    pub ends_at: f64,
+}
+
+/// The character's active food buffs. (Food names were dropped: several
+/// foods give the same buffs and the names are long; the user preferred a
+/// summary of the buffs.)
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct FoodState {
+    pub buffs: Vec<FoodBuff>,
+}
+
+impl FoodBuff {
+    /// "Level 3 Food Regen" → "Regen 3", "Level 2 Deluxe Action Speed" →
+    /// "Deluxe Action Speed 2"; other names ("Mining Pie") unchanged.
+    pub fn short_name(&self) -> String {
+        let Some(rest) = self.name.strip_prefix("Level ") else { return self.name.clone() };
+        let Some((level, what)) = rest.split_once(' ') else { return self.name.clone() };
+        let what = if what == "Food Regen" { "Regen" } else { what };
+        format!("{what} {level}")
+    }
+}
+
+impl FoodState {
+    /// When the food regen runs out, if it's active.
+    pub fn regen_ends_at(&self, now: f64) -> Option<f64> {
+        self.buffs.iter().filter(|b| b.is_regen && b.ends_at > now).map(|b| b.ends_at).reduce(f64::max)
+    }
+
+    pub fn active(&self, now: f64) -> impl Iterator<Item = &FoodBuff> {
+        self.buffs.iter().filter(move |b| b.ends_at > now)
+    }
+
+    /// Active buffs, regen first: "Regen 3 · Deluxe Action Speed 2".
+    pub fn summary(&self, now: f64) -> String {
+        let mut buffs: Vec<&FoodBuff> = self.active(now).collect();
+        buffs.sort_by_key(|b| (!b.is_regen, b.name.clone()));
+        buffs.iter().map(|b| b.short_name()).collect::<Vec<_>>().join(" · ")
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlayerSummary {
@@ -66,4 +114,26 @@ pub struct PlayerSummary {
     pub username: String,
     pub signed_in: Option<bool>,
     pub region_id: Option<i64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn food_regen_and_label() {
+        let buff = |name: &str, is_regen, ends_at| FoodBuff { name: name.into(), is_regen, ends_at };
+        let food = FoodState {
+            buffs: vec![
+                buff("Level 2 Deluxe Action Speed", false, 200.0),
+                buff("Level 3 Food Regen", true, 100.0),
+                buff("Mining Pie", false, 200.0),
+            ],
+        };
+        assert_eq!(food.regen_ends_at(50.0), Some(100.0));
+        assert_eq!(food.summary(50.0), "Regen 3 · Deluxe Action Speed 2 · Mining Pie");
+        // The extra buffs alone don't count as food regen.
+        assert_eq!(food.regen_ends_at(150.0), None);
+        assert_eq!(food.summary(150.0), "Deluxe Action Speed 2 · Mining Pie");
+    }
 }

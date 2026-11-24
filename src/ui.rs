@@ -140,7 +140,7 @@ impl AppState {
         if std::env::var_os("BITCRAFT_DEBUG").is_some() {
             let m = &self.model;
             let line = format!(
-                "[{:?}] {} | stamina {:?}/{:?} | relay {:?} | plants {} | passive {} | crafts {}",
+                "[{:?}] {} | stamina {:?}/{:?} | relay {:?} | plants {} | passive {} | crafts {} | food {}",
                 m.monitor.overall(),
                 m.label_text(),
                 m.stamina.stamina,
@@ -149,6 +149,11 @@ impl AppState {
                 m.plants.tiers.iter().map(|t| t.total).sum::<usize>(),
                 m.passive.crafts.len(),
                 m.crafts.crafts.len(),
+                m.food.as_ref().map_or("?".to_string(), |f| format!(
+                    "{} regen_left={:?}",
+                    f.summary(m.now),
+                    f.regen_ends_at(m.now).map(|e| (e - m.now) as i64)
+                )),
             );
             if self.last_debug_line.as_deref() != Some(line.as_str()) {
                 eprintln!("{line}");
@@ -556,7 +561,26 @@ impl Panel {
                 "Last skill",
                 div().child(m.experience.last_skill_name().unwrap_or_else(|| "–".into())).into_any_element(),
             ))
+            .child(row("Food", self.food(m, theme)))
             .child(row("Last gain", div().child(last_gain).into_any_element()))
+    }
+
+    /// "45m 39s left" + "Regen 3 · Deluxe Action Speed 2".
+    fn food(&self, m: &Model, theme: Theme) -> AnyElement {
+        let Some(food) = &m.food else {
+            // Only known via the relay.
+            return div().text_color(theme.secondary).child("–").into_any_element();
+        };
+        let Some(end) = food.regen_ends_at(m.now) else {
+            return div().text_color(status_color(HealthStatus::Alert)).child("None").into_any_element();
+        };
+        div()
+            .flex()
+            .flex_col()
+            .min_w_0()
+            .child(format!("{} left", duration_string(end - m.now)))
+            .child(div().text_xs().text_color(theme.secondary).child(food.summary(m.now)))
+            .into_any_element()
     }
 
     fn plants(&self, m: &Model, theme: Theme) -> impl IntoElement {

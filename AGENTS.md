@@ -65,7 +65,8 @@ every 60s), overridden to *online* by any live websocket event in the last
 header (status dot, connection state, `· relay` while the relay is live),
 per-source status reports, stats rows (stamina bar `current / max` in the
 overall status color; **satiation bar** `current / max`, green, red at/below
-the alert threshold; total XP; last skill; last gain), plants, passive crafts,
+the alert threshold; total XP; last skill; **food**; last gain), plants,
+passive crafts,
 crafts (progress bar, percent, Paused/Done), character picker, Quit.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
@@ -76,11 +77,21 @@ crafts (progress bar, percent, Paused/Done), character picker, Quit.
 - **Passive crafts section**: grouped by building + item, with running count,
   time until the whole group is done, and how many are ready to collect.
   Running groups first. Not in the label (user didn't ask for it).
+- **Food row**: time until the food regen runs out (`45m 39s left`) with a
+  short summary of the active food buffs below it (`Regen 3 · Deluxe Action
+  Speed 2`; `FoodBuff::short_name` turns "Level 3 Food Regen" into "Regen
+  3"). Food *names* were shown first but dropped (user: too long; several
+  foods give the same buffs, so it was often "A / B"). Red "None" when no
+  food regen is active; "–" until the relay delivered buffs (relay only;
+  REST buff data is unreliable).
 - Light/dark colors follow the window appearance (`Theme`).
 
 ## Status rules
 
 Colors: green = healthy, orange = warning, red = alert. Overall = worst report.
+**Red is reserved for real problems** (no food, low satiation, offline,
+disconnected); being idle is orange (user request). Idle still notifies (see
+Notifications).
 Implemented in `src/core/trackers.rs` (`ActivityCheck::evaluate`,
 `SatiationTracker::report_current`) and `src/model.rs` (`Model::evaluate`:
 Player, Connection).
@@ -88,13 +99,14 @@ Player, Connection).
 | Source | Condition | Status | Message |
 |---|---|---|---|
 | Activity | last action was a craft and it completed | warning | Craft finished |
-| Activity | no counting XP, stamina "ready" (API max known) | alert | Idle: stamina full / Idle: stamina above N% (or Craft idle (N%) if the last action was an unfinished craft) |
+| Activity | no counting XP, stamina "ready" (API max known) | warning | Idle: stamina full / Idle: stamina above N% (or Craft idle (N%) if the last action was an unfinished craft) |
 | Activity | stamina regenerating (immediately, even with recent XP) | warning | Resting |
 | Activity | counting XP | healthy | Gaining experience |
-| Activity | last action was an unfinished craft, no XP, no regen | alert | Craft idle (N%) |
-| Activity | no XP, no regen in 10s (= no food active) | alert | Idle: no XP, no regen |
-| Activity | nothing received yet | alert | No XP or regen yet |
+| Activity | last action was an unfinished craft, no XP, no regen | warning | Craft idle (N%) |
+| Activity | no XP, no regen in 10s | warning | Idle: no XP, no regen |
+| Activity | nothing received yet | warning | No XP or regen yet |
 | Satiation | satiation ≤ 15 | alert | Low satiation (N) |
+| Food | food regen buff active / none (relay data only) | healthy / alert | Nm Ss left / No food |
 | Player | signed out / signed in | alert / healthy | Offline / Online |
 | Connection | connected / connecting / disconnected | healthy / warning / alert | Connected / Connecting… / Disconnected |
 
@@ -122,6 +134,11 @@ Activity rows are checked top to bottom.
   "Resting".
 - There is **no low-stamina warning** (removed): you run out of stamina
   exactly when you stop to regenerate, so it only duplicated "Resting".
+- **Food** (user request, re-added once reliable data existed): reported
+  only after the relay delivered `active_buff_state`; cleared while offline.
+  Only the "Food Regen" buff counts (every food gives one); extra "Food
+  Buffs" alone (e.g. action speed) don't. "No food" is a normal alert, so it
+  notifies when food runs out (5 min cooldown).
 - Messages are kept short because they're shown in the label.
 
 ## Notifications
@@ -133,7 +150,8 @@ thread. Produced by `Model` (`collect_notifications`,
 
 | Event | Rule |
 |---|---|
-| Error state | A status source changes **to alert from a known non-alert status**. A source's *first* report doesn't count, so the red "No XP or regen yet" at launch is silent. **5 min cooldown per source** (e.g. flapping connection). Alert → alert (message change) is silent. |
+| Error state | A status source changes **to alert from a known non-alert status**. A source's *first* report doesn't count. **5 min cooldown per source** (e.g. flapping connection). Alert → alert (message change) is silent. |
+| Went idle | Activity changes to an idle message (`ActivityCheck::is_idle`: "Idle…", "Craft idle…") from a known non-idle one (e.g. Gaining experience / Resting → Idle: stamina full). Idle → idle (message change) is silent. Same 5 min cooldown. Idle used to be red and notified as an error state; it became orange, and this keeps the notification. |
 | Craft finished | Once per craft, when live progress reaches the total, or when REST reports a tracked craft as `completed` (if the live event was missed). |
 | Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished on first load are silent, and so are those in the first list after **switching source** (REST ↔ relay): REST once listed no passive crafts while the relay had 3 finished ones, which notified as "finished" (`Model::switch_source`). |
 | Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first load or the first list after a source switch. |
@@ -274,6 +292,18 @@ game token was rejected: account risk, and the relay has the same data.
   work and can repeat a row once per match → the row store is ref-counted.
   `LIMIT` / HTTP `/sql` aren't available. Schema (column order/types):
   `GET /v1/database/idc-14/schema?version=9`.
+- **Food buffs** (`Feed::food`): `active_buff_state` (pk entity_id) =
+  `[entity_id, [[buff_id, [start], duration, values], …]]`, ~370 entries
+  per player; inactive ones have start `[0]`. **start is Unix seconds**,
+  duration seconds (food: 900/1800/3600). `buff_desc` is subscribed only for
+  the two food buff types (`buff_type_id` 1790361536 "Food Regen", 11 rows;
+  861783812 "Food Buffs", 96 rows): a match = food buff; column 2 = name.
+  Expiry is computed from start + duration on each tick. Not subscribed
+  anymore: `food_desc` (413 rows; column 8 = `[[buff_id, duration option],
+  …]` maps food items → buffs). It was used to name the food, but 369 foods
+  share 223 buff sets (often ambiguous) and the names were too long. `buff_desc.online_timestamp` is true for food buffs; whether
+  that pauses the timer while signed out is unverified (it doesn't matter
+  while playing).
 - Tables used (column indices in `relay.rs`): `passive_craft_state`
   (entity, owner, recipe_id, building_entity_id, timestamp, status
   Queued/Processing/Complete, slot), `crafting_recipe_desc` (name,
@@ -398,21 +428,12 @@ agent: Python's default `urllib` agent got 403).
 
 ## Known limitations / ideas
 
-- **Food buff tracking** (not implemented). BitJita's REST
-  `players/<id>/buffs` was tried in the Swift app and removed: BitJita doesn't
-  keep buffs up to date, so a "No food buff" alert was unreliable. Food is
-  inferred instead from stamina regen (Activity rule) and satiation. The
-  **relay** has the game's own data and looks promising (unverified):
-  `active_buff_state` (pk entity_id) = `[entity_id, [[buff_id,
-  [start], duration, [values]], …]]`; most entries have start `[0]` /
-  duration 0 (inactive); an active one looked like `[9, [1795550691], 15,
-  []]` (start probably Unix seconds). `buff_desc` (id, buff_type_id,
-  description, priority, duration, warn_time, `online_timestamp` = timer only
-  runs while online?, beneficial, …, stats), `buff_type_desc` (id, name,
-  category), `food_desc` (item_id, hp, stamina, hunger, …, `buffs[{buff_id,
-  duration?}]`) map food items → buffs. `player_state` has `time_signed_in`,
-  `sign_in_timestamp`, `signed_in` (possibly needed for online-time buffs, and
-  a live alternative to REST `signedIn`).
+- **Food via REST** (`players/<id>/buffs`) was tried in the Swift app and
+  removed: BitJita doesn't keep buffs up to date. Food now comes from the
+  relay only; without the relay (unmirrored region) there's no Food report,
+  and food is inferred from stamina regen (Activity rule) and satiation.
+- Relay `player_state` has `time_signed_in`, `sign_in_timestamp`,
+  `signed_in`: a possible live alternative to the REST `signedIn` poll.
 - Passive crafts: whether crafts in one building queue (end times would need
   chaining) is unverified; only Processing (parallel slots) and Complete were
   seen.

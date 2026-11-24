@@ -551,6 +551,12 @@ impl Default for ActivityCheck {
 impl ActivityCheck {
     pub const SOURCE: &'static str = "Activity";
 
+    /// Idle messages (warning, orange; user: red is for food/satiation/
+    /// connection problems). Going idle still notifies, see `Model`.
+    pub fn is_idle(message: &str) -> bool {
+        message.starts_with("Idle") || message.starts_with("Craft idle")
+    }
+
     /// Stamina fraction at which the player can continue, per skill.
     fn ready_fraction(skill: Option<i64>) -> f64 {
         match skill.and_then(Skill::from_id) {
@@ -591,17 +597,17 @@ impl ActivityCheck {
                     format!("Idle: stamina above {}%", (ready * 100.0) as i64)
                 }
             });
-            monitor.report(src, HealthStatus::Alert, msg);
+            monitor.report(src, HealthStatus::Warning, msg);
         } else if stamina.is_regenerating(self.regen_window, now) {
             monitor.report(src, HealthStatus::Warning, "Resting");
         } else if gained {
             monitor.report(src, HealthStatus::Healthy, "Gaining experience");
         } else if let Some(msg) = idle_craft {
-            monitor.report(src, HealthStatus::Alert, msg);
+            monitor.report(src, HealthStatus::Warning, msg);
         } else if xp.last_gain_at.is_none() {
-            monitor.report(src, HealthStatus::Alert, "No XP or regen yet");
+            monitor.report(src, HealthStatus::Warning, "No XP or regen yet");
         } else {
-            monitor.report(src, HealthStatus::Alert, "Idle: no XP, no regen");
+            monitor.report(src, HealthStatus::Warning, "Idle: no XP, no regen");
         }
     }
 }
@@ -637,7 +643,8 @@ mod tests {
         xp.handle(&[(12, 42)], 1.0);
         stamina.handle(30.0, 1.0);
         ActivityCheck::default().evaluate(&xp, &stamina, None, &mut monitor, 40.0);
-        assert_eq!(monitor.sorted_reports()[0].message, "Idle: stamina above 20%");
+        let report = &monitor.sorted_reports()[0];
+        assert_eq!((report.status, report.message.as_str()), (HealthStatus::Warning, "Idle: stamina above 20%"));
     }
 
     #[test]

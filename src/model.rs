@@ -9,7 +9,7 @@ use crate::core::trackers::{
     ActivityCheck, Craft, CraftTracker, ExperienceTracker, PassiveCraftTracker, PlantTracker, SatiationTracker,
     StaminaTracker,
 };
-use crate::core::types::{PlayerSummary, now};
+use crate::core::types::{FoodState, PlayerSummary, now};
 use crate::net::{Command, ConnState, NetEvent, RelayState, live};
 use crate::settings::Settings;
 
@@ -21,6 +21,7 @@ pub const STALE_FEED_WINDOW: f64 = 60.0;
 pub const ALERT_COOLDOWN: f64 = 5.0 * 60.0;
 const PLAYER_SOURCE: &str = "Player";
 const CONNECTION_SOURCE: &str = "Connection";
+const FOOD_SOURCE: &str = "Food";
 
 pub struct Notification {
     pub title: String,
@@ -36,6 +37,9 @@ pub struct Model {
     pub crafts: CraftTracker,
     pub plants: PlantTracker,
     pub passive: PassiveCraftTracker,
+    /// Food buffs from the relay; None until the relay delivered them (no
+    /// "Food" report then: REST buff data is unreliable).
+    pub food: Option<FoodState>,
     activity: ActivityCheck,
 
     pub live_state: ConnState,
@@ -76,6 +80,7 @@ impl Model {
             crafts: CraftTracker::default(),
             plants: PlantTracker::default(),
             passive: PassiveCraftTracker::default(),
+            food: None,
             activity: ActivityCheck::default(),
             live_state: ConnState::Connecting,
             relay_state: RelayState::Off,
@@ -121,6 +126,7 @@ impl Model {
             self.crafts = CraftTracker::default();
             self.plants = PlantTracker::default();
             self.passive = PassiveCraftTracker::default();
+            self.food = None;
             self.monitor = StatusMonitor::default();
             self.relay_state = RelayState::Off;
             self.live_state = ConnState::Connecting;
@@ -204,6 +210,7 @@ impl Model {
             }
             NetEvent::InitialRestDone => self.initial_rest_done = true,
             NetEvent::Relay(state) => self.relay_state = state,
+            NetEvent::RelayFood(food) => self.food = Some(food),
         }
         self.collect_notifications();
         self.update_loading();
@@ -229,6 +236,19 @@ impl Model {
         let changed = slot.is_some_and(|was| was != relay);
         *slot = Some(relay);
         changed
+    }
+
+    /// Food: healthy while a food regen buff runs, alert "No food" when it
+    /// ran out (also a notification, via the alert transition).
+    fn report_food(&mut self) {
+        let Some(food) = &self.food else { return };
+        match food.regen_ends_at(self.now) {
+            Some(end) => {
+                let left = crate::ui::duration_string(end - self.now);
+                self.monitor.report(FOOD_SOURCE, HealthStatus::Healthy, format!("{left} left"));
+            }
+            None => self.monitor.report(FOOD_SOURCE, HealthStatus::Alert, "No food"),
+        }
     }
 
     fn apply_stats(&mut self, values: &[f64]) {
@@ -267,11 +287,13 @@ impl Model {
             // Cleared: coming back online is a first report → no notification.
             self.monitor.clear(ActivityCheck::SOURCE);
             self.monitor.clear(SatiationTracker::SOURCE);
+            self.monitor.clear(FOOD_SOURCE);
             self.monitor.report(PLAYER_SOURCE, HealthStatus::Alert, "Offline");
         } else {
             self.monitor.report(PLAYER_SOURCE, HealthStatus::Healthy, "Online");
             self.activity.evaluate(&self.experience, &self.stamina, self.crafts.last_worked.as_ref(), &mut self.monitor, self.now);
             self.satiation.report_current(&mut self.monitor);
+            self.report_food();
         }
         match self.live_state {
             ConnState::Connected => self.monitor.report(CONNECTION_SOURCE, HealthStatus::Healthy, "Connected"),
@@ -281,14 +303,20 @@ impl Model {
         self.collect_alert_notifications();
     }
 
-    /// A source turning red from a known non-red state; 5 min cooldown.
+    /// A source turning red from a known non-red state, or the activity
+    /// going idle (orange) from a known non-idle state; 5 min cooldown.
     fn collect_alert_notifications(&mut self) {
         let changes = self.monitor.take_changes();
         if self.is_loading {
             return;
         }
         for (previous, report) in changes {
-            if report.status != HealthStatus::Alert || previous.is_none_or(|p| p == HealthStatus::Alert) {
+            let Some(previous) = previous else { continue };
+            let turned_red = report.status == HealthStatus::Alert && previous.status != HealthStatus::Alert;
+            let went_idle = report.source == ActivityCheck::SOURCE
+                && ActivityCheck::is_idle(&report.message)
+                && !ActivityCheck::is_idle(&previous.message);
+            if !turned_red && !went_idle {
                 continue;
             }
             if self.last_alert_at.get(&report.source).is_some_and(|t| self.now - t < ALERT_COOLDOWN) {

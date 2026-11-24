@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{CraftInfo, PassiveCraft, Plant, PlayerSummary};
+use crate::core::types::{CraftInfo, FoodState, PassiveCraft, Plant, PlayerSummary};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnState {
@@ -54,6 +54,7 @@ pub enum NetEvent {
     Relay(RelayState),
     RelayPassiveCrafts(Vec<PassiveCraft>),
     RelayPlants(Vec<Plant>),
+    RelayFood(FoodState),
 }
 
 pub enum Outgoing {
