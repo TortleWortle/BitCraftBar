@@ -71,8 +71,7 @@ crafts (progress bar, percent, Paused/Done), character picker, Quit.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
   currently growing** (count + time until the whole tier is grown, `~` when
-  estimated; `coarse_duration_string`: `1h 05m`, `4m` (minutes rounded up),
-  seconds only under a minute, `42s`; user preference), then separate rows for *Needs fertilizer*, *Needs water* and
+  estimated), then separate rows for *Needs fertilizer*, *Needs water* and
   *Ready to harvest* with per-tier counts (user asked for growing-only in the
   tracker and the needs shown separately).
 - **Passive crafts section**: grouped by building + item, with running count,
@@ -85,6 +84,9 @@ crafts (progress bar, percent, Paused/Done), character picker, Quit.
   foods give the same buffs, so it was often "A / B"). Red "None" when no
   food regen is active; "–" until the relay delivered buffs (relay only;
   REST buff data is unreliable).
+- **Timers** (plants, passive crafts, food, last gain; `ui::duration_string`):
+  `1h 05m`, `4m` (minutes rounded up, so never `0m` with time left), and
+  seconds only under a minute, `42s` (user preference; was `4m 12s`).
 - Light/dark colors follow the window appearance (`Theme`).
 
 ## Status rules
