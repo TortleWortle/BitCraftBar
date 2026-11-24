@@ -119,7 +119,9 @@ final class PlantTracker {
         growthDurations[placeableId] = duration
     }
 
-    func update(plants: [Plant]) {
+    /// `baseline`: first list from a different source; no notifications.
+    func update(plants: [Plant], baseline: Bool = false) {
+        if baseline { hasLoaded = false }
         var byTier: [Int: TierSummary] = [:]
         for plant in plants {
             guard let stage = Self.stage(of: plant) else { continue }

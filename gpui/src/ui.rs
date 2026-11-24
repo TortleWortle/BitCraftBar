@@ -1,0 +1,789 @@
+//! GPUI views: `AppState` (owns the model, tray and popup) and the popup
+//! `Panel` (port of the Swift `StatusPanelView` + `CharacterPicker`).
+
+use std::time::{Duration, Instant};
+
+use gpui::{
+    AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight, Hsla, KeyDownEvent, Pixels, Render, Rgba,
+    SharedString, Subscription, Task, Window, WindowAppearance, WindowHandle, div, point, prelude::*, px, relative,
+    rgb, size,
+};
+use tokio::sync::mpsc::UnboundedSender;
+
+use crate::core::status::HealthStatus;
+use crate::core::trackers::{Craft, PassiveGroup, TierSummary};
+use crate::core::types::PlayerSummary;
+use crate::model::Model;
+use crate::net::{Command, ConnState, Outgoing, RelayState};
+use crate::notifier;
+use crate::tray::Tray;
+
+pub const PANEL_WIDTH: f32 = 320.0;
+
+/// Which popup edge stays put when it's resized to fit its content.
+#[derive(Clone, Copy, Debug)]
+pub enum Edge {
+    /// Tray at the top of the screen: grow downwards from here.
+    Top(Pixels),
+    /// Tray at the bottom (Windows taskbar): grow upwards from here.
+    Bottom(Pixels),
+}
+
+/// Where the popup goes, in GPUI's logical screen coordinates.
+#[derive(Clone, Copy, Debug)]
+pub struct Placement {
+    pub x: Pixels,
+    pub edge: Edge,
+    /// Room on screen; longer content scrolls.
+    pub max_height: Pixels,
+}
+
+impl Placement {
+    pub fn frame(&self, height: Pixels) -> Bounds<Pixels> {
+        let height = height.min(self.max_height);
+        let y = match self.edge {
+            Edge::Top(top) => top,
+            Edge::Bottom(bottom) => bottom - height,
+        };
+        Bounds { origin: point(self.x, y), size: size(px(PANEL_WIDTH), height) }
+    }
+}
+const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
+const MAX_RESULTS_SHOWN: usize = 10;
+
+pub struct AppState {
+    pub model: Model,
+    net: UnboundedSender<Command>,
+    tray: Option<Tray>,
+    pub popup: Option<WindowHandle<Panel>>,
+    pub popup_place: Option<Placement>,
+    /// Height the popup window was last sized to (avoids resize loops).
+    popup_height: Option<Pixels>,
+    /// Clicking the tray while the popup is open first deactivates (closes)
+    /// it; don't reopen it from that same click.
+    pub popup_closed_at: Option<Instant>,
+    pub picking: bool,
+    pub query: String,
+    pub results: Vec<PlayerSummary>,
+    pub searching: bool,
+    pub search_error: Option<String>,
+    search_task: Option<Task<()>>,
+    last_debug_line: Option<String>,
+}
+
+impl AppState {
+    pub fn new(model: Model, net: UnboundedSender<Command>, tray: Option<Tray>) -> Self {
+        let mut state = Self {
+            model,
+            net,
+            tray,
+            popup: None,
+            popup_place: None,
+            popup_height: None,
+            popup_closed_at: None,
+            picking: false,
+            query: String::new(),
+            results: Vec::new(),
+            searching: false,
+            search_error: None,
+            search_task: None,
+            last_debug_line: None,
+        };
+        state.flush();
+        state
+    }
+
+    pub fn handle_net(&mut self, message: Outgoing, cx: &mut Context<Self>) {
+        match message {
+            Outgoing::Event { user, event } => self.model.handle(&user, event),
+            Outgoing::SearchResults { query, result } => {
+                if query.trim() == self.query.trim() {
+                    self.searching = false;
+                    match result {
+                        Ok(players) => {
+                            self.results = players;
+                            self.search_error = None;
+                        }
+                        Err(e) => self.search_error = Some(e),
+                    }
+                }
+            }
+        }
+        self.flush();
+        cx.notify();
+    }
+
+    pub fn tick(&mut self, cx: &mut Context<Self>) {
+        self.model.tick();
+        self.flush();
+        cx.notify();
+    }
+
+    /// Forward model outputs: network commands, notifications, tray.
+    fn flush(&mut self) {
+        for command in self.model.take_commands() {
+            let _ = self.net.send(command);
+        }
+        for n in self.model.take_notifications() {
+            notifier::notify(n.title, n.body);
+        }
+        if let Some(tray) = &mut self.tray {
+            let m = &self.model;
+            let (rgb, stamina) = if m.is_loading {
+                (HealthStatus::Warning.rgb(), Some(0.0))
+            } else {
+                (m.monitor.overall().rgb(), m.stamina.fraction())
+            };
+            tray.update(rgb, stamina, &m.label_text());
+        }
+        // BITCRAFT_DEBUG=1: log label changes (no tray/screenshot needed).
+        if std::env::var_os("BITCRAFT_DEBUG").is_some() {
+            let m = &self.model;
+            let line = format!(
+                "[{:?}] {} | stamina {:?}/{:?} | relay {:?} | plants {} | passive {} | crafts {}",
+                m.monitor.overall(),
+                m.label_text(),
+                m.stamina.stamina,
+                m.stamina.max,
+                m.relay_state,
+                m.plants.tiers.iter().map(|t| t.total).sum::<usize>(),
+                m.passive.crafts.len(),
+                m.crafts.crafts.len(),
+            );
+            if self.last_debug_line.as_deref() != Some(line.as_str()) {
+                eprintln!("{line}");
+                self.last_debug_line = Some(line);
+            }
+        }
+    }
+
+    pub fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+        self.query = query;
+        self.search_error = None;
+        let q = self.query.trim().to_string();
+        if q.chars().count() < 2 {
+            self.results.clear();
+            self.searching = false;
+            self.search_task = None;
+            cx.notify();
+            return;
+        }
+        self.searching = true;
+        let timer = cx.background_executor().timer(SEARCH_DEBOUNCE);
+        self.search_task = Some(cx.spawn(async move |this, cx| {
+            timer.await;
+            let _ = this.update(cx, |this, _| {
+                if this.query.trim() == q {
+                    let _ = this.net.send(Command::Search(q));
+                }
+            });
+        }));
+        cx.notify();
+    }
+
+    pub fn select(&mut self, player: PlayerSummary, cx: &mut Context<Self>) {
+        self.model.select_player(&player);
+        self.picking = false;
+        self.query.clear();
+        self.results.clear();
+        self.flush();
+        cx.notify();
+    }
+}
+
+// MARK: - Panel
+
+pub struct Panel {
+    state: Entity<AppState>,
+    focus: FocusHandle,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl Panel {
+    pub fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let focus = cx.focus_handle();
+        focus.focus(window);
+        let subscriptions = vec![
+            cx.observe(&state, |_, _, cx| cx.notify()),
+            // Close when clicking elsewhere (like a menu bar popover).
+            cx.observe_window_activation(window, |this, window, cx| {
+                if !window.is_window_active() {
+                    this.state.update(cx, |s, _| {
+                        s.popup = None;
+                        s.popup_height = None;
+                        s.popup_closed_at = Some(Instant::now());
+                        s.picking = false;
+                    });
+                    window.remove_window();
+                }
+            }),
+        ];
+        Self { state, focus, _subscriptions: subscriptions }
+    }
+
+    fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let keystroke = &event.keystroke;
+        let state = self.state.clone();
+        if keystroke.key == "escape" {
+            state.update(cx, |s, cx| {
+                if s.picking {
+                    s.picking = false;
+                    cx.notify();
+                }
+            });
+            return;
+        }
+        if !state.read(cx).picking || keystroke.modifiers.platform || keystroke.modifiers.control {
+            return;
+        }
+        let mut query = state.read(cx).query.clone();
+        match keystroke.key.as_str() {
+            "backspace" => {
+                query.pop();
+            }
+            "enter" => {
+                if let Some(first) = state.read(cx).results.first().cloned() {
+                    state.update(cx, |s, cx| s.select(first, cx));
+                }
+                return;
+            }
+            _ => match &keystroke.key_char {
+                Some(text) if !text.chars().any(char::is_control) => query.push_str(text),
+                _ => return,
+            },
+        }
+        state.update(cx, |s, cx| s.set_query(query, cx));
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Theme {
+    bg: Rgba,
+    text: Rgba,
+    secondary: Rgba,
+    border: Rgba,
+    track: Rgba,
+    hover: Rgba,
+}
+
+impl Theme {
+    fn for_appearance(appearance: WindowAppearance) -> Self {
+        match appearance {
+            WindowAppearance::Dark | WindowAppearance::VibrantDark => Self {
+                bg: rgb(0x242426),
+                text: rgb(0xf2f2f2),
+                secondary: rgb(0xa8a8ad),
+                border: rgb(0x3a3a3c),
+                track: rgb(0x3a3a3c),
+                hover: rgb(0x343438),
+            },
+            _ => Self {
+                bg: rgb(0xf7f7f7),
+                text: rgb(0x1c1c1e),
+                secondary: rgb(0x636366),
+                border: rgb(0xd8d8dc),
+                track: rgb(0xe0e0e4),
+                hover: rgb(0xeaeaee),
+            },
+        }
+    }
+}
+
+fn status_color(status: HealthStatus) -> Rgba {
+    rgb(status.rgb())
+}
+
+/// "1h 05m" or "4m 12s".
+pub fn duration_string(seconds: f64) -> String {
+    let total = seconds.max(0.0).ceil() as i64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 { format!("{h}h {m:02}m") } else { format!("{m}m {s:02}s") }
+}
+
+fn dot(color: impl Into<Hsla>, size: f32) -> impl IntoElement {
+    div().size(px(size)).flex_none().rounded_full().bg(color.into())
+}
+
+fn bar(fraction: f64, color: Rgba, theme: Theme) -> impl IntoElement {
+    div()
+        .flex_1()
+        .min_w(px(40.0))
+        .h(px(6.0))
+        .rounded_full()
+        .bg(theme.track)
+        .child(div().h_full().rounded_full().bg(color).w(relative(fraction.clamp(0.0, 1.0) as f32)))
+}
+
+fn section_title(title: &str) -> impl IntoElement {
+    div().font_weight(FontWeight::SEMIBOLD).child(title.to_string())
+}
+
+fn divider(theme: Theme) -> impl IntoElement {
+    div().h(px(1.0)).w_full().bg(theme.border)
+}
+
+impl Render for Panel {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::for_appearance(window.appearance());
+        let state = self.state.read(cx);
+        let m = &state.model;
+
+        let header_color = if m.is_loading { status_color(HealthStatus::Warning) } else { status_color(m.monitor.overall()) };
+        let live = match m.live_state {
+            ConnState::Connected => "Connected",
+            ConnState::Connecting => "Connecting…",
+            ConnState::Disconnected => "Disconnected",
+        };
+        let relay = match m.relay_state {
+            RelayState::Live => " · relay",
+            RelayState::Connecting => " · relay…",
+            RelayState::Off | RelayState::Unavailable(_) => "",
+        };
+
+        let mut body: Vec<AnyElement> = Vec::new();
+        body.push(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(dot(header_color, 12.0))
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(14.0)).child("BitCraft Tracker"))
+                .child(div().flex_1())
+                .child(div().text_xs().text_color(theme.secondary).child(format!("{live}{relay}")))
+                .into_any_element(),
+        );
+
+        if m.is_loading {
+            let name = m.settings.username.clone().unwrap_or_else(|| "character".into());
+            body.push(
+                div()
+                    .h(px(60.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.secondary)
+                    .child(format!("Loading {name}…"))
+                    .into_any_element(),
+            );
+        } else {
+            body.push(self.reports(m, theme).into_any_element());
+            body.push(divider(theme).into_any_element());
+            body.push(self.stats(m, theme).into_any_element());
+            if !m.plants.tiers.is_empty() {
+                body.push(divider(theme).into_any_element());
+                body.push(self.plants(m, theme).into_any_element());
+            }
+            if !m.passive.has_loaded {
+                body.push(divider(theme).into_any_element());
+                body.push(
+                    div()
+                        .flex()
+                        .items_center()
+                        .child(section_title("Passive crafts"))
+                        .child(div().flex_1())
+                        .child(div().text_xs().text_color(theme.secondary).child("Loading…"))
+                        .into_any_element(),
+                );
+            } else if !m.passive.crafts.is_empty() {
+                body.push(divider(theme).into_any_element());
+                body.push(self.passive(m.passive.groups(m.now), m.now, theme).into_any_element());
+            }
+            let crafts = m.crafts.sorted();
+            if !crafts.is_empty() {
+                body.push(divider(theme).into_any_element());
+                body.push(self.crafts(&crafts, m, theme).into_any_element());
+            }
+        }
+
+        body.push(divider(theme).into_any_element());
+        body.push(self.picker(state, theme, cx).into_any_element());
+        body.push(
+            div()
+                .flex()
+                .child(div().flex_1())
+                .child(
+                    button("quit", "Quit", theme).on_click(|_, _, cx: &mut App| cx.quit()),
+                )
+                .into_any_element(),
+        );
+
+        let place = state.popup_place;
+        let max_height = place.map_or(px(600.0), |p| p.max_height);
+        let fit_state = self.state.clone();
+        div()
+            .track_focus(&self.focus)
+            .on_key_down(cx.listener(Self::on_key))
+            .size_full()
+            .flex()
+            .flex_col()
+            // Anchored at the bottom: keep the panel at the window's bottom.
+            .when(matches!(place.map(|p| p.edge), Some(Edge::Bottom(_))), |d| d.justify_end())
+            // Size the window to the panel once laid out (content changes,
+            // e.g. opening the character search, refit it).
+            .on_children_prepainted(move |bounds, window, cx| {
+                let Some(panel) = bounds.first() else { return };
+                fit_window(&fit_state, panel.size.height, window, cx);
+            })
+            .child(
+                div()
+                    .id("panel")
+                    .w_full()
+                    // Natural height (no shrinking to the current window),
+                    // so growing content is measured and the window follows.
+                    .flex_none()
+                    .max_h(max_height)
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .p_4()
+                    .bg(theme.bg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .rounded_lg()
+                    .text_size(px(13.0))
+                    .text_color(theme.text)
+                    .children(body),
+            )
+    }
+}
+
+/// Resize/move the popup window so it's exactly as tall as the panel.
+fn fit_window(state: &Entity<AppState>, height: Pixels, window: &mut Window, cx: &mut App) {
+    let (place, current) = {
+        let s = state.read(cx);
+        (s.popup_place, s.popup_height.unwrap_or(window.bounds().size.height))
+    };
+    let Some(place) = place else { return };
+    let height = height.min(place.max_height).ceil();
+
+    if (height - current).abs() < px(1.0) {
+        return;
+    }
+    state.update(cx, |s, _| s.popup_height = Some(height));
+    crate::platform::set_window_frame(window, place.frame(height), cx);
+}
+
+fn button(id: &'static str, label: &str, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_2()
+        .py_0p5()
+        .rounded_md()
+        .border_1()
+        .border_color(theme.border)
+        .cursor_pointer()
+        .hover(move |s| s.bg(theme.hover))
+        .child(label.to_string())
+}
+
+impl Panel {
+    fn reports(&self, m: &Model, theme: Theme) -> impl IntoElement {
+        div().flex().flex_col().gap_1p5().children(m.monitor.sorted_reports().into_iter().map(move |r| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(dot(status_color(r.status), 8.0))
+                .child(div().font_weight(FontWeight::MEDIUM).child(r.source))
+                .child(div().text_color(theme.secondary).child(r.message))
+        }))
+    }
+
+    fn stats(&self, m: &Model, theme: Theme) -> impl IntoElement {
+        let stamina_text = match m.stamina.stamina {
+            Some(s) => format!("{} / {}", s as i64, m.stamina.max.map_or("?".into(), |x| (x as i64).to_string())),
+            None => "–".into(),
+        };
+        let satiation_text = match m.satiation.satiation {
+            Some(s) => format!("{} / {}", s as i64, m.satiation.max as i64),
+            None => "–".into(),
+        };
+        let low = m.satiation.is_low();
+        let satiation_color = status_color(if low { HealthStatus::Alert } else { HealthStatus::Healthy });
+        let last_gain = match m.experience.last_gain_at {
+            Some(t) => {
+                let ago = duration_string(m.now - t);
+                if m.experience.last_gain_amount > 0 {
+                    format!("+{} {ago} ago", m.experience.last_gain_amount)
+                } else {
+                    format!("{ago} ago")
+                }
+            }
+            None => "–".into(),
+        };
+        let row = move |label: &str, value: AnyElement| {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(div().w(px(72.0)).flex_none().text_color(theme.secondary).child(label.to_string()))
+                .child(div().flex_1().flex().items_center().gap_2().child(value))
+        };
+        let with_bar = |fraction: f64, color: Rgba, text: String, text_color: Rgba| {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(bar(fraction, color, theme))
+                .child(div().flex_none().text_color(text_color).child(text))
+                .into_any_element()
+        };
+        let overall = if m.is_offline { HealthStatus::Alert } else { m.monitor.overall() };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(row(
+                "Stamina",
+                with_bar(m.stamina.fraction().unwrap_or(0.0), status_color(overall), stamina_text, theme.text),
+            ))
+            .child(row(
+                "Satiation",
+                with_bar(
+                    m.satiation.fraction().unwrap_or(0.0),
+                    satiation_color,
+                    satiation_text,
+                    if low { status_color(HealthStatus::Alert) } else { theme.text },
+                ),
+            ))
+            .child(row(
+                "Total XP",
+                div().child(m.experience.total.map_or("–".into(), group_thousands)).into_any_element(),
+            ))
+            .child(row(
+                "Last skill",
+                div().child(m.experience.last_skill_name().unwrap_or_else(|| "–".into())).into_any_element(),
+            ))
+            .child(row("Last gain", div().child(last_gain).into_any_element()))
+    }
+
+    fn plants(&self, m: &Model, theme: Theme) -> impl IntoElement {
+        let now = m.now;
+        let time_left = move |tier: &TierSummary| match tier.all_grown_at() {
+            None => "–".to_string(),
+            Some(end) if end <= now => "any moment".into(),
+            Some(end) => format!("{}{} left", if tier.is_estimate { "~" } else { "" }, duration_string(end - now)),
+        };
+        let need_row = |label: &str, color: u32, count: fn(&TierSummary) -> usize| {
+            let tiers: Vec<String> = m
+                .plants
+                .tiers
+                .iter()
+                .filter(|t| count(t) > 0)
+                .map(|t| format!("T{} ×{}", t.tier, count(t)))
+                .collect();
+            (!tiers.is_empty()).then(|| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .child(dot(rgb(color), 7.0))
+                    .child(label.to_string())
+                    .child(div().flex_1())
+                    .child(div().text_color(theme.secondary).child(tiers.join(", ")))
+            })
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(section_title("Plants"))
+            .children(m.plants.growing_tiers().into_iter().map(move |tier| {
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("T{}", tier.tier)))
+                    .child(div().text_color(theme.secondary).child(format!("{} growing", tier.growing)))
+                    .child(div().flex_1())
+                    .child(time_left(&tier))
+            }))
+            .children(need_row("Needs fertilizer", 0xff9500, |t| t.needs_fertilizer))
+            .children(need_row("Needs water", 0x0a84ff, |t| t.needs_water))
+            .children(need_row("Ready to harvest", 0x34c759, |t| t.grown))
+    }
+
+    fn passive(&self, groups: Vec<PassiveGroup>, now: f64, theme: Theme) -> impl IntoElement {
+        div().flex().flex_col().gap_1p5().child(section_title("Passive crafts")).children(groups.into_iter().map(
+            move |g| {
+                let status = if g.running == 0 {
+                    "Ready".to_string()
+                } else {
+                    match g.all_done_at.filter(|_| !g.has_unknown_end) {
+                        None => "Running".into(),
+                        Some(end) if end <= now => "any moment".into(),
+                        Some(end) => format!("{} left", duration_string(end - now)),
+                    }
+                };
+                let mut detail = vec![g.building.clone()];
+                if g.running > 0 {
+                    detail.push(format!("{} running", g.running));
+                }
+                if g.ready > 0 {
+                    detail.push(format!("{} ready to collect", g.ready));
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .flex()
+                            .child(div().font_weight(FontWeight::MEDIUM).child(g.name.clone()))
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .text_color(if g.running == 0 { status_color(HealthStatus::Healthy) } else { theme.secondary })
+                                    .child(status),
+                            ),
+                    )
+                    .child(div().text_xs().text_color(theme.secondary).child(detail.join(" · ")))
+            },
+        ))
+    }
+
+    fn crafts(&self, crafts: &[Craft], m: &Model, theme: Theme) -> impl IntoElement {
+        let now = m.now;
+        let window = m.crafts.active_window;
+        div().flex().flex_col().gap_2().child(section_title("Crafts")).children(crafts.iter().cloned().map(move |c| {
+            let status = if c.is_complete() {
+                Some("Done")
+            } else if c.last_progress_at.is_none_or(|t| now - t > window) {
+                Some("Paused")
+            } else {
+                None
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().font_weight(FontWeight::MEDIUM).child(c.name.clone()))
+                        .child(div().flex_1())
+                        .children(status.map(|s| div().text_color(theme.secondary).child(s)))
+                        .child(c.percent_string()),
+                )
+                .child(div().flex().child(bar(c.fraction(), rgb(0x0a84ff), theme)))
+                .child(div().text_xs().text_color(theme.secondary).child(format!(
+                    "{} · {} / {}",
+                    c.building.clone().unwrap_or_default(),
+                    group_thousands(c.progress),
+                    group_thousands(c.total)
+                )))
+        }))
+    }
+
+    fn picker(&self, state: &AppState, theme: Theme, cx: &Context<Self>) -> impl IntoElement {
+        let name = state.model.settings.username.clone().unwrap_or_else(|| "Unknown".into());
+        if !state.picking {
+            return div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(div().text_color(theme.secondary).child("Character"))
+                .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                .child(div().flex_1())
+                .child(button("change", "Change", theme).on_click(cx.listener(|this, _, window, cx| {
+                    this.focus.focus(window);
+                    this.state.update(cx, |s, cx| {
+                        s.picking = true;
+                        s.query.clear();
+                        s.results.clear();
+                        cx.notify();
+                    });
+                })))
+                .into_any_element();
+        }
+
+        let query: SharedString = if state.query.is_empty() {
+            "Type a username…".into()
+        } else {
+            format!("{}▏", state.query).into()
+        };
+        let hint = if state.query.trim().chars().count() < 2 {
+            Some("Type at least 2 characters".to_string())
+        } else if let Some(e) = &state.search_error {
+            Some(format!("Search failed: {e}"))
+        } else if state.searching && state.results.is_empty() {
+            Some("Searching…".into())
+        } else if state.results.is_empty() {
+            Some("No players found".into())
+        } else if state.results.len() >= 50 {
+            Some("Showing the first 50; type more to narrow it down".into())
+        } else {
+            None
+        };
+        let current = state.model.settings.user_id.clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(status_color(HealthStatus::Warning))
+                            .text_color(if state.query.is_empty() { theme.secondary } else { theme.text })
+                            .child(query),
+                    )
+                    .child(button("cancel", "Cancel", theme).on_click(cx.listener(|this, _, _, cx| {
+                        this.state.update(cx, |s, cx| {
+                            s.picking = false;
+                            cx.notify();
+                        });
+                    }))),
+            )
+            .children(hint.map(|h| div().text_xs().text_color(theme.secondary).child(h)))
+            .child(
+                div()
+                    .id("results")
+                    .flex()
+                    .flex_col()
+                    .max_h(px(22.0 * MAX_RESULTS_SHOWN as f32))
+                    .overflow_y_scroll()
+                    .children(state.results.iter().cloned().enumerate().map(|(i, player)| {
+                        let selected = player.entity_id == current;
+                        let label = format!("{}{}", player.username, if player.signed_in == Some(true) { "  •" } else { "" });
+                        div()
+                            .id(("result", i))
+                            .h(px(22.0))
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .rounded_sm()
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(theme.hover))
+                            .when(selected, |d| d.font_weight(FontWeight::SEMIBOLD))
+                            .child(label)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let player = player.clone();
+                                this.state.update(cx, |s, cx| s.select(player, cx));
+                            }))
+                    })),
+            )
+            .into_any_element()
+    }
+}
+
+fn group_thousands(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, ch) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}

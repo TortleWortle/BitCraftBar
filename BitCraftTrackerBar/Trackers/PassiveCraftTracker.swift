@@ -104,7 +104,7 @@ final class PassiveCraftTracker {
     }
 
     /// From the REST endpoint (durations from `setDuration`).
-    func update(from response: BitJitaAPI.PassiveCraftsResponse, now: Date = .now) {
+    func update(from response: BitJitaAPI.PassiveCraftsResponse, now: Date = .now, baseline: Bool = false) {
         let itemNames = Dictionary(response.items.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
 
         let crafts = response.craftResults.map { result in
@@ -121,14 +121,16 @@ final class PassiveCraftTracker {
                 duration: durations[result.recipeId]
             )
         }
-        update(crafts: crafts, now: now)
+        update(crafts: crafts, now: now, baseline: baseline)
     }
 
-    /// Replace the craft list (from either source).
-    func update(crafts: [Craft], now: Date = .now) {
+    /// Replace the craft list (from either source). `baseline`: first list
+    /// from a different source (REST ↔ relay); its already-finished crafts
+    /// aren't news, like on the first load.
+    func update(crafts: [Craft], now: Date = .now, baseline: Bool = false) {
         self.crafts = crafts
 
-        if !hasLoaded {
+        if !hasLoaded || baseline {
             // Already finished before we started watching: don't notify.
             finishedIds.formUnion(crafts.filter { $0.isFinished(at: now) }.map(\.id))
             hasLoaded = true

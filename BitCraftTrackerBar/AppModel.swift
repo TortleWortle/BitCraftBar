@@ -78,10 +78,11 @@ final class AppModel {
             self?.route(channel: channel, data: data)
         }
         relay.onPassiveCrafts = { [weak self] crafts in
-            self?.passiveCrafts.update(crafts: crafts)
+            guard let self else { return }
+            self.passiveCrafts.update(crafts: crafts, baseline: self.switchSource(\.passiveFromRelay, toRelay: true))
         }
         relay.onPlants = { [weak self] plants in
-            self?.applyPlants(plants)
+            self?.applyPlants(plants, fromRelay: true)
         }
         setUpNotifications()
         connect()
@@ -104,6 +105,8 @@ final class AppModel {
         plants.reset()
         passiveCrafts.reset()
         relay.stop()
+        plantsFromRelay = nil
+        passiveFromRelay = nil
         reportedSignedIn = nil
         lastLiveEventAt = nil
         isOffline = false
@@ -317,16 +320,29 @@ final class AppModel {
         do {
             let placeables = try await BitJitaAPI.placeables(userId: userId)
             guard !Task.isCancelled, !relay.isLive else { return }
-            applyPlants(placeables.instances.map(PlantTracker.Plant.init))
+            applyPlants(placeables.instances.map(PlantTracker.Plant.init), fromRelay: false)
         } catch {
             print("Failed to fetch placeables: \(error)")
         }
     }
 
+    /// Which source fed plants / passive crafts last (true = relay).
+    /// Switching (REST ↔ relay) is a fresh baseline: the lists can differ
+    /// (REST lags), which would otherwise look like crafts finishing.
+    @ObservationIgnored private var plantsFromRelay: Bool?
+    @ObservationIgnored private var passiveFromRelay: Bool?
+
+    /// Records the source; true if it changed.
+    private func switchSource(_ slot: ReferenceWritableKeyPath<AppModel, Bool?>, toRelay: Bool) -> Bool {
+        let changed = self[keyPath: slot].map { $0 != toRelay } ?? false
+        self[keyPath: slot] = toRelay
+        return changed
+    }
+
     /// Growing plants without a reported end time: look up the crop's growth
     /// duration once (catalog), for an estimate; then apply.
-    private func applyPlants(_ list: [PlantTracker.Plant]) {
-        plants.update(plants: list)
+    private func applyPlants(_ list: [PlantTracker.Plant], fromRelay: Bool) {
+        plants.update(plants: list, baseline: switchSource(\.plantsFromRelay, toRelay: fromRelay))
         let missing = plants.missingDurations(in: list)
         guard !missing.isEmpty else { return }
         Task { [weak self] in
@@ -354,7 +370,7 @@ final class AppModel {
                     passiveCrafts.setDuration(recipe.timeRequirement, forRecipe: missing.recipeId)
                 }
             }
-            passiveCrafts.update(from: passive)
+            passiveCrafts.update(from: passive, baseline: switchSource(\.passiveFromRelay, toRelay: false))
         } catch {
             print("Failed to fetch passive crafts: \(error)")
         }

@@ -125,7 +125,7 @@ sound plays (`NSSound "Glass"`). Sent for:
 |---|---|
 | Error state | A status source changes **to alert from a known non-alert status** (`StatusMonitor.onChange`). A source's *first* report doesn't count, so the red "No XP or regen yet" at launch is silent. **5 min cooldown per source** (e.g. flapping connection). Alert → alert (message change) is silent. |
 | Craft finished | Once per craft, when live progress reaches the total, or when REST reports a tracked craft as `completed` (if the live event was missed). |
-| Passive craft finished | When a passive craft's computed end time passes (1s tick) or BitJita reports it `complete`, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished on first load are silent. |
+| Passive craft finished | When a passive craft's computed end time passes (1s tick) or BitJita reports it `complete`, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished on first load are silent, and so are those in the first list after switching source (REST ↔ relay): BitJita's REST once listed no passive crafts while the relay had 3 finished ones, which notified as "finished". |
 | Plants grown | Per tier, between two placeable polls: growing count drops to 0 **and** grown count increased. Not on the first load. Lags with BitJita's placeable data. |
 
 Connection reports `healthy` when connected (instead of clearing) so a later
@@ -326,6 +326,19 @@ Channels probed that produced no events: `character_stats`, `player_state`,
   unverified; `BitJitaDate` accepts Postgres-style strings, ISO 8601, and
   epoch seconds/ms. Fallback estimate = `updatedAt` + catalog growth duration
   (max), marked with `~`; it assumes `updatedAt` is when growing started.
+
+## Rust / GPUI port (`gpui/`)
+
+A cross-platform (macOS, Windows, Linux) port of this app in Rust with
+[GPUI](https://gpui.rs), requested so it runs beyond macOS. **Same rules and
+data sources as described in this file**; when changing behavior, change both
+apps (or note here which one lags). Port-specific details, platform
+requirements and differences (tray text is a tooltip on Windows/Linux, no
+wake/network-change reconnect, keepalive window, rustls+ring) are in
+`gpui/README.md`. Structure mirrors the Swift app: `core/trackers.rs`
+(trackers + `ActivityCheck`), `model.rs` (`AppModel`), `net/` (live websocket,
+REST, relay), `ui.rs` (panel). `cargo test` covers the main status rules.
+Verified on macOS only (live data, panel); Windows/Linux builds are untested.
 
 ## Project settings
 
