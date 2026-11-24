@@ -12,9 +12,9 @@ use tokio::time::{interval, timeout};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
-use super::{NetEvent, RelayState};
+use super::RelayState;
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{FoodBuff, FoodState, PassiveCraft, Plant, now};
+use crate::core::types::{CraftInfo, FoodBuff, FoodState, PassiveCraft, Plant, now};
 
 const HOST: &str = "relay.bitjita.com";
 /// `buff_type_desc` ids: "Food Regen" (every food) and "Food Buffs" (extras).
@@ -127,6 +127,10 @@ impl Feed {
             format!("SELECT * FROM passive_craft_state WHERE owner_entity_id = {u}"),
             format!("SELECT crafting_recipe_desc.* FROM crafting_recipe_desc JOIN passive_craft_state ON crafting_recipe_desc.id = passive_craft_state.recipe_id WHERE passive_craft_state.owner_entity_id = {u}"),
             format!("SELECT building_state.* FROM building_state JOIN passive_craft_state ON building_state.entity_id = passive_craft_state.building_entity_id WHERE passive_craft_state.owner_entity_id = {u}"),
+            // Active crafts (progress, recipe, count, building).
+            format!("SELECT * FROM progressive_action_state WHERE owner_entity_id = {u}"),
+            format!("SELECT crafting_recipe_desc.* FROM crafting_recipe_desc JOIN progressive_action_state ON crafting_recipe_desc.id = progressive_action_state.recipe_id WHERE progressive_action_state.owner_entity_id = {u}"),
+            format!("SELECT building_state.* FROM building_state JOIN progressive_action_state ON building_state.entity_id = progressive_action_state.building_entity_id WHERE progressive_action_state.owner_entity_id = {u}"),
             format!("SELECT * FROM placeable_state WHERE owner_entity_id = {u}"),
             format!("SELECT placeable_desc.* FROM placeable_desc JOIN placeable_state ON placeable_desc.id = placeable_state.placeable_id WHERE placeable_state.owner_entity_id = {u}"),
             format!("SELECT growth_state.* FROM growth_state JOIN placeable_state ON growth_state.entity_id = placeable_state.entity_id WHERE placeable_state.owner_entity_id = {u}"),
@@ -197,6 +201,47 @@ impl Feed {
         FoodState { buffs: self.food_buffs().into_iter().map(|(_, b)| b).collect() }
     }
 
+    /// Building name via `building_state` → `building_desc`.
+    fn building_name(&self, building_entity: &Value) -> Option<String> {
+        self.store
+            .get("building_state", &key(building_entity))
+            .and_then(|b| b.get(3).and_then(int))
+            .and_then(|id| self.store.get("building_desc", &id.to_string()))
+            .and_then(|d| d.get(2)?.as_str().map(str::to_string))
+    }
+
+    /// Active crafts: `progressive_action_state` = [entity_id,
+    /// building_entity_id, function_type, progress, recipe_id, craft_count,
+    /// last_crit_outcome, owner, lock_expiration, preparation]. Total =
+    /// recipe `actions_required` (column 14) × craft_count (matches REST
+    /// `totalActionsRequired`).
+    fn crafts(&self) -> Vec<CraftInfo> {
+        self.store
+            .rows("progressive_action_state")
+            .map(|row| {
+                let recipe = self.store.get("crafting_recipe_desc", &key(&row[4]));
+                let item_name = recipe
+                    .and_then(|r| crafted_item_id(r))
+                    .and_then(|id| self.store.get("item_desc", &id.to_string()))
+                    .and_then(|r| r.get(1)?.as_str());
+                let progress = row.get(3).and_then(int).unwrap_or(0);
+                let count = row.get(5).and_then(int).unwrap_or(1);
+                let per_item = recipe.and_then(|r| r.get(14).and_then(int)).unwrap_or(0);
+                let total = per_item * count;
+                CraftInfo {
+                    id: key(&row[0]),
+                    name: PassiveCraftTracker::display_name(recipe.and_then(|r| r.get(1)?.as_str()), item_name),
+                    building: self.building_name(&row[1]),
+                    progress,
+                    total,
+                    completed: progress >= total,
+                }
+            })
+            // Recipe not loaded yet: total unknown (0 would look finished).
+            .filter(|c| c.total > 0)
+            .collect()
+    }
+
     fn passive_crafts(&self) -> Vec<PassiveCraft> {
         self.store
             .rows("passive_craft_state")
@@ -206,12 +251,7 @@ impl Feed {
                 let item_name = item_id
                     .and_then(|id| self.store.get("item_desc", &id.to_string()))
                     .and_then(|r| r.get(1)?.as_str());
-                let building = self
-                    .store
-                    .get("building_state", &key(&row[3]))
-                    .and_then(|b| b.get(3).and_then(int))
-                    .and_then(|id| self.store.get("building_desc", &id.to_string()))
-                    .and_then(|d| d.get(2)?.as_str().map(str::to_string));
+                let building = self.building_name(&row[3]);
                 // status: 0 Queued, 1 Processing, 2 Complete.
                 let status = row.get(5).and_then(tag);
                 PassiveCraft {
@@ -262,7 +302,28 @@ impl Feed {
 }
 
 /// Follows `user`'s passive crafts and plants in `region` until cancelled.
-pub async fn run(user: String, region: i64, emit: impl Fn(NetEvent)) {
+/// Everything one region's database has for the character, after an update.
+#[derive(Default)]
+pub struct RegionData {
+    pub crafts: Vec<CraftInfo>,
+    pub passive: Vec<PassiveCraft>,
+    pub plants: Vec<Plant>,
+    pub food: FoodState,
+}
+
+pub enum RegionUpdate {
+    State(RelayState),
+    Data(RegionData),
+}
+
+/// "module is still loading its initial state from upstream; retry shortly"
+/// (relay restarting) vs a lasting refusal (e.g. region not mirrored).
+pub fn is_transient(reason: &str) -> bool {
+    reason.contains("loading") || reason.contains("retry")
+}
+
+/// Follows `user`'s rows in one region's database until cancelled.
+pub async fn run(user: String, region: i64, emit: impl Fn(RegionUpdate)) {
     let mut feed = Feed {
         user,
         store: Store::default(),
@@ -273,17 +334,17 @@ pub async fn run(user: String, region: i64, emit: impl Fn(NetEvent)) {
     };
     let mut backoff = Duration::from_secs(1);
     loop {
-        emit(NetEvent::Relay(RelayState::Connecting));
+        emit(RegionUpdate::State(RelayState::Connecting));
         let wait = match session(&mut feed, region, &emit, &mut backoff).await {
             Err(reason) => {
                 // "module is still loading its initial state from upstream;
                 // retry shortly" happens while the relay restarts.
-                let transient = reason.contains("loading") || reason.contains("retry");
-                emit(NetEvent::Relay(RelayState::Unavailable(reason)));
+                let transient = is_transient(&reason);
+                emit(RegionUpdate::State(RelayState::Unavailable(reason)));
                 if transient { backoff.max(Duration::from_secs(5)) } else { REFUSED_RETRY }
             }
             Ok(()) => {
-                emit(NetEvent::Relay(RelayState::Connecting));
+                emit(RegionUpdate::State(RelayState::Connecting));
                 backoff
             }
         };
@@ -296,7 +357,7 @@ pub async fn run(user: String, region: i64, emit: impl Fn(NetEvent)) {
 async fn session(
     feed: &mut Feed,
     region: i64,
-    emit: &impl Fn(NetEvent),
+    emit: &impl Fn(RegionUpdate),
     backoff: &mut Duration,
 ) -> Result<(), String> {
     let url = format!("wss://{HOST}/v1/database/idc-{region}/subscribe");
@@ -326,6 +387,18 @@ async fn session(
                     Some(Err(_)) | None => return Ok(()),
                 };
                 let Ok(message) = serde_json::from_str::<Value>(&text) else { continue };
+                // BITCRAFT_DEBUG: log everything except the frequent updates.
+                if std::env::var_os("BITCRAFT_DEBUG").is_some() && message.get("TransactionUpdate").is_none() {
+                    let kind = message.as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_default();
+                    let tables: Vec<String> = message
+                        .pointer("/InitialSubscription/database_update/tables")
+                        .or_else(|| message.pointer("/TransactionUpdate/status/Committed/tables"))
+                        .and_then(Value::as_array)
+                        .map(|t| t.iter().map(|t| format!("{}:{}", t["table_name"].as_str().unwrap_or("?"), t["num_rows"])).collect())
+                        .unwrap_or_default();
+                    let status = message.pointer("/TransactionUpdate/status").and_then(|s| s.as_object()).and_then(|o| o.keys().next().cloned()).unwrap_or_default();
+                    eprintln!("relay idc-{region}: {kind} {status} {tables:?} {}", if tables.is_empty() { text.chars().take(300).collect::<String>() } else { String::new() });
+                }
                 if let Some(error) = message.get("SubscriptionError") {
                     return Err(error["error"].as_str().unwrap_or("subscription refused").to_string());
                 }
@@ -338,10 +411,13 @@ async fn session(
                 };
                 feed.store.apply(changes.as_array().map(Vec::as_slice).unwrap_or_default(), initial);
                 *backoff = Duration::from_secs(1);
-                emit(NetEvent::Relay(RelayState::Live));
-                emit(NetEvent::RelayPassiveCrafts(feed.passive_crafts()));
-                emit(NetEvent::RelayPlants(feed.plants(initial)));
-                emit(NetEvent::RelayFood(feed.food()));
+                emit(RegionUpdate::State(RelayState::Live));
+                emit(RegionUpdate::Data(RegionData {
+                    crafts: feed.crafts(),
+                    passive: feed.passive_crafts(),
+                    plants: feed.plants(initial),
+                    food: feed.food(),
+                }));
                 if feed.add_missing_lookups() && sink.send(feed.subscribe_message()).await.is_err() {
                     return Ok(());
                 }

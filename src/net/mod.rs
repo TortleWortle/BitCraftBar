@@ -6,7 +6,7 @@ pub mod api;
 pub mod live;
 pub mod relay;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -55,6 +55,7 @@ pub enum NetEvent {
     RelayPassiveCrafts(Vec<PassiveCraft>),
     RelayPlants(Vec<Plant>),
     RelayFood(FoodState),
+    RelayCrafts(Vec<CraftInfo>),
 }
 
 pub enum Outgoing {
@@ -155,19 +156,21 @@ fn track(user: String, out: async_channel::Sender<Outgoing>, caches: Arc<Mutex<C
 /// REST every 60s, requests of a round in parallel. Also starts the relay
 /// once the player's region is known.
 async fn poll(user: String, emit: impl Fn(NetEvent) + Clone + Send + Sync + 'static, relay_live: Arc<AtomicBool>, caches: Arc<Mutex<Caches>>) {
-    // Aborted when this task is (character switch).
-    let mut relay: Option<(i64, AbortOnDrop)> = None;
+    // Aborted with this task (character switch).
+    let (hub, hub_task) = start_relay_hub(user.clone(), emit.clone(), relay_live.clone(), caches.clone());
+    let _hub_task = AbortOnDrop(hub_task);
     let mut first = true;
     loop {
         let passive = tokio::spawn(poll_passive(user.clone(), emit.clone(), relay_live.clone(), caches.clone()));
         let (crafts, stats, plants, player) = tokio::join!(
-            api::crafts(&user),
+            poll_crafts(&user, &relay_live),
             api::stats(&user),
             poll_plants(&user, &relay_live, &caches),
             api::player(&user),
         );
         match crafts {
-            Ok(c) => emit(NetEvent::Crafts(c)),
+            Ok(Some(c)) => emit(NetEvent::Crafts(c)),
+            Ok(None) => {}
             Err(e) => eprintln!("crafts: {e}"),
         }
         match stats {
@@ -181,14 +184,13 @@ async fn poll(user: String, emit: impl Fn(NetEvent) + Clone + Send + Sync + 'sta
         }
         match player {
             Ok(p) => {
-                if let Some(region) = p.region_id
-                    && relay.as_ref().is_none_or(|(r, _)| *r != region)
-                {
-                    drop(relay.take()); // aborts the old region's relay
-                    relay_live.store(false, Ordering::Relaxed);
-                    let task = start_relay(user.clone(), region, emit.clone(), relay_live.clone(), caches.clone());
-                    relay = Some((region, AbortOnDrop(task)));
-                }
+                // Placeables and crafting stations stay in their region while
+                // the player travels (buffs move with the player), so follow
+                // every mirrored region + the player's + their claims'.
+                let mut regions: BTreeSet<i64> = MIRRORED_REGIONS.into_iter().collect();
+                regions.extend(p.region_id);
+                regions.extend(p.claims.iter().filter_map(|c| c.region_id));
+                let _ = hub.send(HubCommand::Regions { all: regions, player: p.region_id });
                 emit(NetEvent::Player(p));
             }
             Err(e) => eprintln!("player: {e}"),
@@ -201,6 +203,16 @@ async fn poll(user: String, emit: impl Fn(NetEvent) + Clone + Send + Sync + 'sta
         let _ = passive.await;
         tokio::time::sleep(POLL_INTERVAL).await;
     }
+}
+
+/// None while the relay is live (it has crafts too, and BitJita's REST
+/// sometimes answers 500).
+async fn poll_crafts(user: &str, relay_live: &AtomicBool) -> anyhow::Result<Option<Vec<CraftInfo>>> {
+    if relay_live.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    let crafts = api::crafts(user).await?;
+    Ok((!relay_live.load(Ordering::Relaxed)).then_some(crafts))
 }
 
 /// None while the relay is live (its data is fresher).
@@ -272,34 +284,123 @@ async fn with_growth_durations(mut plants: Vec<Plant>, caches: &Arc<Mutex<Caches
     plants
 }
 
-fn start_relay(
+/// Regions BitJita's relay mirrors (observed; others refuse, retried every
+/// 5 min).
+const MIRRORED_REGIONS: [i64; 9] = [7, 8, 9, 12, 13, 14, 17, 18, 19];
+
+enum HubCommand {
+    /// Regions to follow; the player's current one (food buffs are there).
+    Regions { all: BTreeSet<i64>, player: Option<i64> },
+}
+
+fn start_relay_hub(
     user: String,
-    region: i64,
     emit: impl Fn(NetEvent) + Send + Sync + 'static,
     relay_live: Arc<AtomicBool>,
     caches: Arc<Mutex<Caches>>,
-) -> JoinHandle<()> {
-    // Relay events pass through here: track liveness, add growth durations.
-    let (tx, mut rx) = mpsc::unbounded_channel::<NetEvent>();
-    let forward = tokio::spawn(async move {
-        while let Some(event) = rx.recv().await {
-            match event {
-                NetEvent::Relay(state) => {
-                    relay_live.store(state == RelayState::Live, Ordering::Relaxed);
-                    emit(NetEvent::Relay(state));
+) -> (mpsc::UnboundedSender<HubCommand>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (tx, tokio::spawn(relay_hub(user, rx, emit, relay_live, caches)))
+}
+
+/// One relay feed per region; merges their data. The relay only counts as
+/// live (and replaces REST for crafts/plants/passive crafts) when every
+/// followed region is live, so a region still loading never hides data.
+/// Regions that refuse for good (not mirrored) are ignored.
+async fn relay_hub(
+    user: String,
+    mut commands: mpsc::UnboundedReceiver<HubCommand>,
+    emit: impl Fn(NetEvent),
+    relay_live: Arc<AtomicBool>,
+    caches: Arc<Mutex<Caches>>,
+) {
+    let (tx, mut updates) = mpsc::unbounded_channel::<(i64, relay::RegionUpdate)>();
+    let mut feeds: HashMap<i64, AbortOnDrop> = HashMap::new();
+    let mut states: HashMap<i64, RelayState> = HashMap::new();
+    let mut data: HashMap<i64, relay::RegionData> = HashMap::new();
+    let mut player_region: Option<i64> = None;
+    let mut last_state: Option<RelayState> = None;
+    loop {
+        let mut data_changed = false;
+        tokio::select! {
+            command = commands.recv() => match command {
+                None => return,
+                Some(HubCommand::Regions { all, player }) => {
+                    player_region = player;
+                    feeds.retain(|r, _| all.contains(r));
+                    states.retain(|r, _| all.contains(r));
+                    data.retain(|r, _| all.contains(r));
+                    for region in all {
+                        if feeds.contains_key(&region) {
+                            continue;
+                        }
+                        let tx = tx.clone();
+                        let task = tokio::spawn(relay::run(user.clone(), region, move |update| {
+                            let _ = tx.send((region, update));
+                        }));
+                        feeds.insert(region, AbortOnDrop(task));
+                    }
+                    data_changed = true;
                 }
-                NetEvent::RelayPlants(plants) => emit(NetEvent::RelayPlants(with_growth_durations(plants, &caches).await)),
-                other => emit(other),
-            }
+            },
+            Some((region, update)) = updates.recv() => {
+                if !feeds.contains_key(&region) {
+                    continue;
+                }
+                match update {
+                    relay::RegionUpdate::State(state) => {
+                        states.insert(region, state);
+                    }
+                    relay::RegionUpdate::Data(d) => {
+                        data.insert(region, d);
+                        data_changed = true;
+                    }
+                }
+            },
         }
-    });
-    tokio::spawn(async move {
-        let _forward = AbortOnDrop(forward);
-        relay::run(user, region, move |e| {
-            let _ = tx.send(e);
-        })
-        .await;
-    })
+
+        let overall = overall_state(&feeds, &states);
+        let live = overall == RelayState::Live;
+        relay_live.store(live, Ordering::Relaxed);
+        if last_state.as_ref() != Some(&overall) {
+            emit(NetEvent::Relay(overall.clone()));
+            // Just went live: send the merged lists right away.
+            data_changed |= live;
+            last_state = Some(overall);
+        }
+        if live && data_changed {
+            emit(NetEvent::RelayCrafts(data.values().flat_map(|d| d.crafts.clone()).collect()));
+            emit(NetEvent::RelayPassiveCrafts(data.values().flat_map(|d| d.passive.clone()).collect()));
+            let plants = data.values().flat_map(|d| d.plants.clone()).collect();
+            emit(NetEvent::RelayPlants(with_growth_durations(plants, &caches).await));
+        }
+        // Food buffs live in the player's current region.
+        if data_changed
+            && let Some(region) = player_region
+            && states.get(&region) == Some(&RelayState::Live)
+            && let Some(d) = data.get(&region)
+        {
+            emit(NetEvent::RelayFood(d.food.clone()));
+        }
+    }
+}
+
+fn overall_state(feeds: &HashMap<i64, AbortOnDrop>, states: &HashMap<i64, RelayState>) -> RelayState {
+    if feeds.is_empty() {
+        return RelayState::Off;
+    }
+    let relevant: Vec<Option<&RelayState>> = feeds
+        .keys()
+        .map(|r| states.get(r))
+        .filter(|s| !matches!(s, Some(RelayState::Unavailable(reason)) if !relay::is_transient(reason)))
+        .collect();
+    if relevant.is_empty() {
+        RelayState::Unavailable("no mirrored region".into())
+    } else if relevant.iter().all(|s| *s == Some(&RelayState::Live)) {
+        RelayState::Live
+    } else {
+        RelayState::Connecting
+    }
 }
 
 struct AbortOnDrop(JoinHandle<()>);

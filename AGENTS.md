@@ -270,7 +270,7 @@ character that's no longer tracked are dropped.
 
 ## Data sources (BitJita)
 
-### SpacetimeDB relay (passive crafts + plants, live) — `src/net/relay.rs`
+### SpacetimeDB relay (crafts, passive crafts, plants, food; live) — `src/net/relay.rs`, hub in `src/net/mod.rs`
 
 BitCraft runs on SpacetimeDB. BitJita runs a read-only relay ("BITCONNECT",
 https://relay.bitjita.com) that mirrors it; **no account or BitCraft token**
@@ -280,14 +280,26 @@ REST fallback. Connecting to Clockwork's own SpacetimeDB with the player's
 game token was rejected: account risk, and the relay has the same data.
 
 - `wss://relay.bitjita.com/v1/database/idc-<region>/subscribe`, websocket
-  subprotocol `v1.json.spacetimedb`. One database per region; region = the
-  player's `regionId` from `players/<id>` (relay started/restarted by the
-  poll loop when it's known or changes). Mirrored: idc-global and 7, 8, 9,
-  12, 13, 14, 17, 18, 19 (others: `SubscriptionError` → REST, retried every
-  5 min). While the relay restarts it refuses with "module is still loading
-  its initial state from upstream; retry shortly" (`/healthz` 503, observed
-  for 8+ min); that's retried with the normal backoff. Placeables/crafts in a
-  different region than the player is in are not seen.
+  subprotocol `v1.json.spacetimedb`. **One database per region**, and rows
+  live in the region of the *thing*: placeables and crafting stations stay
+  in their region, while the player's buffs move with the player. (Bug
+  found: following only the player's region showed 0 plants/crafts after
+  the player traveled from region 14 to 13, while buffs still came through.)
+  So the **relay hub** (`relay_hub`) runs one feed per region: every
+  mirrored region (`MIRRORED_REGIONS`: 7, 8, 9, 12, 13, 14, 17, 18, 19), plus
+  the player's `regionId` and their claims' regions (`players/<id>`), updated
+  on each 60s poll. All queries filter by the character, so each is small.
+  Crafts, passive crafts and plants are merged across regions; food comes
+  from the player's region.
+- **Liveness**: the relay counts as live (`RelayState::Live`, shared
+  `AtomicBool`) only when **every** followed region is live; regions that
+  refuse for good (`SubscriptionError` other than "loading", e.g. not
+  mirrored; retried every 5 min) are ignored. While not live, REST provides
+  crafts/plants/passive crafts and relay lists aren't sent, so a region
+  that's still loading never hides data. While the relay restarts it refuses
+  with "module is still loading its initial state from upstream; retry
+  shortly" (`/healthz` 503, observed for 8+ min; it also briefly served
+  incomplete tables); that's retried with the normal backoff.
 - Protocol: send `{"Subscribe":{"query_strings":[SQL…],"request_id":1}}`
   (replaces the whole set; also used to add lookups) → `InitialSubscription`
   (all current rows) → `TransactionUpdate`s (`deletes` + `inserts` per table).
@@ -308,6 +320,15 @@ game token was rejected: account risk, and the relay has the same data.
   share 223 buff sets (often ambiguous) and the names were too long. `buff_desc.online_timestamp` is true for food buffs; whether
   that pauses the timer while signed out is unverified (it doesn't matter
   while playing).
+- **Active crafts** (`Feed::crafts`): `progressive_action_state` (owner
+  filter) = [entity_id, building_entity_id, function_type, progress,
+  recipe_id, craft_count, last_crit_outcome, owner, lock_expiration,
+  preparation]; total = recipe `actions_required` (column 14) × craft_count
+  (= REST `totalActionsRequired`, verified 130 × 552 = 71,760); name via
+  recipe → `item_desc`, building via `building_state` → `building_desc`.
+  Crafts whose recipe hasn't arrived yet are skipped (total 0 would look
+  finished). Progress changes arrive live and count as "last progressed".
+  The BitJita live channel is still subscribed as a fallback.
 - Tables used (column indices in `relay.rs`): `passive_craft_state`
   (entity, owner, recipe_id, building_entity_id, timestamp, status
   Queued/Processing/Complete, slot), `crafting_recipe_desc` (name,
@@ -323,8 +344,9 @@ game token was rejected: account risk, and the relay has the same data.
 - Crop growth start isn't stored; it's recorded when a plant is seen
   switching to `Growing …` live (estimate `~` = that + catalog duration).
   Plants already growing at launch have no time left.
-- While the relay is live (shared `AtomicBool` in `net/mod.rs`), the REST
-  passive-crafts and placeables requests are skipped / their results dropped.
+- While the relay is live, the REST crafts, passive-crafts and placeables
+  requests are skipped / their results dropped (BitJita's REST also
+  sometimes answers 500 for crafts/placeables).
 
 ### BitJita live websocket — `src/net/live.rs`
 

@@ -181,6 +181,16 @@ impl Model {
                 let ids = self.crafts.update(&list);
                 self.commands.push(Command::Subscribe(ids.iter().map(|id| format!("{}{id}", live::CRAFT_PREFIX)).collect()));
             }
+            NetEvent::RelayCrafts(list) => {
+                // The relay pushes progress live: record it as progress
+                // (sets "last progressed") before merging the list.
+                for craft in &list {
+                    self.crafts.handle_progress(&craft.id, craft.progress, now);
+                }
+                let ids = self.crafts.update(&list);
+                // Keep the BitJita live channels too (fallback if the relay drops).
+                self.commands.push(Command::Subscribe(ids.iter().map(|id| format!("{}{id}", live::CRAFT_PREFIX)).collect()));
+            }
             NetEvent::Stats(values) => self.apply_stats(&values),
             NetEvent::Player(player) => {
                 self.reported_signed_in = player.signed_in;

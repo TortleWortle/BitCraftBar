@@ -122,6 +122,15 @@ pub struct PlayerSummary {
     pub username: String,
     pub signed_in: Option<bool>,
     pub region_id: Option<i64>,
+    /// Only in `players/<id>` (not in search results).
+    #[serde(default)]
+    pub claims: Vec<Claim>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct Claim {
+    pub region_id: Option<i64>,
 }
 
 #[cfg(test)]
