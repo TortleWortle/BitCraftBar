@@ -68,6 +68,8 @@ pub struct FoodBuff {
     /// otherwise "Food Buffs" (extra effects of better food).
     pub is_regen: bool,
     pub ends_at: f64,
+    /// Full length in seconds (for the bar).
+    pub duration: f64,
 }
 
 /// The character's active food buffs. (Food names were dropped: several
@@ -93,6 +95,12 @@ impl FoodState {
     /// When the food regen runs out, if it's active.
     pub fn regen_ends_at(&self, now: f64) -> Option<f64> {
         self.buffs.iter().filter(|b| b.is_regen && b.ends_at > now).map(|b| b.ends_at).reduce(f64::max)
+    }
+
+    /// Share of the food regen left (0...1), for the bar.
+    pub fn regen_fraction(&self, now: f64) -> Option<f64> {
+        let buff = self.buffs.iter().filter(|b| b.is_regen && b.ends_at > now).max_by(|a, b| a.ends_at.total_cmp(&b.ends_at))?;
+        (buff.duration > 0.0).then(|| ((buff.ends_at - now) / buff.duration).clamp(0.0, 1.0))
     }
 
     pub fn active(&self, now: f64) -> impl Iterator<Item = &FoodBuff> {
@@ -122,7 +130,7 @@ mod tests {
 
     #[test]
     fn food_regen_and_label() {
-        let buff = |name: &str, is_regen, ends_at| FoodBuff { name: name.into(), is_regen, ends_at };
+        let buff = |name: &str, is_regen, ends_at| FoodBuff { name: name.into(), is_regen, ends_at, duration: 100.0 };
         let food = FoodState {
             buffs: vec![
                 buff("Level 2 Deluxe Action Speed", false, 200.0),
@@ -131,6 +139,7 @@ mod tests {
             ],
         };
         assert_eq!(food.regen_ends_at(50.0), Some(100.0));
+        assert_eq!(food.regen_fraction(50.0), Some(0.5));
         assert_eq!(food.summary(50.0), "Regen 3 · Deluxe Action Speed 2 · Mining Pie");
         // The extra buffs alone don't count as food regen.
         assert_eq!(food.regen_ends_at(150.0), None);

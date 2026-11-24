@@ -185,6 +185,7 @@ impl Feed {
                             name: desc.get(2).and_then(Value::as_str).unwrap_or("Food buff").to_string(),
                             is_regen: desc.get(1).and_then(int) == Some(FOOD_REGEN_TYPE),
                             ends_at,
+                            duration,
                         },
                     )
                 })

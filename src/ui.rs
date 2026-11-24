@@ -547,6 +547,21 @@ impl Panel {
                 .into_any_element()
         };
         let overall = if m.is_offline { HealthStatus::Alert } else { m.monitor.overall() };
+        // Food: bar of the regen buff's time left; buff summary below it.
+        // Only known via the relay ("–" until then), red "None" when out.
+        let food_bar = match &m.food {
+            None => div().text_color(theme.secondary).child("–").into_any_element(),
+            Some(food) => match food.regen_ends_at(m.now) {
+                Some(end) => with_bar(
+                    food.regen_fraction(m.now).unwrap_or(0.0),
+                    status_color(HealthStatus::Healthy),
+                    duration_string(end - m.now),
+                    theme.text,
+                ),
+                None => with_bar(0.0, status_color(HealthStatus::Alert), "None".into(), status_color(HealthStatus::Alert)),
+            },
+        };
+        let food_summary = m.food.as_ref().map(|f| f.summary(m.now)).filter(|s| !s.is_empty());
         div()
             .flex()
             .flex_col()
@@ -555,6 +570,10 @@ impl Panel {
                 "Stamina",
                 with_bar(m.stamina.fraction().unwrap_or(0.0), status_color(overall), stamina_text, theme.text),
             ))
+            .child(row("Food", food_bar))
+            .children(food_summary.map(|summary| {
+                row("", div().text_xs().text_color(theme.secondary).child(summary).into_any_element())
+            }))
             .child(row(
                 "Satiation",
                 with_bar(
@@ -572,26 +591,7 @@ impl Panel {
                 "Last skill",
                 div().child(m.experience.last_skill_name().unwrap_or_else(|| "–".into())).into_any_element(),
             ))
-            .child(row("Food", self.food(m, theme)))
             .child(row("Last gain", div().child(last_gain).into_any_element()))
-    }
-
-    /// "45m 39s left" + "Regen 3 · Deluxe Action Speed 2".
-    fn food(&self, m: &Model, theme: Theme) -> AnyElement {
-        let Some(food) = &m.food else {
-            // Only known via the relay.
-            return div().text_color(theme.secondary).child("–").into_any_element();
-        };
-        let Some(end) = food.regen_ends_at(m.now) else {
-            return div().text_color(status_color(HealthStatus::Alert)).child("None").into_any_element();
-        };
-        div()
-            .flex()
-            .flex_col()
-            .min_w_0()
-            .child(format!("{} left", duration_string(end - m.now)))
-            .child(div().text_xs().text_color(theme.secondary).child(food.summary(m.now)))
-            .into_any_element()
     }
 
     fn plants(&self, m: &Model, theme: Theme) -> impl IntoElement {

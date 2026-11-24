@@ -64,9 +64,9 @@ every 60s), overridden to *online* by any live websocket event in the last
 **Popup panel** (`src/ui.rs`, `Panel`), opened by clicking the tray icon:
 header (status dot, connection state, `· relay` while the relay is live),
 per-source status reports, stats rows (stamina bar `current / max` in the
-overall status color; **satiation bar** `current / max`, green, red at/below
-the alert threshold; total XP; last skill; **food**; last gain), plants,
-passive crafts,
+overall status color; **food bar** right below it; **satiation bar**
+`current / max`, green, red at/below the alert threshold; total XP; last
+skill; last gain), plants, passive crafts,
 crafts (progress bar, percent, Paused/Done), character picker, Quit.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
@@ -77,13 +77,14 @@ crafts (progress bar, percent, Paused/Done), character picker, Quit.
 - **Passive crafts section**: grouped by building + item, with running count,
   time until the whole group is done, and how many are ready to collect.
   Running groups first. Not in the label (user didn't ask for it).
-- **Food row**: time until the food regen runs out (`45m 39s left`) with a
-  short summary of the active food buffs below it (`Regen 3 · Deluxe Action
-  Speed 2`; `FoodBuff::short_name` turns "Level 3 Food Regen" into "Regen
-  3"). Food *names* were shown first but dropped (user: too long; several
-  foods give the same buffs, so it was often "A / B"). Red "None" when no
-  food regen is active; "–" until the relay delivered buffs (relay only;
-  REST buff data is unreliable).
+- **Food bar** (below stamina, user request): green bar of the food regen
+  buff's time left (remaining / buff duration) with the time (`41m`), and a
+  short summary of the active food buffs on the line below (`Regen 3 ·
+  Deluxe Action Speed 2`; `FoodBuff::short_name` turns "Level 3 Food Regen"
+  into "Regen 3"). Food *names* were shown first but dropped (user: too
+  long; several foods give the same buffs, so it was often "A / B"). Empty
+  bar + red "None" when no food regen is active; "–" until the relay
+  delivered buffs (relay only; REST buff data is unreliable).
 - **Timers** (plants, passive crafts, food, last gain; `ui::duration_string`):
   `1h 05m`, `4m` (minutes rounded up, so never `0m` with time left), and
   seconds only under a minute, `42s` (user preference; was `4m 12s`).
