@@ -20,6 +20,10 @@ const PLAYER_SOURCE: &str = "Player";
 const CONNECTION_SOURCE: &str = "Connection";
 const FOOD_SOURCE: &str = "Food";
 
+/// Craft progress counts as the player's when they gained XP in the
+/// recipe's skill this close to it (either may arrive first).
+const OWN_PROGRESS_WINDOW: f64 = 5.0;
+
 /// Stamina fraction above which "idle" plays the idle sound.
 pub const IDLE_SOUND_STAMINA: f64 = 0.9;
 /// A used-up gather target only alerts above this stamina: lower, the
@@ -145,12 +149,29 @@ impl Model {
         self.crafts.active(self.now)
     }
 
+    /// Someone else can work on the player's craft (user report: a thread
+    /// craft showed as the current activity while chopping a tree). Its
+    /// progress is the player's only if they gained XP in the recipe's
+    /// skill within 5s of it; checked after crafts and after XP updates.
+    fn attribute_crafts(&mut self) {
+        for (id, skill, at) in self.crafts.unattributed() {
+            let own = match skill {
+                Some(s) => self.experience.last_gain_in(s).is_some_and(|g| (g - at).abs() <= OWN_PROGRESS_WINDOW),
+                // Recipe without XP: can't tell, count it.
+                None => true,
+            };
+            if own {
+                self.crafts.mark_worked(&id);
+            }
+        }
+    }
+
     /// The resource being gathered: hit in the last 30s, online, and more
     /// recent than the last craft progress (whichever the player did last
     /// is what the info window shows).
     pub fn active_gather(&self) -> Option<&Gather> {
         let gather = self.gather.as_ref().filter(|g| !self.is_offline && g.is_active(self.now) && g.bar(self.now).is_some())?;
-        let craft_at = self.crafts.last_worked.as_ref().and_then(|c| c.last_progress_at);
+        let craft_at = self.crafts.last_worked.as_ref().and_then(|c| c.worked_at);
         craft_at.is_none_or(|t| gather.last_hit_at >= t).then_some(gather)
     }
 
@@ -197,7 +218,10 @@ impl Model {
         let now = now();
         self.now = now;
         match event {
-            NetEvent::Experience(stacks) => self.experience.handle(&stacks, now),
+            NetEvent::Experience(stacks) => {
+                self.experience.handle(&stacks, now);
+                self.attribute_crafts();
+            }
             NetEvent::Stamina(v) => self.stamina.handle(v, now),
             NetEvent::Satiation(v) => self.satiation.satiation = Some(v),
             NetEvent::RelayCrafts(list) => {
@@ -207,6 +231,7 @@ impl Model {
                     self.crafts.handle_progress(&craft.id, craft.progress, now);
                 }
                 self.crafts.update(&list);
+                self.attribute_crafts();
             }
             NetEvent::RelayPlayer(player) => {
                 if let Some(values) = player.as_ref().and_then(|p| p.stats.as_ref()) {

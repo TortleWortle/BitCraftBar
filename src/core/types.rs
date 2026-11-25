@@ -24,6 +24,9 @@ pub struct CraftInfo {
     /// Crafted item's tag ("Ingot", "Rope") and tier, for badges.
     pub kind: Option<String>,
     pub tier: Option<i64>,
+    /// Skill the recipe trains (`Skill` id): progress only counts as the
+    /// player's own when they gained XP in it (others can work on it too).
+    pub skill: Option<i64>,
 }
 
 /// One passive craft (relay `passive_craft_state`).

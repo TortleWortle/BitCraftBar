@@ -248,8 +248,9 @@ Activity rows are checked top to bottom.
   raw ids.
 - **Craft rules** (user request: yellow when a craft just finished, red when
   the last craft still needs progress but you're idle). "Last action was a
-  craft" = `CraftTracker::last_worked` (last craft with live progress, kept
-  after completion in case its row disappears) progressed no more than
+  craft" = `CraftTracker::last_worked` (last craft with the player's own
+  progress, see "Own progress" below; kept after completion in case its
+  row disappears) progressed no more than
   5s before the last XP gain. XP later than that means you moved on (e.g. a
   craft that isn't tracked), and the normal rules apply. "Craft
   finished" stays until then; resting during an unfinished craft is still
@@ -677,6 +678,21 @@ connection. Replaced by the relay (user request).
 - **Craft time remaining was removed** (rate-based ETA was too inaccurate).
   Show percent done instead, rounded down so it never shows 100% early.
 - A craft is **active** if it progressed in the last 30s; otherwise "Paused".
+- **Own progress** (user report: a thread craft showed as the current
+  activity while they were chopping a tree; others can work on your
+  craft). `progressive_action_state` has no "who" column, so progress
+  counts as the player's only if they **gained XP in the recipe's skill**
+  (`crafting_recipe_desc.experience_per_progress`, column 12 →
+  `CraftInfo::skill`) within 5s of it (`model::OWN_PROGRESS_WINDOW`;
+  `Model::attribute_crafts`, run after craft and after XP updates, since
+  either can arrive first). Own progress (`Craft::worked_at`,
+  `CraftTracker::mark_worked`) drives everything "current activity": the
+  label's craft percent, the info window's craft line, the Activity craft
+  rules (`last_worked`) and gather-vs-craft. Any progress
+  (`last_progress_at`) still shows in the crafts list and badges (it is
+  progressing). Limit: someone else's progress while the player gains XP
+  in the same skill elsewhere counts as the player's. Recipes without XP
+  count as own.
 - **Passive craft done** = reported complete **or** computed end time
   passed (start + recipe `time_requirement`; `passive_craft_timer` is
   private). Duration doesn't account for speed bonuses, so it's an

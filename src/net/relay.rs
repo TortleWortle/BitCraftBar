@@ -482,6 +482,8 @@ impl Feed {
                     completed: progress >= total,
                     kind,
                     tier,
+                    // `experience_per_progress` (column 12) = [[skill_id, xp], …].
+                    skill: recipe.and_then(|r| r.get(12)?.as_array()?.first()?.as_array()?.first().and_then(int)),
                 }
             })
             // Recipe not loaded yet: total unknown (0 would look finished).

@@ -12,6 +12,8 @@ use super::types::{CraftInfo, PassiveCraft, Plant};
 #[derive(Default)]
 pub struct ExperienceTracker {
     pub last_gain_at: Option<f64>,
+    /// Last gain per skill (attributes craft progress to the player).
+    gain_by_skill: HashMap<i64, f64>,
     pub last_gain_amount: i64,
     /// Skill with the largest increase in the latest gain.
     pub last_skill_id: Option<i64>,
@@ -20,6 +22,10 @@ pub struct ExperienceTracker {
 }
 
 impl ExperienceTracker {
+    pub fn last_gain_in(&self, skill: i64) -> Option<f64> {
+        self.gain_by_skill.get(&skill).copied()
+    }
+
     pub fn last_skill_name(&self) -> Option<String> {
         self.last_skill_id.map(Skill::name_for)
     }
@@ -43,6 +49,9 @@ impl ExperienceTracker {
                     (delta > 0).then_some((*skill, delta))
                 })
                 .collect();
+            for (skill, _) in &per_skill {
+                self.gain_by_skill.insert(*skill, now);
+            }
             let gained = per_skill.iter().map(|(_, d)| d).sum();
             if gained > 0 {
                 self.last_gain_amount = gained;
@@ -206,9 +215,13 @@ pub struct Craft {
     pub building: Option<String>,
     pub progress: i64,
     pub total: i64,
+    /// Any progress (the owner or someone else working on it).
     pub last_progress_at: Option<f64>,
     pub kind: Option<String>,
     pub tier: Option<i64>,
+    pub skill: Option<i64>,
+    /// Last progress made by the player (see [`CraftTracker::mark_worked`]).
+    pub worked_at: Option<f64>,
 }
 
 impl Craft {
@@ -228,8 +241,9 @@ impl Craft {
 
 pub struct CraftTracker {
     pub crafts: BTreeMap<String, Craft>,
-    /// Last craft with live progress; kept after completion (in case its
-    /// row disappears). Cleared if it disappears unfinished (cancelled).
+    /// Last craft the player worked on (their own progress, not someone
+    /// else's on it); kept after completion (in case its row disappears).
+    /// Cleared if it disappears unfinished (cancelled).
     pub last_worked: Option<Craft>,
     pub active_window: f64,
     completion_reported: HashSet<String>,
@@ -262,10 +276,31 @@ impl CraftTracker {
         crafts
     }
 
+    /// The craft the player is working on: their own progress in the last
+    /// 30s (someone else progressing it doesn't count).
     pub fn active(&self, now: f64) -> Option<Craft> {
-        let craft = self.sorted().into_iter().next()?;
-        let last = craft.last_progress_at?;
-        (now - last <= self.active_window && !craft.is_complete()).then_some(craft)
+        let craft = self.crafts.values().filter(|c| c.worked_at.is_some()).max_by(|a, b| a.worked_at.unwrap_or(0.0).total_cmp(&b.worked_at.unwrap_or(0.0)))?;
+        let last = craft.worked_at?;
+        (now - last <= self.active_window && !craft.is_complete()).then(|| craft.clone())
+    }
+
+    /// (id, skill, time) of each craft whose latest progress isn't
+    /// attributed to the player (yet): the model checks it against XP.
+    pub fn unattributed(&self) -> Vec<(String, Option<i64>, f64)> {
+        self.crafts
+            .values()
+            .filter_map(|c| {
+                let t = c.last_progress_at?;
+                (c.worked_at != Some(t)).then(|| (c.id.clone(), c.skill, t))
+            })
+            .collect()
+    }
+
+    /// The player made this craft's latest progress.
+    pub fn mark_worked(&mut self, id: &str) {
+        let Some(craft) = self.crafts.get_mut(id) else { return };
+        craft.worked_at = craft.last_progress_at;
+        self.last_worked = Some(craft.clone());
     }
 
     pub fn take_completed(&mut self) -> Vec<Craft> {
@@ -301,8 +336,11 @@ impl CraftTracker {
                 last_progress_at: None,
                 kind: info.kind.clone(),
                 tier: info.tier,
+                skill: info.skill,
+                worked_at: None,
             });
             entry.name = info.name.clone();
+            entry.skill = info.skill;
             entry.kind = info.kind.clone();
             entry.tier = info.tier;
             entry.building = info.building.clone();
@@ -327,7 +365,11 @@ impl CraftTracker {
         craft.progress = progress;
         craft.last_progress_at = Some(now);
         let craft = craft.clone();
-        self.last_worked = Some(craft.clone());
+        // Not necessarily the player's progress (`mark_worked`), but the
+        // last worked craft shows the current percent.
+        if let Some(last) = self.last_worked.as_mut().filter(|l| l.id == craft.id) {
+            last.progress = craft.progress;
+        }
         self.report_completion(&craft);
     }
 }
@@ -690,6 +732,8 @@ mod tests {
             last_progress_at: Some(t),
             kind: None,
             tier: None,
+            skill: None,
+            worked_at: Some(t),
         };
         // Action: spend + XP, then regen tops stamina back up to full.
         stamina.handle(98.0, 1.0);
@@ -756,8 +800,13 @@ mod tests {
             completed: false,
             kind: None,
             tier: None,
+            skill: None,
         }]);
         crafts.handle_progress("1", 12, 5.0);
+        // Someone else's progress (not marked): not the player's activity.
+        assert!(crafts.active(5.0).is_none() && crafts.last_worked.is_none());
+        crafts.mark_worked("1");
+        assert_eq!(crafts.active(6.0).map(|c| c.id), Some("1".into()));
         // An older value (or the same one again) isn't progress.
         crafts.handle_progress("1", 11, 6.0);
         crafts.handle_progress("1", 12, 7.0);
@@ -807,6 +856,8 @@ mod tests {
             last_progress_at: Some(5.0),
             kind: None,
             tier: None,
+            skill: None,
+            worked_at: Some(5.0),
         };
         ActivityCheck::default().evaluate(&xp, &stamina, Some(&craft), None, &mut monitor, 6.0);
         let report = &monitor.sorted_reports()[0];
