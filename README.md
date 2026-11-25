@@ -29,6 +29,21 @@ Settings (tracked character) are stored in
   on KDE, XFCE, etc.; GNOME needs the *AppIndicator and KStatusNotifierItem*
   extension. Without a tray the panel opens as a window instead.
 
+## Releases
+
+Bump `version` in `Cargo.toml`, commit, then tag and push:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`.github/workflows/release.yml` builds Windows (`.exe`), macOS (universal
+`.app`) and Linux (binary) and publishes a GitHub release. Running apps
+show *Update available* in the popup (checked at startup and every 12h).
+Builds aren't code-signed: Windows SmartScreen and macOS Gatekeeper warn
+on first launch (macOS: *System Settings → Privacy & Security → Open
+Anyway*).
+
 ## Layout
 
 ```

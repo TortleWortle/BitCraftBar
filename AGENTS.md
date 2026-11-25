@@ -73,7 +73,8 @@ per-source status reports, stats rows (stamina bar `current / max` in the
 overall status color; **food bar** right below it; **satiation bar**
 `current / max`, green, red at/below the alert threshold; total XP; last
 skill; last gain), plants, passive crafts,
-crafts (progress bar, percent, Paused/Done), character picker,
+crafts (progress bar, percent, Paused/Done), an **Update available**
+row when GitHub has a newer release (see Releases), character picker,
 *Show/Hide info window*, Quit.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
@@ -296,6 +297,7 @@ src/core/          No GPUI, no I/O (unit-tested):
   skill.rs         `enum Skill` (value = skill id) + display names
   types.rs         Data passed from net → model (CraftInfo, PassiveCraft,
                    Plant, PlayerSummary); times are Unix seconds (f64)
+  version.rs       Release tag vs current version (update check)
 src/net/           Background Tokio runtime ("network" thread):
   mod.rs           Command/Outgoing channels; per-character tracking
                    (live task + 60s REST poll + relay); caches
@@ -609,6 +611,36 @@ agent: Python's default `urllib` agent got 403).
   GPUI's libs (Vulkan, xkbcommon, wayland/X11, fontconfig), e.g.
   `sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan1 libfontconfig-dev libasound2-dev`
   (`libasound2-dev`: ALSA, for rodio's sound output).
+- **Releases** (`.github/workflows/release.yml`): pushing a tag `vX.Y.Z`
+  builds on GitHub runners and publishes a GitHub release. Bump
+  `version` in `Cargo.toml` first; the workflow fails if the tag doesn't
+  match (otherwise the update check would compare against the wrong
+  version and always say "update available"). Artifacts:
+  - Windows: zipped `.exe`. Release builds use the `windows` subsystem
+    (`main.rs`), so there's no console window. Unsigned: SmartScreen
+    warns (*More info → Run anyway*).
+  - macOS: zipped **`.app` bundle**, universal (arm64 + x86_64 via
+    `lipo`), `Info.plist` from `packaging/macos/` (`LSUIElement`, bundle
+    id `com.github.tortlewortle.bitcraft-tracker`). A bundle rather than a
+    bare binary so notifications come from our app, not Terminal (see
+    Notifications). Ad-hoc signed only (no Apple Developer account), so
+    Gatekeeper blocks the first launch: *System Settings → Privacy &
+    Security → Open Anyway*, or `xattr -dr com.apple.quarantine`.
+  - Linux: `.tar.gz` with the binary, built on `ubuntu-22.04` (older
+    glibc → runs on more distros). Users need the runtime libs listed
+    below.
+  The workflow hasn't been run yet (no GitHub remote when it was written);
+  the Linux apt package list in particular is a best guess.
+- **Update check** (`net::check_updates`, user request): at startup and
+  every 12h, `GET api.github.com/repos/<repository>/releases/latest`
+  (repository = `Cargo.toml` `repository`; latest skips drafts and
+  prereleases). If its tag is newer than `CARGO_PKG_VERSION`
+  (`core::version::is_newer`), the popup shows *Update available vX.Y.Z*
+  with a *Download* button that opens the release page. **Popup only**,
+  no notification (user choice). No self-update: replacing a running
+  `.exe` / `.app` has edge cases, and a link covers it. Errors (offline,
+  no releases yet, rate limit: 60/h unauthenticated) are silent; logged
+  with `BITCRAFT_DEBUG=1`.
 - **Verified on macOS only** (live data, panel, notifications). Windows and
   Linux haven't been built or run yet; cross-checking Windows from macOS
   fails in `ring`'s build script (needs an MSVC C toolchain).

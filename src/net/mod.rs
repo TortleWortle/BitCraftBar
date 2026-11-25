@@ -79,6 +79,8 @@ pub struct RelayPlayer {
 pub enum Outgoing {
     Event { user: String, event: NetEvent },
     SearchResults { query: String, result: Result<Vec<PlayerSummary>, String> },
+    /// A GitHub release newer than this build (update check).
+    UpdateAvailable(api::Release),
 }
 
 pub enum Command {
@@ -90,6 +92,8 @@ pub enum Command {
 }
 
 pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// How often to look for a new release (also once at startup).
+const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 
 /// Starts the network thread; messages for the UI go to `out`.
 pub fn start(out: async_channel::Sender<Outgoing>) -> mpsc::UnboundedSender<Command> {
@@ -123,6 +127,7 @@ struct Tracking {
 
 async fn manager(mut commands: mpsc::UnboundedReceiver<Command>, out: async_channel::Sender<Outgoing>) {
     let caches = Arc::new(Mutex::new(Caches::default()));
+    tokio::spawn(check_updates(out.clone()));
     let mut current: Option<Tracking> = None;
     while let Some(command) = commands.recv().await {
         match command {
@@ -150,6 +155,25 @@ async fn manager(mut commands: mpsc::UnboundedReceiver<Command>, out: async_chan
                 });
             }
         }
+    }
+}
+
+/// Startup + every 12h: tell the UI when GitHub has a newer release.
+/// Errors (offline, no releases yet, rate limit) are ignored.
+async fn check_updates(out: async_channel::Sender<Outgoing>) {
+    loop {
+        match api::latest_release().await {
+            Ok(release) if crate::core::version::is_newer(&release.tag_name, env!("CARGO_PKG_VERSION")) => {
+                let _ = out.send(Outgoing::UpdateAvailable(release)).await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                if std::env::var_os("BITCRAFT_DEBUG").is_some() {
+                    eprintln!("update check: {e}");
+                }
+            }
+        }
+        tokio::time::sleep(UPDATE_CHECK_INTERVAL).await;
     }
 }
 

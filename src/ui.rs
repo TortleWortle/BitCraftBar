@@ -76,6 +76,8 @@ pub struct AppState {
     pub searching: bool,
     pub search_error: Option<String>,
     search_task: Option<Task<()>>,
+    /// Newer GitHub release, shown in the popup.
+    pub update: Option<crate::net::api::Release>,
     last_debug_line: Option<String>,
 }
 
@@ -98,6 +100,7 @@ impl AppState {
             searching: false,
             search_error: None,
             search_task: None,
+            update: None,
             last_debug_line: None,
         };
         state.flush();
@@ -119,6 +122,7 @@ impl AppState {
                     }
                 }
             }
+            Outgoing::UpdateAvailable(release) => self.update = Some(release),
         }
         self.flush();
         cx.notify();
@@ -546,6 +550,10 @@ impl Render for Panel {
             body.push(divider(theme).into_any_element());
             body.push(self.settings(&state.model.settings.sounds, theme).into_any_element());
         }
+        if let Some(release) = &state.update {
+            body.push(divider(theme).into_any_element());
+            body.push(self.update(release, theme).into_any_element());
+        }
         body.push(divider(theme).into_any_element());
         body.push(self.picker(state, theme, cx).into_any_element());
         body.push(
@@ -647,6 +655,20 @@ fn button(id: &'static str, label: &str, theme: Theme) -> gpui::Stateful<gpui::D
 }
 
 impl Panel {
+    /// "Update available" row; Download opens the release page.
+    fn update(&self, release: &crate::net::api::Release, theme: Theme) -> impl IntoElement {
+        let url = release.html_url.clone();
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(dot(status_color(HealthStatus::Healthy), 8.0))
+            .child(div().font_weight(FontWeight::MEDIUM).child("Update available"))
+            .child(div().text_color(theme.secondary).child(release.tag_name.clone()))
+            .child(div().flex_1())
+            .child(button("update", "Download", theme).on_click(move |_, _, cx: &mut App| cx.open_url(&url)))
+    }
+
     fn reports(&self, m: &Model, theme: Theme) -> impl IntoElement {
         div().flex().flex_col().gap_1p5().children(m.monitor.sorted_reports().into_iter().map(move |r| {
             div()

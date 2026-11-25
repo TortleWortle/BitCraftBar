@@ -1,0 +1,110 @@
+# Push a tag like `v0.2.0` (matching Cargo.toml `version`) to build and
+# publish a GitHub release for Windows, macOS and Linux. See AGENTS.md
+# "Releases".
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+          - os: macos-latest
+            name: macos-universal
+          # Oldest supported runner: the binary links the system glibc, so
+          # building on an older one runs on more distributions.
+          - os: ubuntu-22.04
+            name: linux-x64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches Cargo.toml version
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version (the update check compares them)"
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.os == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libxkbcommon-dev libxkbcommon-x11-dev \
+            libwayland-dev libvulkan-dev libfontconfig-dev libfreetype6-dev \
+            libasound2-dev libx11-xcb-dev libxcb1-dev
+
+      - name: Test
+        if: runner.os == 'Linux'
+        run: cargo test
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cargo build --release
+          New-Item -ItemType Directory dist | Out-Null
+          Compress-Archive -Path target/release/bitcraft-tracker.exe -DestinationPath "dist/bitcraft-tracker-$env:VERSION-${{ matrix.name }}.zip"
+
+      - name: Build (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          cargo build --release
+          mkdir dist
+          tar -czf "dist/bitcraft-tracker-$VERSION-${{ matrix.name }}.tar.gz" -C target/release bitcraft-tracker
+
+      - name: Build (macOS .app, universal)
+        if: runner.os == 'macOS'
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          app="dist/BitCraft Tracker.app"
+          mkdir -p "$app/Contents/MacOS"
+          lipo -create -output "$app/Contents/MacOS/bitcraft-tracker" \
+            target/aarch64-apple-darwin/release/bitcraft-tracker \
+            target/x86_64-apple-darwin/release/bitcraft-tracker
+          sed "s/@VERSION@/$VERSION/g" packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          # Ad-hoc signature (no Apple Developer account): required to run on
+          # Apple Silicon, and gives notifications a stable app identity.
+          codesign --force --deep --sign - "$app"
+          ditto -c -k --keepParent "$app" "dist/bitcraft-tracker-$VERSION-${{ matrix.name }}.zip"
+          rm -rf "$app"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes

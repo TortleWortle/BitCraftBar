@@ -2,6 +2,9 @@
 //! Rust/GPUI port of the macOS app in `../BitCraftTrackerBar` (see
 //! `../AGENTS.md` for behavior and data sources, `README.md` for this port).
 
+// Release builds on Windows: no console window next to the tray icon.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 mod core;
 mod info;
 mod model;

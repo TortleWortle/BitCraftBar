@@ -319,3 +319,26 @@ mod tests {
         assert_eq!(parse_date(&serde_json::json!(1795546305000i64)), Some(1795546305.0));
     }
 }
+
+/// A published GitHub release (update check).
+#[derive(Clone, Debug, Deserialize)]
+pub struct Release {
+    pub tag_name: String,
+    pub html_url: String,
+}
+
+/// Latest published (non-draft, non-prerelease) release of this app on
+/// GitHub. Repository from Cargo.toml `repository`.
+pub async fn latest_release() -> Result<Release> {
+    let repo = env!("CARGO_PKG_REPOSITORY").trim_end_matches('/');
+    let Some(path) = repo.strip_prefix("https://github.com/") else { bail!("repository isn't on GitHub: {repo}") };
+    let response = client()
+        .get(format!("https://api.github.com/repos/{path}/releases/latest"))
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        bail!("latest release: {}", response.status());
+    }
+    Ok(response.json().await?)
+}

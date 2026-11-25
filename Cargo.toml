@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Tray app showing the status of a BitCraft character (data from BitJita). Rust/GPUI port of the macOS BitCraftTrackerBar."
 license = "MIT"
+# Update check: latest GitHub release of this repository (`net::api::latest_release`).
+repository = "https://github.com/TortleWortle/BitCraftTrackerBar"
 publish = false
 
 [[bin]]

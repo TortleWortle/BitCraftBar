@@ -5,3 +5,4 @@ pub mod skill;
 pub mod status;
 pub mod trackers;
 pub mod types;
+pub mod version;
