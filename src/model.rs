@@ -9,7 +9,7 @@ use crate::core::trackers::{
     ActivityCheck, Craft, CraftTracker, ExperienceTracker, PassiveCraftTracker, PlantTracker, SatiationTracker,
     StaminaTracker,
 };
-use crate::core::types::{FoodState, PlayerSummary, now};
+use crate::core::types::{FoodState, PlayerAction, PlayerSummary, now};
 use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState, live};
 use crate::settings::Settings;
 
@@ -43,6 +43,8 @@ pub struct Model {
     /// Relay only (`health_state`, max = stats value 0).
     pub health: Option<f64>,
     pub max_health: Option<f64>,
+    /// Relay only (`player_action_state`).
+    pub action: Option<PlayerAction>,
     activity: ActivityCheck,
 
     pub live_state: ConnState,
@@ -89,6 +91,7 @@ impl Model {
             food: None,
             health: None,
             max_health: None,
+            action: None,
             activity: ActivityCheck::default(),
             live_state: ConnState::Connecting,
             relay_state: RelayState::Off,
@@ -138,6 +141,7 @@ impl Model {
             self.food = None;
             self.health = None;
             self.max_health = None;
+            self.action = None;
             self.monitor = StatusMonitor::default();
             self.relay_state = RelayState::Off;
             self.live_state = ConnState::Connecting;
@@ -213,6 +217,7 @@ impl Model {
                     self.apply_stats(values);
                 }
                 self.health = player.as_ref().and_then(|p| p.health);
+                self.action = player.as_ref().and_then(|p| p.action.clone());
                 self.relay_player = player;
             }
             NetEvent::Player(player) => {

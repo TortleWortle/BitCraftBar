@@ -4,9 +4,9 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight, Hsla, KeyDownEvent, Pixels, Render, Rgba,
+    Animation, AnimationExt, AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight, Hsla, KeyDownEvent, Pixels, Render, Rgba,
     SharedString, Subscription, Task, Window, WindowAppearance, WindowHandle, div, point, prelude::*, px, relative,
-    rgb, size,
+    rgb, size, pulsating_between,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -379,7 +379,11 @@ pub(crate) fn badge_wrap(id: &'static str, row: usize, items: &[Badge], grouped:
         .children(items.iter().enumerate().map(|(i, b)| pill(b, (id, row * 1000 + i), grouped, now, theme)))
 }
 
-fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Theme) -> impl IntoElement {
+/// Badges of things finishing within this many seconds pulse (user request).
+const PULSE_WITHIN: f64 = 30.0;
+
+fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Theme) -> AnyElement {
+    let pulse = b.ends_soon(now, PULSE_WITHIN);
     let tip: SharedString = b.tooltip(now).into();
     let color = match b.state {
         BadgeState::Action => status_color(HealthStatus::Alert),
@@ -389,7 +393,7 @@ fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Th
     };
     let mut tint = color;
     tint.a = 0.18;
-    div()
+    let pill = div()
         .flex()
         .items_center()
         .gap_1()
@@ -402,8 +406,18 @@ fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Th
         .text_color(theme.text)
         .child(dot(color, 6.0))
         .child(if grouped { b.short_text() } else { b.text() })
-        .id(id)
-        .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| cx.new(|_| Tooltip { text: tip.clone(), theme }).into()))
+        .id(id.clone())
+        .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| cx.new(|_| Tooltip { text: tip.clone(), theme }).into()));
+    if pulse {
+        pill.with_animation(
+            (SharedString::from(format!("pulse-{}", id.0)), id.1),
+            Animation::new(Duration::from_millis(1400)).repeat().with_easing(pulsating_between(0.35, 1.0)),
+            |el, t| el.opacity(t),
+        )
+        .into_any_element()
+    } else {
+        pill.into_any_element()
+    }
 }
 
 /// Hover text (badges, info window food row).

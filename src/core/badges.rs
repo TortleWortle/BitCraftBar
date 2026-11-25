@@ -53,6 +53,13 @@ impl Badge {
         with_count(label, self.count)
     }
 
+    /// Something in this group finishes within `within` seconds (plants
+    /// growing, passive crafts running): the badge pulses.
+    pub fn ends_soon(&self, now: f64, within: f64) -> bool {
+        self.state == BadgeState::Processing
+            && self.details.iter().any(|d| matches!(d, Detail::EndsAt(Some(end), _) if *end > now && *end - now <= within))
+    }
+
     /// Without the tier, for rows already grouped by tier: "Grain ×6".
     pub fn short_text(&self) -> String {
         with_count(self.kind.clone(), self.count)
@@ -257,6 +264,8 @@ mod tests {
         let b = plants(&list);
         assert_eq!(b[0].tooltip(0.0), "1 needs fertilizer · 1 needs water");
         assert_eq!(b[1].tooltip(60.0), "next ~4m · all ~14m");
+        assert!(!b[1].ends_soon(60.0, 30.0));
+        assert!(b[1].ends_soon(280.0, 30.0));
         let single = plants(&[plant("Planted Basic Starbulb", 2)]);
         assert_eq!(single[0].tooltip(0.0), "Needs fertilizer");
     }

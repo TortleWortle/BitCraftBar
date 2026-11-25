@@ -170,6 +170,13 @@ impl Render for InfoWindow {
             body.push(div().text_color(theme.secondary).child("Loading…").into_any_element());
         } else {
             body.push(status_line(m, theme).into_any_element());
+            // The in-game action bar (gathering, crafting, …): smooth, so
+            // redraw every frame while an action runs (the model only
+            // ticks once a second).
+            if let Some(el) = action_bar(m, theme) {
+                window.request_animation_frame();
+                body.push(el.into_any_element());
+            }
             // Offline: stamina/health/food are stale and don't matter.
             if !m.is_offline {
                 body.push(bars(m, theme).into_any_element());
@@ -251,6 +258,56 @@ fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
         }))
 }
 
+/// Progress of the current action (relay `player_action_state`), with its
+/// name and time left. None when idle, offline, or not a work action.
+fn action_bar(m: &Model, theme: Theme) -> Option<impl IntoElement> {
+    if m.is_offline {
+        return None;
+    }
+    let action = m.action.as_ref()?;
+    let label = action.label()?;
+    let now = crate::core::types::now();
+    let fraction = action.fraction(now)?;
+    let left = (action.start + action.duration - now).max(0.0);
+    Some(
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(div().w(px(50.0)).flex_none().text_xs().text_color(theme.secondary).child(label))
+            .child(bar(fraction, status_color(HealthStatus::Warning), theme))
+            .child(div().flex_none().min_w(px(34.0)).flex().justify_end().text_xs().child(format!("{left:.1}s"))),
+    )
+}
+
+/// A taller bar with its value ("212 / 262", "41m") centered inside
+/// (user request). The fill is slightly translucent so the text stays
+/// readable on both the fill and the empty track, in light and dark mode.
+fn labeled_bar(fraction: f64, color: Rgba, text: String, text_color: Rgba, theme: Theme) -> impl IntoElement {
+    let mut fill = color;
+    fill.a = 0.7;
+    div()
+        .flex_1()
+        .relative()
+        .h(px(16.0))
+        .rounded_md()
+        .overflow_hidden()
+        .bg(theme.track)
+        .child(div().absolute().top_0().left_0().h_full().bg(fill).w(gpui::relative(fraction.clamp(0.0, 1.0) as f32)))
+        .child(
+            div()
+                .absolute()
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(text_color)
+                .child(text),
+        )
+}
+
 fn bars(m: &Model, theme: Theme) -> impl IntoElement {
     let row = move |label: &str, fraction: f64, color: Rgba, text: String, text_color: Rgba| {
         div()
@@ -258,8 +315,7 @@ fn bars(m: &Model, theme: Theme) -> impl IntoElement {
             .items_center()
             .gap_2()
             .child(div().w(px(50.0)).flex_none().text_color(theme.secondary).child(label.to_string()))
-            .child(bar(fraction, color, theme))
-            .child(div().flex_none().min_w(px(58.0)).flex().justify_end().text_color(text_color).child(text))
+            .child(labeled_bar(fraction, color, text, text_color, theme))
     };
     let fmt = |current: Option<f64>, max: Option<f64>| match current {
         Some(c) => format!("{} / {}", c as i64, max.map_or("?".into(), |x| (x as i64).to_string())),

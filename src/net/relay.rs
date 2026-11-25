@@ -14,7 +14,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::RelayState;
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{CraftInfo, FoodBuff, FoodState, PassiveCraft, Plant, now};
+use crate::core::types::{CraftInfo, FoodBuff, FoodState, PassiveCraft, Plant, PlayerAction, now};
 
 const HOST: &str = "relay.bitjita.com";
 /// `buff_type_desc` ids: "Food Regen" (every food) and "Food Buffs" (extras).
@@ -150,6 +150,7 @@ impl Feed {
         q.push(format!("SELECT * FROM character_stats_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM player_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM health_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM player_action_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
@@ -229,6 +230,23 @@ impl Feed {
     /// died_timestamp]; max health is stats value 0.
     fn health(&self) -> Option<f64> {
         self.store.rows("health_state").next()?.get(2)?.as_f64()
+    }
+
+    /// `player_action_state` = [auto_id, chunk_index, entity_id, start_time,
+    /// duration, target, recipe_id, action_type, layer (Base/UpperBody),
+    /// last_action_result, client_cancel, was_consumed, …]. The Base layer
+    /// row with a real action. start_time/duration are plain u64s; the unit
+    /// is detected from start_time's magnitude (and applied to both).
+    fn action(&self) -> Option<PlayerAction> {
+        self.store
+            .rows("player_action_state")
+            .filter(|r| r.get(8).and_then(tag) == Some(0))
+            .find_map(|r| {
+                let kind = *ACTION_TYPES.get(r.get(7).and_then(tag)? as usize)?;
+                let start = r.get(3)?.as_f64()?;
+                let scale = if start > 1e14 { 1e6 } else if start > 1e11 { 1e3 } else { 1.0 };
+                Some(PlayerAction { kind, start: start / scale, duration: r.get(4)?.as_f64()? / scale })
+            })
     }
 
     fn food(&self) -> FoodState {
@@ -340,6 +358,15 @@ impl Feed {
     }
 }
 
+/// `player_action_state.action_type` variants, in schema order.
+const ACTION_TYPES: [&str; 34] = [
+    "None", "Attack", "DestroyPaving", "StationaryEmote", "Extract", "PaveTile", "SpawnCargo", "Build",
+    "Deconstruct", "RepairBuilding", "ResupplyClaim", "CargoPickUp", "Terraform", "DeployDeployable",
+    "StoreDeployable", "Sleep", "Teleport", "Death", "Climb", "UseItem", "Craft", "ConvertItems", "PlayerMove",
+    "DeployableMove", "ResupplyEmpireNode", "SetHome", "UseElevator", "MobileEmote", "PlacePillarShaping",
+    "DestroyPillarShaping", "AbilityCustom", "Prospect", "PlacePlaceable", "InteractPlaceable",
+];
+
 /// `item_desc` tag (column 10, "Ingot") and tier (column 9).
 fn item_kind(item: Option<&Vec<Value>>) -> (Option<String>, Option<i64>) {
     let Some(item) = item else { return (None, None) };
@@ -358,6 +385,7 @@ pub struct RegionData {
     pub signed_in: Option<bool>,
     pub stats: Option<Vec<f64>>,
     pub health: Option<f64>,
+    pub action: Option<PlayerAction>,
 }
 
 pub enum RegionUpdate {
@@ -469,6 +497,7 @@ async fn session(
                     signed_in: feed.signed_in(),
                     stats: feed.stats(),
                     health: feed.health(),
+                    action: feed.action(),
                 }));
                 if feed.add_missing_lookups() && sink.send(feed.subscribe_message()).await.is_err() {
                     return Ok(());

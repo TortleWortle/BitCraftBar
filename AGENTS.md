@@ -112,6 +112,10 @@ crafts (progress bar, percent, Paused/Done), character picker,
   unknown` for plants already growing at launch), green → `Ready to
   harvest` / `Ready to collect` / `Done`. Active crafts have no time left
   (the rate-based ETA was removed), so orange crafts show percent too.
+  **Pulse** (user request): a plant / passive craft badge pulses
+  (opacity animation) when something in it finishes within 30s
+  (`Badge::ends_soon`, `ui::PULSE_WITHIN`). Only orange badges with a known
+  end time; GPUI redraws every frame while one pulses.
   **Tier rows** (`badges::by_tier`, user request): when a section has
   more than one tier, its badges are split into one row per tier with a
   `T2` heading (ascending; untiered last) and the badges drop the tier
@@ -137,7 +141,14 @@ the default. Never takes focus. Content:
 - status line: the worst issue, or the Activity message when all is well,
   with the last skill; the current craft (active, else the last worked on)
   with percent and bar (hidden offline);
-- bars: stamina (`current / max`), **health** (relay `health_state`, max =
+- **action bar** (user request): the in-game action in progress
+  (gathering, crafting, building, …) with its own bar and time left
+  (`1.4s`), under the status line; from relay `player_action_state` (see
+  Data sources). Redraws every frame while an action runs (the model only
+  ticks once a second). Hidden when idle, offline, or for non-work
+  actions (moving, emotes; `PlayerAction::label`);
+- bars (16px, value centered **inside** the bar, user request;
+  `info::labeled_bar`): stamina (`current / max`), **health** (relay `health_state`, max =
   stats value 0; red under 30%), food (time left; **hover** lists the
   active food buffs, one per line with time left, e.g. `Regen 3 · 41m`;
   user request, instead of a summary line under the bar); hidden
@@ -415,6 +426,15 @@ game token was rejected: account risk, and the relay has the same data.
   health, died_timestamp] is subscribed the same way (info window; no
   REST fallback, BitJita's live `health_state` channel sent nothing when
   probed).
+- **Current action** (`Feed::action`): `player_action_state` (pk
+  `auto_id`) = [auto_id, chunk_index, entity_id, start_time, duration,
+  target, recipe_id, action_type, layer (Base / UpperBody),
+  last_action_result, client_cancel, was_consumed, …]; `action_type` is a
+  sum of 34 variants (`relay::ACTION_TYPES`, schema order: None, Attack,
+  …, Extract, …, Craft, …). Only the Base layer row is used. start_time
+  and duration are plain u64s; the unit is detected from start_time's
+  magnitude (s / ms / µs) and applied to both. Taken from the player's
+  region like the other player rows.
 - **Active crafts** (`Feed::crafts`): `progressive_action_state` (owner
   filter) = [entity_id, building_entity_id, function_type, progress,
   recipe_id, craft_count, last_crit_outcome, owner, lock_expiration,

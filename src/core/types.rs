@@ -65,6 +65,52 @@ pub struct Plant {
     pub growth_duration: Option<f64>,
 }
 
+/// The action the character is performing right now (relay
+/// `player_action_state`): the in-game action bar.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlayerAction {
+    /// `action_type` variant ("Extract", "Craft", …).
+    pub kind: &'static str,
+    /// Unix seconds.
+    pub start: f64,
+    /// Seconds.
+    pub duration: f64,
+}
+
+impl PlayerAction {
+    /// Display name: "Gathering", "Crafting", … None for actions that
+    /// aren't work (moving, emotes, none).
+    pub fn label(&self) -> Option<&'static str> {
+        Some(match self.kind {
+            "None" | "PlayerMove" | "DeployableMove" | "StationaryEmote" | "MobileEmote" | "Climb" | "Death"
+            | "Teleport" | "UseElevator" => return None,
+            "Extract" => "Gathering",
+            "Craft" => "Crafting",
+            "Build" => "Building",
+            "Deconstruct" => "Deconstructing",
+            "RepairBuilding" => "Repairing",
+            "Terraform" => "Terraforming",
+            "PaveTile" => "Paving",
+            "DestroyPaving" => "Removing paving",
+            "UseItem" => "Using item",
+            "ConvertItems" => "Converting",
+            "Prospect" => "Prospecting",
+            "Attack" => "Fighting",
+            "Sleep" => "Sleeping",
+            "InteractPlaceable" => "Interacting",
+            "PlacePlaceable" => "Placing",
+            "ResupplyClaim" | "ResupplyEmpireNode" => "Resupplying",
+            other => other,
+        })
+    }
+
+    /// Fraction done at `now` (None once over).
+    pub fn fraction(&self, now: f64) -> Option<f64> {
+        let end = self.start + self.duration;
+        (self.duration > 0.0 && now >= self.start - 1.0 && now < end).then(|| ((now - self.start) / self.duration).clamp(0.0, 1.0))
+    }
+}
+
 /// One active food buff (relay `active_buff_state` + `buff_desc`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct FoodBuff {
