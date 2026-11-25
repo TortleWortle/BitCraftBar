@@ -629,8 +629,13 @@ agent: Python's default `urllib` agent got 403).
   - Linux: `.tar.gz` with the binary, built on `ubuntu-22.04` (older
     glibc → runs on more distros). Users need the runtime libs listed
     below.
-  The workflow hasn't been run yet (no GitHub remote when it was written);
-  the Linux apt package list in particular is a best guess.
+  Repository: `TortleWortle/BitCraftBar` (`Cargo.toml` `repository`).
+- **Vendored `xattr` patch** (`vendor/xattr`, `[patch.crates-io]`): gpui
+  0.2.2 → `zed-async-tar` → `xattr 0.2.3` uses `libc::ENOATTR`, which
+  libc 0.2.19x no longer exports on Linux, so the Linux build failed
+  (first release run). The copy uses `ENODATA` on Linux (same value).
+  Pinning an older libc wasn't possible (tokio/mio need the new one).
+  Drop the patch once gpui stops pulling xattr 0.2.
 - **Update check** (`net::check_updates`, user request): at startup and
   every 12h, `GET api.github.com/repos/<repository>/releases/latest`
   (repository = `Cargo.toml` `repository`; latest skips drafts and

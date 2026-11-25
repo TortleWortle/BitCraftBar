@@ -29,14 +29,14 @@ jobs:
             name: linux-x64
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check tag matches Cargo.toml version
         shell: bash
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version (the update check compares them)"
+            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version (the update check compares them; bump Cargo.toml first)"
             exit 1
           fi
           echo "VERSION=$version" >> "$GITHUB_ENV"

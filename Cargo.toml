@@ -5,7 +5,7 @@ edition = "2024"
 description = "Tray app showing the status of a BitCraft character (data from BitJita). Rust/GPUI port of the macOS BitCraftTrackerBar."
 license = "MIT"
 # Update check: latest GitHub release of this repository (`net::api::latest_release`).
-repository = "https://github.com/TortleWortle/BitCraftTrackerBar"
+repository = "https://github.com/TortleWortle/BitCraftBar"
 publish = false
 
 [[bin]]
@@ -63,3 +63,9 @@ debug = false
 [profile.release]
 lto = "thin"
 strip = true
+
+# gpui 0.2.2 → zed-async-tar → xattr 0.2.3, which uses `libc::ENOATTR`;
+# libc 0.2.19x no longer has it on Linux (build error). Patched copy uses
+# ENODATA there (same value). Remove once gpui no longer pulls xattr 0.2.
+[patch.crates-io]
+xattr = { path = "vendor/xattr" }
