@@ -9,19 +9,18 @@ use crate::core::trackers::{
     ActivityCheck, Craft, CraftTracker, ExperienceTracker, PassiveCraftTracker, PlantTracker, SatiationTracker,
     StaminaTracker,
 };
-use crate::core::types::{FoodState, PlayerSummary, Position, RawBuff, now};
+use crate::core::types::{FoodBuffDesc, FoodState, PlayerSummary, Position, RawBuff, now};
 use crate::sound::Sound;
-use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState, live};
+use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState};
 use crate::settings::Settings;
 
 pub const LOADING_TIMEOUT: f64 = 20.0;
-/// Any live event within this window means online (`signedIn` can lag).
-pub const LIVE_EVENT_WINDOW: f64 = 30.0;
 /// Signed in but no live event for this long → stale feed, reconnect.
 pub const STALE_FEED_WINDOW: f64 = 60.0;
 pub const ALERT_COOLDOWN: f64 = 5.0 * 60.0;
 const PLAYER_SOURCE: &str = "Player";
 const CONNECTION_SOURCE: &str = "Connection";
+const RELAY_SOURCE: &str = "Relay";
 const FOOD_SOURCE: &str = "Food";
 
 /// Stamina fraction above which "idle" plays the idle sound.
@@ -42,11 +41,11 @@ pub struct Model {
     pub plants: PlantTracker,
     pub passive: PassiveCraftTracker,
     /// Food buffs from the relay; None until the relay delivered them (no
-    /// "Food" report then: REST buff data is unreliable).
+    /// "Food" report then).
     pub food: Option<FoodState>,
-    /// Started buffs (relay or BitJita live), turned into `food` with the
-    /// cached food buff types.
+    /// Started buffs, turned into `food` with the food buff types.
     buffs: Option<Vec<RawBuff>>,
+    food_descs: HashMap<i64, FoodBuffDesc>,
     /// Relay only (`health_state`, max = stats value 0).
     pub health: Option<f64>,
     pub max_health: Option<f64>,
@@ -66,26 +65,16 @@ pub struct Model {
     pub is_offline: bool,
 
     loading_started_at: f64,
-    initial_rest_done: bool,
+    /// Every relay region delivered its rows.
+    relay_loaded: bool,
     connected_at: Option<f64>,
-    reported_signed_in: Option<bool>,
-    /// From the relay (`player_state` / `character_stats_state`); while
-    /// Some, it replaces REST `signedIn` and REST stats (both lag).
+    /// The player's relay rows (`player_state`, `character_stats_state`, …).
     relay_player: Option<RelayPlayer>,
     last_live_event_at: Option<f64>,
     last_alert_at: HashMap<String, f64>,
 
     commands: Vec<Command>,
     notifications: Vec<Notification>,
-    /// Source of the last plants / passive crafts list (Some(true) = relay).
-    plants_from_relay: Option<bool>,
-    passive_from_relay: Option<bool>,
-}
-
-#[derive(Clone, Copy)]
-enum Feed {
-    Plants,
-    Passive,
 }
 
 impl Model {
@@ -102,6 +91,7 @@ impl Model {
             passive: PassiveCraftTracker::default(),
             food: None,
             buffs: None,
+            food_descs: HashMap::new(),
             health: None,
             max_health: None,
             sounds: Vec::new(),
@@ -116,21 +106,14 @@ impl Model {
             is_loading: true,
             is_offline: false,
             loading_started_at: now,
-            initial_rest_done: false,
+            relay_loaded: false,
             connected_at: None,
-            reported_signed_in: None,
             relay_player: None,
             last_live_event_at: None,
             last_alert_at: HashMap::new(),
             commands: Vec::new(),
             notifications: Vec::new(),
-            plants_from_relay: None,
-            passive_from_relay: None,
         };
-        // Last known stats until a live source answers.
-        if let Some(values) = model.settings.cached_stats.clone() {
-            model.apply_stats(&values);
-        }
         model.commands.push(Command::Track(model.settings.user_id.clone()));
         model.evaluate();
         model
@@ -159,7 +142,6 @@ impl Model {
         self.settings.username = Some(player.username.clone());
         if player.entity_id != self.settings.user_id {
             self.settings.user_id = player.entity_id.clone();
-            self.settings.cached_stats = None;
             self.experience = ExperienceTracker::default();
             self.stamina = StaminaTracker::default();
             self.satiation = SatiationTracker::default();
@@ -176,16 +158,13 @@ impl Model {
             self.monitor = StatusMonitor::default();
             self.relay_state = RelayState::Off;
             self.live_state = ConnState::Connecting;
-            self.reported_signed_in = None;
             self.relay_player = None;
             self.last_live_event_at = None;
             self.connected_at = None;
             self.is_offline = false;
-            self.plants_from_relay = None;
-            self.passive_from_relay = None;
             self.is_loading = true;
             self.loading_started_at = now();
-            self.initial_rest_done = false;
+            self.relay_loaded = false;
             self.commands.push(Command::Track(self.settings.user_id.clone()));
         }
         self.settings.save();
@@ -216,36 +195,14 @@ impl Model {
                 self.last_live_event_at = Some(now);
                 self.satiation.satiation = Some(v);
             }
-            NetEvent::CharacterStats(values) => {
-                self.last_live_event_at = Some(now);
-                // Same row as the relay's; the relay wins while it has it.
-                if self.relay_player.as_ref().is_none_or(|p| p.stats.is_none()) {
-                    self.apply_stats(&values);
-                }
-            }
-            NetEvent::CraftProgress { id, progress } => {
-                self.last_live_event_at = Some(now);
-                self.crafts.handle_progress(&id, progress, now);
-            }
-            NetEvent::Crafts(list) => {
-                let ids = self.crafts.update(&list);
-                self.commands.push(Command::Subscribe(ids.iter().map(|id| format!("{}{id}", live::CRAFT_PREFIX)).collect()));
-            }
             NetEvent::RelayCrafts(list) => {
                 // The relay pushes progress live: record it as progress
                 // (sets "last progressed") before merging the list.
                 for craft in &list {
                     self.crafts.handle_progress(&craft.id, craft.progress, now);
                 }
-                let ids = self.crafts.update(&list);
-                // Keep the BitJita live channels too (fallback if the relay drops).
-                self.commands.push(Command::Subscribe(ids.iter().map(|id| format!("{}{id}", live::CRAFT_PREFIX)).collect()));
+                self.crafts.update(&list);
             }
-            // REST stats lag behind gear/buff changes; the relay's are live.
-            NetEvent::Stats(values) if self.relay_player.as_ref().is_none_or(|p| p.stats.is_none()) => {
-                self.apply_stats(&values)
-            }
-            NetEvent::Stats(_) => {}
             NetEvent::RelayPlayer(player) => {
                 if let Some(values) = player.as_ref().and_then(|p| p.stats.as_ref()) {
                     self.apply_stats(values);
@@ -257,45 +214,22 @@ impl Model {
                 self.relay_player = player;
             }
             NetEvent::Player(player) => {
-                self.reported_signed_in = player.signed_in;
                 if self.settings.username.as_deref() != Some(player.username.as_str()) {
                     self.settings.username = Some(player.username.clone());
                     self.settings.save();
                 }
                 self.reconnect_if_feed_stale(now);
             }
-            // Switching source (REST ↔ relay) is a fresh baseline: their lists
-            // differ (REST can lag), which would look like crafts finishing.
-            NetEvent::Plants(plants) => {
-                let baseline = self.switch_source(false, Feed::Plants);
-                self.plants.update(&plants, baseline);
-            }
-            NetEvent::RelayPlants(plants) => {
-                let baseline = self.switch_source(true, Feed::Plants);
-                self.plants.update(&plants, baseline);
-            }
-            NetEvent::PassiveCrafts(crafts) => {
-                let baseline = self.switch_source(false, Feed::Passive);
-                self.passive.update(crafts, now, baseline);
-            }
-            NetEvent::RelayPassiveCrafts(crafts) => {
-                let baseline = self.switch_source(true, Feed::Passive);
-                self.passive.update(crafts, now, baseline);
-            }
-            NetEvent::Position(position) => self.update_position(position, now),
-            NetEvent::InitialRestDone => self.initial_rest_done = true,
+            NetEvent::RelayPlants(plants) => self.plants.update(&plants),
+            NetEvent::RelayPassiveCrafts(crafts) => self.passive.update(crafts, now),
             NetEvent::Relay(state) => self.relay_state = state,
-            // Both sources mirror the same row; the latest wins (the hub
-            // only sends relay buffs when they change).
-            NetEvent::RelayBuffs(buffs) | NetEvent::LiveBuffs(buffs) => {
+            NetEvent::RelayLoaded => self.relay_loaded = true,
+            NetEvent::RelayBuffs(buffs) => {
                 self.buffs = Some(buffs);
                 self.update_food();
             }
             NetEvent::FoodBuffDescs(descs) => {
-                if self.settings.food_buff_descs != descs {
-                    self.settings.food_buff_descs = descs;
-                    self.settings.save();
-                }
+                self.food_descs = descs;
                 self.update_food();
             }
         }
@@ -314,21 +248,10 @@ impl Model {
         self.evaluate();
     }
 
-    /// Records which source fed `feed` last; true if it changed.
-    fn switch_source(&mut self, relay: bool, feed: Feed) -> bool {
-        let slot = match feed {
-            Feed::Plants => &mut self.plants_from_relay,
-            Feed::Passive => &mut self.passive_from_relay,
-        };
-        let changed = slot.is_some_and(|was| was != relay);
-        *slot = Some(relay);
-        changed
-    }
-
     /// Food from the last buffs; unknown (None) until buffs and the food
     /// buff types are both known (no types → everything looks like "No food").
     fn update_food(&mut self) {
-        let descs = &self.settings.food_buff_descs;
+        let descs = &self.food_descs;
         self.food = self.buffs.as_ref().filter(|_| !descs.is_empty()).map(|b| FoodState::from_raw(b, descs));
     }
 
@@ -349,10 +272,6 @@ impl Model {
         if values.is_empty() {
             return;
         }
-        if self.settings.cached_stats.as_deref() != Some(values) {
-            self.settings.cached_stats = Some(values.to_vec());
-            self.settings.save();
-        }
         self.stamina.set_reported_max(values.get(1).copied(), self.now);
         self.satiation.set_reported_max(values.get(19).copied());
         self.max_health = values.first().copied().filter(|v| *v > 0.0);
@@ -362,7 +281,7 @@ impl Model {
         if !self.is_loading {
             return;
         }
-        let ready = self.initial_rest_done && self.live_state == ConnState::Connected;
+        let ready = self.relay_loaded && self.live_state == ConnState::Connected;
         if ready || self.now - self.loading_started_at >= LOADING_TIMEOUT {
             self.is_loading = false;
             self.evaluate();
@@ -373,13 +292,9 @@ impl Model {
 
     /// BitJita can stop delivering events on a healthy-looking connection;
     /// satiation updates ~1/s while signed in, so silence means stale.
-    /// Relay `player_state.signed_in` when available, else REST `signedIn`.
-    fn signed_in(&self) -> Option<bool> {
-        self.relay_player.as_ref().map(|p| p.signed_in).or(self.reported_signed_in)
-    }
-
+    /// Online status: relay `player_state.signed_in`.
     fn reconnect_if_feed_stale(&mut self, now: f64) {
-        let (Some(true), Some(connected_at)) = (self.signed_in(), self.connected_at) else { return };
+        let (Some(true), Some(connected_at)) = (self.relay_player.as_ref().map(|p| p.signed_in), self.connected_at) else { return };
         let last = self.last_live_event_at.unwrap_or(0.0).max(connected_at);
         if now - last >= STALE_FEED_WINDOW {
             eprintln!("Signed in but no live events for {}s; reconnecting", (now - last) as i64);
@@ -388,15 +303,8 @@ impl Model {
     }
 
     fn evaluate(&mut self) {
-        self.is_offline = match &self.relay_player {
-            // The game's own `signed_in`: live and authoritative.
-            Some(player) => !player.signed_in,
-            // REST `signedIn` lags: any live event in the last 30s wins.
-            None => {
-                let live_recently = self.last_live_event_at.is_some_and(|t| self.now - t <= LIVE_EVENT_WINDOW);
-                !live_recently && self.reported_signed_in == Some(false)
-            }
-        };
+        // The game's own `signed_in` (relay); unknown counts as online.
+        self.is_offline = self.relay_player.as_ref().is_some_and(|p| !p.signed_in);
         if self.is_offline {
             // Cleared: coming back online is a first report → no notification.
             self.monitor.clear(ActivityCheck::SOURCE);
@@ -414,22 +322,20 @@ impl Model {
             ConnState::Connecting => self.monitor.report(CONNECTION_SOURCE, HealthStatus::Warning, "Connecting…"),
             ConnState::Disconnected => self.monitor.report(CONNECTION_SOURCE, HealthStatus::Alert, "Disconnected"),
         }
+        // Single source for everything but XP/stamina/satiation: an outage
+        // means stale data, so it's always shown.
+        match self.relay_state {
+            RelayState::Live => self.monitor.report(RELAY_SOURCE, HealthStatus::Healthy, "Relay live"),
+            RelayState::Off | RelayState::Connecting => self.monitor.report(RELAY_SOURCE, HealthStatus::Warning, "Relay connecting…"),
+            RelayState::Unavailable(_) => self.monitor.report(RELAY_SOURCE, HealthStatus::Alert, "Relay unavailable"),
+        }
         self.collect_alert_notifications();
         self.check_idle_full();
     }
 
-    /// Position from the relay or BitJita live; a change = moved ("Active").
-    /// Two sources (BitJita live, relay) report the same row; the live one
-    /// is throttled, so it can arrive with an older location after the
-    /// relay's newer one. Comparing would count that as moving (twice:
-    /// back, then forward again), so older rows are dropped.
+    /// Relay position; a change = moved ("Active").
     fn update_position(&mut self, position: Position, now: f64) {
-        if let (Some(last), Some(at)) = (self.position.and_then(|p| p.at), position.at)
-            && at < last
-        {
-            return;
-        }
-        if self.position.is_some_and(|p| (p.x, p.z) != (position.x, position.z)) {
+        if self.position.is_some_and(|p| p != position) {
             self.moved_at = Some(now);
         }
         self.position = Some(position);

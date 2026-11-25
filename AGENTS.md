@@ -10,11 +10,15 @@
 
 A tray / menu bar app (macOS, Windows, Linux) that shows, at a glance, the
 status of the user's character in the game **BitCraft**. Written in Rust with
-[GPUI](https://gpui.rs) (Zed's UI framework). Data comes from the community
-site [BitJita](https://bitjita.com) (live websocket, REST API) and the
+[GPUI](https://gpui.rs) (Zed's UI framework). Data comes from the
 community read-only SpacetimeDB relay
-[relay.bitcraftsync.app](https://relay.bitcraftsync.app). There is no main window or Dock icon; everything
-lives in the tray icon and its popup panel.
+[relay.bitcraftsync.app](https://relay.bitcraftsync.app) (crafts, passive
+crafts, plants, food, stats, health, position, online status) and the
+community site [BitJita](https://bitjita.com) (live websocket for XP,
+stamina and satiation; REST for player search and username). **One source
+per piece of data, no fallbacks** (user request: "a half functioning app
+is unpredictable"); see Data sources. There is no main window or Dock
+icon; everything lives in the tray icon and its popup panel.
 
 The goal is a quick "is my character still doing something useful?" check
 while the user is AFK-crafting/gathering, without tabbing into the game.
@@ -62,11 +66,10 @@ online, so it's a transition). Activity, Satiation and Food reports are
 **cleared** while offline (idling offline isn't a problem, and clearing
 means coming back online is a "first report", so it never notifies).
 
-Detection (`Model::evaluate`): the relay's `player_state.signed_in` when
-available (the game's own value; changes instantly). Without the relay:
-BitJita's `players/<id>` `signedIn` (polled every 60s, can lag), overridden
-to *online* by any live websocket event in the last 30s. Unknown counts as
-online.
+Detection (`Model::evaluate`): the relay's `player_state.signed_in` (the
+game's own value; changes instantly). Unknown (relay has no
+`player_state` row yet) counts as online. BitJita's `signedIn` used to be
+a fallback; removed with the other fallbacks.
 
 **Popup panel** (`src/ui.rs`, `Panel`), opened by clicking the tray icon:
 header (status dot, connection state, `· relay` while the relay is live),
@@ -95,7 +98,7 @@ row when GitHub has a newer release (see Releases), character picker,
   long; several foods give the same buffs, so it was often "A / B"). Orange
   under 5 minutes left (`status::food_rgb`, user request); full red bar +
   red "None" when no food regen is active (full so the red shows); "–" until the relay
-  delivered buffs (relay only; REST buff data is unreliable).
+  delivered buffs.
 - **Badges** (`core::badges`, user request; under each section title in
   the popup and in the info window): one pill per *type + tier* and state,
   with a count, e.g. `Grain T1 ×6`, `Ingot T2`, `Rope T5`. Colors: **red**
@@ -104,16 +107,15 @@ row when GitHub has a newer release (see Releases), character picker,
   **gray** = idle (paused craft, queued passive craft), **green** =
   finished (grown, ready to collect, craft complete). Most urgent first.
   Crafts and passive crafts use the crafted item's **tag** + tier (relay
-  `item_desc` columns 10 / 9; REST `items[].tag` / `.tier`), falling back
-  to the item name. Plants use the crop from the placeable name
+  `item_desc` columns 10 / 9), falling back to the item name. Plants use the crop from the placeable name
   (`<stage> <quality> <crop>`; quality = tier): Embergrain → Grain,
   Starbulb → Bulbs, Wispweave → Fiber (the only three crops in the
   catalog; the user's examples were "Grain" and "Bulbs").
   **Hover text** (`Badge::tooltip`, user request) by state: gray → percent
   done (`8% done`; queued passive crafts: `Queued`), red → what's needed
   (`Needs fertilizer`, `3 need fertilizer · 1 needs water`), orange → time
-  left (`4m left`, `next ~4m · all 14m`, `~` = estimate, `Time left
-  unknown` for plants already growing at launch), green → `Ready to
+  left (`4m left`, `next 4m · all 14m`, `~` = estimate, only when the relay's
+  growth timer row is missing), green → `Ready to
   harvest` / `Ready to collect` / `Done`. Active crafts have no time left
   (the rate-based ETA was removed), so orange crafts show percent too.
   **Pulse** (user request): a plant / passive craft badge pulses
@@ -187,19 +189,19 @@ Player, Connection).
 | Activity | no XP, no regen in 10s | warning | Idle: no XP, no regen |
 | Activity | nothing received yet | warning | No XP or regen yet |
 | Satiation | satiation ≤ 15 | alert | Low satiation (N) |
-| Food | food regen buff active / none (relay data only) | healthy / alert | Nm Ss left / No food |
+| Food | food regen buff active / none | healthy / alert | Nm Ss left / No food |
 | Player | signed out / signed in | alert / healthy | Player offline / Online |
-| Connection | connected / connecting / disconnected | healthy / warning / alert | Connected / Connecting… / Disconnected |
+| Connection | BitJita live connected / connecting / disconnected | healthy / warning / alert | Connected / Connecting… / Disconnected |
+| Relay | every region live / connecting (incl. "still loading") / every region refused | healthy / warning / alert | Relay live / Relay connecting… / Relay unavailable |
 
 Activity rows are checked top to bottom.
 
 - **Active** (user request): moving around means the player is at the
   keyboard, so it overrides every other Activity rule. Movement = the
   `mobile_entity_state` location changed (`Model::update_position` →
-  `moved_at`, window `ActivityCheck::move_window` = 10s). Source: BitJita
-  live channel (works without the relay; first version used the relay
-  only and did nothing while the relay was restarting) and the relay
-  when live. **Idle right after Active is quiet** (user request: the
+  `moved_at`, window `ActivityCheck::move_window` = 10s). Source: the
+  relay (BitJita's live channel was a second source; removed with the
+  fallbacks). **Idle right after Active is quiet** (user request: the
   player stopped the action by walking away, not worth an alert): when
   Activity goes from "Active" to an idle message, neither the went-idle
   notification nor the idle sound fires, until Activity is something other
@@ -229,19 +231,22 @@ Activity rows are checked top to bottom.
 - **Craft rules** (user request: yellow when a craft just finished, red when
   the last craft still needs progress but you're idle). "Last action was a
   craft" = `CraftTracker::last_worked` (last craft with live progress, kept
-  after completion since REST drops completed crafts) progressed no more than
+  after completion in case its row disappears) progressed no more than
   5s before the last XP gain. XP later than that means you moved on (e.g. a
-  new craft REST hasn't discovered yet), and the normal rules apply. "Craft
+  craft that isn't tracked), and the normal rules apply. "Craft
   finished" stays until then; resting during an unfinished craft is still
   "Resting".
 - There is **no low-stamina warning** (removed): you run out of stamina
   exactly when you stop to regenerate, so it only duplicated "Resting".
 - **Food** (user request, re-added once reliable data existed): reported
-  only once buffs arrived (relay or BitJita live `active_buff_state`) and
-  the food buff types are known (relay, cached); cleared while offline.
+  only once the relay delivered buffs and the food buff types; cleared
+  while offline.
   Only the "Food Regen" buff counts (every food gives one); extra "Food
   Buffs" alone (e.g. action speed) don't. "No food" is a normal alert, so it
   notifies when food runs out (5 min cooldown).
+- **Relay**: it's the only source for everything but XP / stamina /
+  satiation, so an outage (stale data) is a report of its own. Transient
+  refusals ("still loading") count as connecting.
 - Messages are kept short because they're shown in the label.
 
 ## Notifications
@@ -255,9 +260,9 @@ thread. Produced by `Model` (`collect_notifications`,
 |---|---|
 | Error state | A status source changes **to alert from a known non-alert status**. A source's *first* report doesn't count. **5 min cooldown per source** (e.g. flapping connection). Alert → alert (message change) is silent. |
 | Went idle | Not when it comes straight from "Active" (moving; see Status rules). Activity changes to an idle message (`ActivityCheck::is_idle`: "Idle…", "Craft idle…") from a known non-idle one (e.g. Gaining experience / Resting → Idle: stamina full). Idle → idle (message change) is silent. Same 5 min cooldown. Idle used to be red and notified as an error state; it became orange, and this keeps the notification. |
-| Craft finished | Once per craft, when live progress reaches the total, or when REST reports a tracked craft as `completed` (if the live event was missed). |
-| Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished on first load are silent, and so are those in the first list after **switching source** (REST ↔ relay): REST once listed no passive crafts while the relay had 3 finished ones, which notified as "finished" (`Model::switch_source`). |
-| Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first load or the first list after a source switch. |
+| Craft finished | Once per craft, when its relay progress reaches the total. |
+| Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished in the first list are silent. |
+| Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first list. |
 
 Connection reports `healthy` when connected (instead of clearing) so a later
 disconnect is a transition and notifies.
@@ -308,14 +313,16 @@ src/core/          No GPUI, no I/O (unit-tested):
   version.rs       Release tag vs current version (update check)
 src/net/           Background Tokio runtime ("network" thread):
   mod.rs           Command/Outgoing channels; per-character tracking
-                   (live task + 60s REST poll + relay); caches
-  live.rs          BitJita websocket: subscribe, ping, reconnect w/ backoff
-  api.rs           BitJita REST + flexible date parsing (`parse_date`)
-  relay.rs         SpacetimeDB relay: passive crafts + plants, live
+                   (live task + relay hub + 60s players/<id> poll)
+  live.rs          BitJita websocket (XP, stamina, satiation): subscribe,
+                   ping, reconnect w/ backoff
+  api.rs           BitJita REST (player search, players/<id>)
+  relay.rs         SpacetimeDB relay, one feed per region: crafts, passive
+                   crafts, plants, food, stats, health, position, online
 src/tray.rs        Tray icon rendering/updates
 src/notifier.rs    Desktop notifications
 src/sound.rs       Alert sounds (synthesized chimes, rodio)
-src/settings.rs    settings.json (tracked character)
+src/settings.rs    settings.json (tracked character, info window, sounds)
 ```
 
 **Data flow is one way**: the network thread sends `net::Outgoing` messages
@@ -338,10 +345,8 @@ character that's no longer tracked are dropped.
 - **No gray text in the menu bar** (macOS user feedback: hard to read). The
   tray title is plain text anyway. Loading uses the warning color (orange
   ring, empty pie) and the text "Loading…".
-- **Websocket subscriptions are tracked as a set** and re-sent on reconnect;
-  `Command::Subscribe` adds channels at runtime (crafts discovered via REST).
-  Channels added while (re)connecting are kept and sent with the next
-  subscribe (losing them once made active crafts show as "Paused").
+- **BitJita live channels** are fixed per character (XP, stamina,
+  satiation) and re-sent on reconnect.
 - **Reconnect** with exponential backoff 1s → 30s. **Keepalive**: ping every
   15s; a ping still unanswered at the next tick (> 10s) fails the connection
   (silent dead sockets after sleep / Wi-Fi switch). No explicit
@@ -349,20 +354,20 @@ character that's no longer tracked are dropped.
   ping detects it within ~30s.
 - **Stale feed**: BitJita can stop delivering events on a connection that
   otherwise stays healthy (pings answered), observed after an outage on their
-  side, while a fresh connection gets them. So if `players/<id>` says
-  `signedIn` but no live event arrived for 60s on a connection at least 60s
-  old, the model sends `Command::ReconnectLive` (`reconnect_if_feed_stale`,
-  checked on the 60s poll). Relies on satiation updating ~1/s while signed
-  in; a wrong `signedIn` only costs a reconnect per minute.
+  side, while a fresh connection gets them. So if the relay says
+  the player is signed in but no live event arrived for 60s on a
+  connection at least 60s old, the model sends `Command::ReconnectLive`
+  (`reconnect_if_feed_stale`, checked on the 60s `players/<id>` poll).
+  Relies on satiation updating ~1/s while signed in.
 - **Loading state** (`Model::is_loading`): at launch and after switching
-  character, until the websocket is connected and the core REST requests
-  (crafts, stats, placeables, player) finished, capped at 20s. Tray shows the
+  character, until the BitJita websocket is connected and every relay
+  region delivered its rows (`NetEvent::RelayLoaded`), capped at 20s. Tray shows the
   orange ring + "Loading…", the panel "Loading <name>…" instead of the data
   sections, and no notifications fire. Typically 1–2s.
-- **REST polling**: every 60s, the requests of a round run **in parallel**
-  (`tokio::join!`). Loading doesn't wait for passive crafts: that endpoint
-  sometimes takes ~10s+ (BitJita cache seems cold; fast on repeat), so the
-  panel shows a "Passive crafts — Loading…" placeholder until it arrives.
+- **REST polling**: only `players/<id>`, every 60s (username, extra relay
+  regions). The relay starts on the mirrored regions right away, without
+  waiting for it. The panel shows a "Passive crafts — Loading…"
+  placeholder until the first relay list arrives.
 - **Character selection** is by username search in the panel: the
   tracked character's name with a *Change* button that opens a search field
   (typed via key events; GPUI has no text input widget), debounced 300ms,
@@ -403,9 +408,24 @@ character that's no longer tracked are dropped.
 - **macOS**: activation policy set to Accessory at startup (no Dock icon;
   GPUI starts as a regular app).
 
-## Data sources (BitJita)
+## Data sources
 
-### SpacetimeDB relay (crafts, passive crafts, plants, food; live) — `src/net/relay.rs`, hub in `src/net/mod.rs`
+**One source per piece of data, no fallbacks** (user request: "I would
+like one source of truth, a half functioning app is unpredictable").
+There used to be BitJita fallbacks for most relay data (REST crafts,
+passive crafts, placeables, stats, `signedIn`; live craft progress,
+position, stats and buffs), with rules for mixing them (newest wins,
+source-switch baselines, cached stats and food types in
+`settings.json`). All removed: when the relay is down, its data is stale
+and the **Relay** status report says so.
+
+| Data | Source |
+|---|---|
+| XP, stamina, satiation | BitJita live websocket |
+| Crafts, passive crafts, plants, food buffs, max stamina/satiation/health, health, position, online status | Relay |
+| Player search, username, player/claim regions | BitJita REST |
+
+### SpacetimeDB relay — `src/net/relay.rs`, hub in `src/net/mod.rs`
 
 BitCraft runs on SpacetimeDB. We use the community read-only mirror
 **https://relay.bitcraftsync.app** (user request; source
@@ -414,7 +434,7 @@ replaced BitJita's relay (`relay.bitjita.com`, "BITCONNECT"), which was
 often down for long periods (`/healthz` 503) and slow to deliver food
 buffs. **No account or BitCraft token** (the relay issues its own
 identities). Unofficial, no published terms/limits; could change without
-notice, hence the REST fallback. Read-only: `OneOffQuery` / `CallReducer`
+notice. Read-only: `OneOffQuery` / `CallReducer`
 are rejected. Connecting to Clockwork's own SpacetimeDB with the player's
 game token was rejected: account risk, and the relay has the same data.
 
@@ -431,20 +451,26 @@ game token was rejected: account risk, and the relay has the same data.
   found: following only the player's region showed 0 plants/crafts after
   the player traveled from region 14 to 13, while buffs still came through.)
   So the **relay hub** (`relay_hub`) runs one feed per region: every
-  mirrored region (`MIRRORED_REGIONS`: 7, 8, 9, 12, 13, 14, 17, 18, 19), plus
-  the player's `regionId` and their claims' regions (`players/<id>`), updated
-  on each 60s poll. All queries filter by the character, so each is small.
-  Crafts, passive crafts and plants are merged across regions; food comes
-  from the player's region.
-- **Liveness**: the relay counts as live (`RelayState::Live`, shared
-  `AtomicBool`) only when **every** followed region is live; regions that
-  refuse for good (`SubscriptionError` other than "loading", e.g. not
-  mirrored; retried every 5 min) are ignored. While not live, REST provides
-  crafts/plants/passive crafts and relay lists aren't sent, so a region
-  that's still loading never hides data. BitJita's relay refused with
+  mirrored region (`MIRRORED_REGIONS`: 7, 8, 9, 12, 13, 14, 17, 18, 19),
+  started at once, plus the player's `regionId` and their claims' regions
+  (`players/<id>`), added on each 60s poll. All queries filter by the
+  character, so each is small. Crafts, passive crafts and plants are
+  merged across regions; food comes from the player's region.
+- **Delivery**: lists (crafts, passive crafts, plants) and the player's
+  rows are sent once **every followed region delivered its rows** at
+  least once (regions refusing for good, e.g. not mirrored, retried every
+  5 min, are skipped), then on every change; so a region that's still
+  loading never looks like missing crafts. A region that's reconnecting
+  keeps its last rows (stale until it's back; the Relay report shows
+  it). `RelayState::Live` (the report) = every region live. Errors like
   "module is still loading its initial state from upstream; retry
-  shortly" while restarting (8+ min); such errors are still retried with
-  the normal backoff.
+  shortly" (relay restarting, 8+ min seen) are retried with the normal
+  backoff and count as connecting.
+- **Name lookups**: recipe → `item_desc` and `building_state` →
+  `building_desc` need a second subscribe round. A region holds its data
+  until that re-subscribe's `InitialSubscription` arrived (updates can
+  come in between), so names never show half-resolved ("Forge" instead
+  of "Ingot T2").
 - Protocol: send `{"Subscribe":{"query_strings":[SQL…],"request_id":1}}`
   (replaces the whole set; also used to add lookups) → `InitialSubscription`
   (all current rows) → `TransactionUpdate`s (`deletes` + `inserts` per table).
@@ -465,15 +491,11 @@ game token was rejected: account risk, and the relay has the same data.
   duration seconds (food: 900/1800/3600). `buff_desc` is subscribed only for
   the two food buff types (`buff_type_id` 1790361536 "Food Regen", 11 rows;
   861783812 "Food Buffs", 96 rows): a match = food buff; column 2 = name.
-  Expiry is computed from start + duration on each tick. **Two sources**
-  for the same row: the hub sends the relay's started buffs
-  (`NetEvent::RelayBuffs`) **only when they change** (every region update
-  re-sends data, and a stale repeat would undo newer live buffs), BitJita
-  live sends `LiveBuffs`; the model keeps the latest. Which buffs are food
-  comes from the relay's `buff_desc` (`NetEvent::FoodBuffDescs`), **cached
-  in `settings.json`** (`food_buff_descs`) so live buffs work while the
-  relay is down; with no cached types there's no Food report (it would
-  say "No food"). Not subscribed
+  Expiry is computed from start + duration on each tick. The hub sends
+  the started buffs (`NetEvent::RelayBuffs`) **only when they change**
+  (every region update re-sends data). Which buffs are food comes from
+  `buff_desc` (`NetEvent::FoodBuffDescs`); until both arrived there's no
+  Food report (it would say "No food"). Not subscribed
   anymore: `food_desc` (413 rows; column 8 = `[[buff_id, duration option],
   …]` maps food items → buffs). It was used to name the food, but 369 foods
   share 223 buff sets (often ambiguous) and the names were too long. `buff_desc.online_timestamp` is true for food buffs; whether
@@ -486,12 +508,11 @@ game token was rejected: account risk, and the relay has the same data.
   REST stats: 1 = max stamina 262, 19 = max satiation 100, verified equal).
   Like buffs, these rows **move with the player** (present in region 13 and
   absent in 14 after traveling), so the hub takes the player's rows (food,
-  stats, online status) from the live region that has `player_state` and
-  sends `NetEvent::RelayPlayer` (None when no live region has it → REST
-  fallback). `health_state` = [entity_id, last_health_decrease_timestamp,
-  health, died_timestamp] is subscribed the same way (info window; no
-  REST fallback, BitJita's live `health_state` channel sent nothing when
-  probed).
+  stats, online status) from the region that has `player_state`
+  (preferring a live one: a reconnecting old region can still hold a
+  stale copy) and sends `NetEvent::RelayPlayer` (None when no region has
+  it: unknown). `health_state` = [entity_id, last_health_decrease_timestamp,
+  health, died_timestamp] is subscribed the same way (info window).
 - **Position** (`Feed::position`): `mobile_entity_state` = [entity_id,
   chunk_index, timestamp, location_x, location_z, destination_x,
   destination_z, dimension, is_walking, …]; location changes → "Active"
@@ -504,25 +525,29 @@ game token was rejected: account risk, and the relay has the same data.
   recipe → `item_desc`, building via `building_state` → `building_desc`.
   Crafts whose recipe hasn't arrived yet are skipped (total 0 would look
   finished). Progress changes arrive live and count as "last progressed".
-  The BitJita live channel is still subscribed as a fallback.
 - Tables used (column indices in `relay.rs`): `passive_craft_state`
   (entity, owner, recipe_id, building_entity_id, timestamp, status
   Queued/Processing/Complete, slot), `crafting_recipe_desc` (name,
   time_requirement = duration, crafted_item_stacks), `item_desc`,
   `building_state` → `building_desc` (names; second lookup round),
   `placeable_state` (owner, placeable_id) → `placeable_desc` (name, tag,
-  tier), `growth_state` (end_timestamp; empty for crops when checked).
+  tier).
+- **Plant growth** (`Feed::plants`): `placeable_growth_timer` =
+  [scheduled_id, scheduled_at (sum: 0 Interval, **1 Time** = growth end),
+  entity_id (the plant), growth_recipe_id] is public and gives the
+  **exact** end per growing plant (verified: timer → `placeable_growth_desc`
+  `[id, placeable_id, time [min, max], outcomes, …]` → outcome = the
+  "Grown …" placeable). `placeable_growth_desc` (by placeable_id) is also
+  subscribed for the estimate fallback while a timer row is missing.
+  (`growth_state.end_timestamp` was empty for crops; no longer used.)
 - **Private** (subscribe error): `passive_craft_timer`, so passive end times
   are still start + recipe duration. Processing crafts run in parallel slots
   (`slot = some(n)`); a `Queued` craft is shown without an end time until it
   turns Processing. No Queued rows were seen in region 14 (51,769 rows:
   47,933 complete, 3,836 processing).
 - Crop growth start isn't stored; it's recorded when a plant is seen
-  switching to `Growing …` live (estimate `~` = that + catalog duration).
-  Plants already growing at launch have no time left.
-- While the relay is live, the REST crafts, passive-crafts and placeables
-  requests are skipped / their results dropped (BitJita's REST also
-  sometimes answers 500 for crafts/placeables).
+  switching to `Growing …` live, for the `~` estimate (start + catalog
+  duration) when there's no timer row.
 
 ### BitJita live websocket — `src/net/live.rs`
 
@@ -536,16 +561,12 @@ doesn't prove a channel exists). Events: `{"type":"event","channel":...,"data":{
 | `experience_state:<player id>` | `experience_stacks[{skill_id, quantity}]` | **No snapshot on subscribe**, only updates. First update counts as a gain (no baseline); skill is known from the second update on. |
 | `stamina_state:<player id>` | `stamina` | ~1/s while regenerating. **Stops sending when full.** |
 | `satiation_state:<player id>` | `satiation` | ~1/s while it changes (slowly decreasing). |
-| `character_stats_state:<player id>` | `values[1]` = max stamina, `values[19]` = max satiation | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe. Fallback for when the relay's `character_stats_state` isn't available. |
-| `mobile_entity_state:<player id>` | `location_x`, `location_z` (also `destination_*`, `is_walking`, `timestamp` ms, `region_id`) | **~16 events/s** (330 in 20s while playing), so `live::handle` sends a `Position` at most once per second and only when it changed. Movement → "Active". |
-| `progressive_action_state:<craft entity id>` | `progress`, `entity_id` | One event per craft action (+ a duplicate `preparation: true` event). |
-| `active_buff_state:<player id>` | `active_buffs` | Food buffs, faster than the relay (user: relay food "takes quite long, if at all"). **Format unverified**: an earlier probe saw no events (likely only sent on change, e.g. eating). `net::parse_buffs` accepts the relay's column arrays or objects (`buff_id`, `buff_start_timestamp`, `buff_duration`; timestamps wrapped or not, s/ms/µs); an unrecognized payload is ignored. `BITCRAFT_DEBUG=1` logs the raw data: check it and tighten the parser once seen. |
 
-Channels probed that produced no events: `character_stats`, `player_state`,
-`health_state`. BitJita's frontend also uses
-`health_state`, `active_buff_state`, `passive_craft_state:owner_entity_id:<id>`,
-`placeable_state`, `growth_state`; like `character_stats_state` they probably
-only send on change.
+No longer subscribed (relay has them; removed with the fallbacks):
+`character_stats_state`, `mobile_entity_state` (~16 events/s while
+moving), `active_buff_state`, `progressive_action_state:<craft id>`.
+Channels probed that produced no events: `character_stats`,
+`player_state`, `health_state`.
 
 ### BitJita REST — `src/net/api.rs`
 
@@ -554,41 +575,22 @@ agent: Python's default `urllib` agent got 403).
 
 | Endpoint | Used for |
 |---|---|
-| `players/<id>/crafts` | Craft list: `entityId`, `progress`, `totalActionsRequired`, `completed`, `craftedItem[].item_id` → `items[].name`, `buildingName`. Polled every 60s to discover new crafts (then followed live). |
-| `players/<id>/passive-crafts` | Passive crafts (fallback when the relay isn't live). Same envelope as crafts (`craftResults`, `items`) but each result only has `entityId`, `buildingName`, `recipeId`, `recipeName` (e.g. `"Weave {0}"`, `{0}` = item), `status`, start `timestamp`, `craftedItem`, `slot`. **No progress or end time.** Only `status: "complete"` observed; anything else = running. Completed crafts stay listed until collected. Can lag behind the game considerably (reason for the relay). |
-| `items/<itemId>` | `craftingRecipes[]` with `id`, `timeRequirement` (seconds). A passive recipe's **duration** (e.g. Weave Rough Cloth Strip = 180s); end = start `timestamp` + duration. Cached per recipe. |
-| `players/<id>/stats` | `stats.values[1]` = **max stamina**, `stats.values[19]` = **max satiation** (index order from BitJita's frontend stat list: maxHealth, maxStamina, …, satiationRegenRate (18), maxSatiation (19), …). Polled every 60s; ignored while the relay provides the stats (REST lags behind gear/buff changes). Inferred mapping, not documented. |
-| `players/<id>/placeables` | Plants fallback. `instances[]`: `placeable{name, tag, tier}`, `placeableId`, `availableInteractions[].verbPhrase`, `updatedAt`, `nextStateAt`, `growthEndTimestamp`. Crops have tag `Farmed Crop`; others (e.g. sift collectors, `Sift`) are ignored. `urgency` is not useful for crops. |
-| `placeables/<placeableId>` | Catalog entry; `growth[].time` = `[min, max]` seconds for timed stages (e.g. Growing Basic Starbulb: 300s). Cached per type; only fetched for growing plants with a start time and no reported end. |
-| `players?q=<text>` | Player search: case-insensitive substring on username, **≥ 2 chars**, **max 50 results, alphabetical, no paging**. Re-ranked client-side: exact, then prefix, then rest. UI hints to type more when 50 come back. |
-| `players/<id>` | `username`, `signedIn` (offline state; fallback when the relay has no `player_state`), `regionId` + `claims[].regionId` (extra relay regions to follow). Polled every 60s. `skillMap` was the source for `skill.rs` (hardcoded). |
+| `players?q=<text>` | Player search: case-insensitive substring on username, **≥ 2 chars**, **max 50 results, alphabetical, no paging**. Re-ranked client-side: exact, then prefix, then rest. UI hints to type more when 50 come back. Results' `signedIn` shows the online dot. |
+| `players/<id>` | `username` (display), `regionId` + `claims[].regionId` (extra relay regions to follow). Polled every 60s. `skillMap` was the source for `skill.rs` (hardcoded). |
+
+No longer used (relay has the data; removed with the fallbacks):
+`players/<id>/crafts`, `/passive-crafts`, `/placeables`, `/stats`,
+`items/<id>` (recipe durations), `placeables/<id>` (growth durations),
+and `signedIn` from `players/<id>`.
 
 ### Data decisions
 
-- **Out-of-order events between sources** (user: "events feel flickery").
-  Single-source feeds (XP, stamina, satiation, relay health/food)
-  arrive in order over one websocket and are applied as they come. Where
-  two sources report the same row, older values are dropped:
-  - **Position** (BitJita live, throttled to 1/s, + relay): both carry the
-    row's `timestamp` (ms); `Model::update_position` ignores a position
-    older than the last one. Otherwise the throttled live copy could arrive
-    after the relay's newer one and count as moving back and forth.
-  - **Craft progress** (relay + BitJita live channel + REST): only ever
-    goes up (`CraftTracker::handle_progress` ignores values ≤ current;
-    REST merges with `max`).
-  - **Max stamina/satiation**: the relay's stats win; REST and BitJita
-    live `character_stats_state` are only applied while the relay has none.
-
-- **Max stamina / satiation**: relay `character_stats_state` when
-  available, else REST stats + BitJita live `character_stats_state`
-  (whichever came last). The last values are **cached** in
-  `settings.json` (`cached_stats`, per tracked character, cleared on
-  switching) and applied at startup: the relay restarts for 10+ minutes
-  at a time and `players/<id>/stats` has answered 404 meanwhile; if current stamina exceeds it
-  (API lagging after a gear change), use current. Fallback without API: highest
-  stamina seen in the last 10 minutes (current value always included, since
-  updates stop at full).
-- **"Stamina full" / "ready"** is only trusted with the API max; the fallback
+- **Max stamina / satiation / health**: relay `character_stats_state`
+  (1 = max stamina, 19 = max satiation, 0 = max health). Until it
+  arrives: highest stamina seen in the last 10 minutes (current value
+  always included, since updates stop at full). No cache across
+  launches anymore (loading waits for the relay).
+- **"Stamina full" / "ready"** is only trusted with the relay max; the fallback
   estimate equals the current value while regenerating, so any fraction of it
   would look reached. Without the API max, only the no-regen rule applies.
 - **XP gain** = any skill's quantity increased vs the previous update. Last
@@ -598,22 +600,20 @@ agent: Python's default `urllib` agent got 403).
 - **Craft time remaining was removed** (rate-based ETA was too inaccurate).
   Show percent done instead, rounded down so it never shows 100% early.
 - A craft is **active** if it progressed in the last 30s; otherwise "Paused".
-- **Passive craft done** = reported complete **or** computed end time passed.
-  Duration doesn't account for speed bonuses, so it's an estimate.
+- **Passive craft done** = reported complete **or** computed end time
+  passed (start + recipe `time_requirement`; `passive_craft_timer` is
+  private). Duration doesn't account for speed bonuses, so it's an
+  estimate.
 - **Crop lifecycle** (same for all 132 crop placeables in the catalog):
   `Planted …` → *Fertilizer* action (e.g. 3× Basic Fertilizer) →
   `Fertilized Planted …` → *Water* action (1× Water Bucket) →
   `Growing …` (timer) → `Grown …` → *Harvest*.
-- **Stage detection** (`PlantTracker::stage`): `Grown `/`Growing ` name prefix
-  first; otherwise the available interaction (`fertilizer` / `water`, REST
-  only), falling back to the `Fertilized Planted ` / `Planted ` name prefix.
-  Non-crops → None. Grouped by tier.
-- **Time left**: reported end (relay `growth_state`, REST
-  `growthEndTimestamp` / `nextStateAt`) when present — always empty/null when
-  checked. Fallback estimate = start + catalog growth duration (max), marked
-  `~`; start = seen-switching-to-growing (relay) or `updatedAt` (REST,
-  assumed to be when growing started). `api::parse_date` accepts
-  Postgres-style strings, ISO 8601 and epoch seconds/ms.
+- **Stage detection** (`PlantTracker::stage`): name prefix: `Grown `,
+  `Growing `, `Fertilized Planted ` (needs water), `Planted ` (needs
+  fertilizer). Non-crops → None. Grouped by tier.
+- **Time left**: relay `placeable_growth_timer` (exact). Fallback
+  estimate when a plant has no timer row = seen-switching-to-growing +
+  catalog growth duration (max), marked `~`.
 
 ## Project settings
 
@@ -623,7 +623,7 @@ agent: Python's default `urllib` agent got 403).
   screen), `BITCRAFT_NO_NOTIFY=1` (suppress notifications). `cargo test` for
   the core rules and date parsing.
 - **Settings file** (tracked character, info window state/position,
-  sounds, cached stats and food buff types):
+  sounds; old `cached_stats` / `food_buff_descs` keys are ignored):
   `<config dir>/bitcraft-tracker/settings.json` (macOS
   `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`).
 - **GPUI** 0.2.2 with `runtime_shaders`: Metal shaders compile at runtime,
@@ -708,20 +708,14 @@ agent: Python's default `urllib` agent got 403).
   rows disappear. `resource_depleted_event` isn't replicated by the relay.
 
 - **Food via REST** (`players/<id>/buffs`) was tried in the Swift app and
-  removed: BitJita doesn't keep buffs up to date. Food now comes from the
-  relay and BitJita live; without either (and no cached buff types)
-  there's no Food report,
-  and food is inferred from stamina regen (Activity rule) and satiation.
-- Relay `player_state` has `time_signed_in`, `sign_in_timestamp`,
-  `signed_in`: a possible live alternative to the REST `signedIn` poll.
+  removed: BitJita doesn't keep buffs up to date.
+- XP, stamina and satiation still come from BitJita live; the relay may
+  have the same tables (`experience_state`, `stamina_state`,
+  `satiation_state`), which would make BitJita search-only.
 - Passive crafts: whether crafts in one building queue (end times would need
   chaining) is unverified; only Processing (parallel slots) and Complete were
   seen.
-- Placeable data freshness via REST depends on BitJita (all instances had the
-  same `updatedAt` when first checked); the relay fixes this when live.
 - Skill names are hardcoded; unknown ids show as "Skill N".
-- Craft channels are never unsubscribed when crafts finish (harmless, reset on
-  character change).
 - Warning color is orange; the user has called it "yellow". Changing it
   affects every warning (Resting, Connecting…, Craft finished).
 - The tray label on macOS is single-colored plain text (the Swift app colored

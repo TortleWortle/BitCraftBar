@@ -1,4 +1,5 @@
-//! Live passive crafts + plants from BitCraft's SpacetimeDB via the
+//! The character's crafts, passive crafts, plants, food, stats, health,
+//! position and online status from BitCraft's SpacetimeDB via the
 //! community read-only relay `relay.bitcraftsync.app` (one port per region:
 //! 3000 + region). No account/token needed. Protocol:
 //! SpacetimeDB v1 JSON (`v1.json.spacetimedb`). See AGENTS.md "SpacetimeDB
@@ -156,7 +157,10 @@ impl Feed {
             format!("SELECT building_state.* FROM building_state JOIN progressive_action_state ON building_state.entity_id = progressive_action_state.building_entity_id WHERE progressive_action_state.owner_entity_id = {u}"),
             format!("SELECT * FROM placeable_state WHERE owner_entity_id = {u}"),
             format!("SELECT placeable_desc.* FROM placeable_desc JOIN placeable_state ON placeable_desc.id = placeable_state.placeable_id WHERE placeable_state.owner_entity_id = {u}"),
-            format!("SELECT growth_state.* FROM growth_state JOIN placeable_state ON growth_state.entity_id = placeable_state.entity_id WHERE placeable_state.owner_entity_id = {u}"),
+            // Growth end per plant (exact), and the catalog growth time
+            // (fallback estimate while a timer row is missing).
+            format!("SELECT placeable_growth_timer.* FROM placeable_growth_timer JOIN placeable_state ON placeable_growth_timer.entity_id = placeable_state.entity_id WHERE placeable_state.owner_entity_id = {u}"),
+            format!("SELECT placeable_growth_desc.* FROM placeable_growth_desc JOIN placeable_state ON placeable_growth_desc.placeable_id = placeable_state.placeable_id WHERE placeable_state.owner_entity_id = {u}"),
         ];
         // Food buffs: the character's active buffs + the food buff types'
         // descriptions (names).
@@ -241,8 +245,7 @@ impl Feed {
     /// is_walking, …]: current position, for movement detection.
     fn position(&self) -> Option<Position> {
         let row = self.store.rows("mobile_entity_state").next()?;
-        let at = row.get(2).and_then(Value::as_f64).filter(|t| *t > 0.0).map(|ms| ms / 1e3);
-        Some(Position { x: row.get(3).and_then(int)?, z: row.get(4).and_then(int)?, at })
+        Some(Position { x: row.get(3).and_then(int)?, z: row.get(4).and_then(int)? })
     }
 
     /// Building name via `building_state` → `building_desc`.
@@ -316,10 +319,34 @@ impl Feed {
             .collect()
     }
 
+    /// Plants: `placeable_state` = [entity_id, owner, placeable_id,
+    /// direction] → `placeable_desc` = [id, name, tag, tier, …]. Growth end:
+    /// `placeable_growth_timer` = [scheduled_id, scheduled_at (sum: 0
+    /// Interval, 1 Time), entity_id, growth_recipe_id]. Catalog duration:
+    /// `placeable_growth_desc` = [id, placeable_id, time [min, max], …].
     fn plants(&mut self, initial: bool) -> Vec<Plant> {
         let now = now();
         let mut growing = HashSet::new();
         let mut plants = Vec::new();
+        let ends: HashMap<String, f64> = self
+            .store
+            .rows("placeable_growth_timer")
+            .filter_map(|t| {
+                let at = t.get(1)?.as_array()?;
+                if at.first().and_then(int) != Some(1) {
+                    return None;
+                }
+                Some((key(t.get(2)?), at.get(1).and_then(date)?))
+            })
+            .collect();
+        let durations: HashMap<i64, f64> = self
+            .store
+            .rows("placeable_growth_desc")
+            .filter_map(|d| {
+                let max = d.get(2)?.as_array()?.iter().filter_map(Value::as_f64).reduce(f64::max)?;
+                Some((d.get(1).and_then(int)?, max))
+            })
+            .collect();
         let rows: Vec<Vec<Value>> = self.store.rows("placeable_state").cloned().collect();
         for row in rows {
             let id = key(&row[0]);
@@ -336,13 +363,11 @@ impl Feed {
                 self.growing_since.remove(&id);
             }
             plants.push(Plant {
-                placeable_id,
                 name,
                 tier,
-                interactions: vec![],
-                reported_end: self.store.get("growth_state", &id).and_then(|g| g.get(1).and_then(date)),
+                reported_end: ends.get(&id).copied(),
                 started_growing_at: self.growing_since.get(&id).copied(),
-                growth_duration: None,
+                growth_duration: durations.get(&placeable_id).copied(),
             });
         }
         self.growing_ids = growing;
@@ -356,7 +381,6 @@ fn item_kind(item: Option<&Vec<Value>>) -> (Option<String>, Option<i64>) {
     (item.get(10).and_then(Value::as_str).map(str::to_string), item.get(9).and_then(int))
 }
 
-/// Follows `user`'s passive crafts and plants in `region` until cancelled.
 /// Everything one region's database has for the character, after an update.
 #[derive(Default)]
 pub struct RegionData {
@@ -446,6 +470,7 @@ async fn session(
     let mut ping = interval(Duration::from_secs(15));
     ping.tick().await;
     let mut awaiting_pong: Option<tokio::time::Instant> = None;
+    let mut awaiting_subscription = true;
 
     loop {
         tokio::select! {
@@ -482,6 +507,20 @@ async fn session(
                 };
                 feed.store.apply(changes.as_array().map(Vec::as_slice).unwrap_or_default(), initial);
                 *backoff = Duration::from_secs(1);
+                // New recipes/buildings need a name lookup first: hold the
+                // data until the re-subscribe's InitialSubscription is in
+                // (updates can arrive before it), so names never show
+                // half-resolved.
+                awaiting_subscription &= !initial;
+                if feed.add_missing_lookups() {
+                    if sink.send(feed.subscribe_message()).await.is_err() {
+                        return Ok(());
+                    }
+                    awaiting_subscription = true;
+                }
+                if awaiting_subscription {
+                    continue;
+                }
                 emit(RegionUpdate::State(RelayState::Live));
                 emit(RegionUpdate::Data(RegionData {
                     crafts: feed.crafts(),
@@ -494,9 +533,6 @@ async fn session(
                     health: feed.health(),
                     position: feed.position(),
                 }));
-                if feed.add_missing_lookups() && sink.send(feed.subscribe_message()).await.is_err() {
-                    return Ok(());
-                }
             },
             _ = ping.tick() => {
                 if awaiting_pong.is_some_and(|sent| sent.elapsed() >= Duration::from_secs(10)) {

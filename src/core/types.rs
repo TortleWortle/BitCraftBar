@@ -12,7 +12,7 @@ pub fn now() -> f64 {
         .unwrap_or(0.0)
 }
 
-/// One active (non-passive) craft from REST `players/<id>/crafts`.
+/// One active (non-passive) craft (relay `progressive_action_state`).
 #[derive(Clone, Debug)]
 pub struct CraftInfo {
     pub id: String,
@@ -26,7 +26,7 @@ pub struct CraftInfo {
     pub tier: Option<i64>,
 }
 
-/// One passive craft (relay or REST).
+/// One passive craft (relay `passive_craft_state`).
 #[derive(Clone, Debug)]
 pub struct PassiveCraft {
     pub id: String,
@@ -52,14 +52,12 @@ impl PassiveCraft {
     }
 }
 
-/// One placeable (relay or REST); only crops matter.
+/// One placeable (relay `placeable_state`); only crops matter.
 #[derive(Clone, Debug)]
 pub struct Plant {
-    pub placeable_id: i64,
     pub name: String,
     pub tier: i64,
-    /// Lowercased verb phrases of the available interactions (REST only).
-    pub interactions: Vec<String>,
+    /// Growth end (relay `placeable_growth_timer`).
     pub reported_end: Option<f64>,
     /// When it started growing, if known (for the estimate).
     pub started_growing_at: Option<f64>,
@@ -67,16 +65,11 @@ pub struct Plant {
     pub growth_duration: Option<f64>,
 }
 
-/// Character location (`mobile_entity_state`), from the BitJita live feed
-/// or the relay.
+/// Character location (relay `mobile_entity_state`).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Position {
     pub x: i64,
     pub z: i64,
-    /// The row's `timestamp` (Unix seconds; both sources carry it, in ms),
-    /// to drop a position older than one already seen from the other
-    /// source.
-    pub at: Option<f64>,
 }
 
 /// One active food buff (relay `active_buff_state` + `buff_desc`).
@@ -111,8 +104,8 @@ impl FoodBuff {
     }
 }
 
-/// One started entry of `active_buff_state.active_buffs` (relay row or
-/// BitJita live event); which buffs are food comes from [`FoodBuffDesc`].
+/// One started entry of the relay's `active_buff_state.active_buffs`;
+/// which buffs are food comes from [`FoodBuffDesc`].
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RawBuff {
     pub id: i64,

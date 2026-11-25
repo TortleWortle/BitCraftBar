@@ -99,7 +99,7 @@ impl StaminaTracker {
         (m > 0.0).then(|| (s / m).clamp(0.0, 1.0))
     }
 
-    /// Only trusted with the API max (the fallback estimate equals the
+    /// Only trusted with the relay max (the fallback estimate equals the
     /// current value while regenerating).
     pub fn is_at_least(&self, fraction: f64) -> bool {
         match (self.stamina, self.reported_max) {
@@ -228,8 +228,8 @@ impl Craft {
 
 pub struct CraftTracker {
     pub crafts: BTreeMap<String, Craft>,
-    /// Last craft with live progress; kept after completion (REST drops
-    /// completed crafts). Cleared if it disappears unfinished (cancelled).
+    /// Last craft with live progress; kept after completion (in case its
+    /// row disappears). Cleared if it disappears unfinished (cancelled).
     pub last_worked: Option<Craft>,
     pub active_window: f64,
     completion_reported: HashSet<String>,
@@ -278,7 +278,7 @@ impl CraftTracker {
         }
     }
 
-    /// REST list. Returns ids of incomplete crafts (to subscribe to).
+    /// Full craft list (relay). Returns ids of incomplete crafts.
     pub fn update(&mut self, list: &[CraftInfo]) -> Vec<String> {
         for info in list.iter().filter(|c| c.completed) {
             if let Some(mut craft) = self.crafts.get(&info.id).cloned() {
@@ -377,15 +377,10 @@ pub struct PlantTracker {
 impl PlantTracker {
     pub fn stage(plant: &Plant) -> Option<Stage> {
         let name = plant.name.as_str();
-        let has = |verb: &str| plant.interactions.iter().any(|v| v == verb);
         if name.starts_with("Grown ") {
             Some(Stage::Grown)
         } else if name.starts_with("Growing ") {
             Some(Stage::Growing)
-        } else if has("fertilizer") {
-            Some(Stage::NeedsFertilizer)
-        } else if has("water") {
-            Some(Stage::NeedsWater)
         } else if name.starts_with("Fertilized Planted ") {
             Some(Stage::NeedsWater)
         } else if name.starts_with("Planted ") {
@@ -424,12 +419,9 @@ impl PlantTracker {
         (!parts.is_empty()).then(|| parts.join("; "))
     }
 
-    /// `baseline`: first list from a different source; no notifications.
-    pub fn update(&mut self, plants: &[Plant], baseline: bool) {
+    /// The first list sets the baseline (no notifications).
+    pub fn update(&mut self, plants: &[Plant]) {
         self.plants = plants.to_vec();
-        if baseline {
-            self.has_loaded = false;
-        }
         let mut by_tier: BTreeMap<i64, TierSummary> = BTreeMap::new();
         for plant in plants {
             let Some(stage) = Self::stage(plant) else { continue };
@@ -488,11 +480,10 @@ pub struct PassiveCraftTracker {
 }
 
 impl PassiveCraftTracker {
-    /// `baseline`: first list from a different source (REST → relay): its
-    /// already-finished crafts aren't news, like on the first load.
-    pub fn update(&mut self, crafts: Vec<PassiveCraft>, now: f64, baseline: bool) {
+    /// Crafts already finished in the first list aren't news.
+    pub fn update(&mut self, crafts: Vec<PassiveCraft>, now: f64) {
         self.crafts = crafts;
-        if !self.has_loaded || baseline {
+        if !self.has_loaded {
             // Already finished before we started watching: don't notify.
             self.finished_ids.extend(self.crafts.iter().filter(|c| c.is_finished(now)).map(|c| c.id.clone()));
             self.has_loaded = true;
@@ -816,16 +807,14 @@ mod tests {
     #[test]
     fn plant_stages_and_summary() {
         let plant = |name: &str, tier| Plant {
-            placeable_id: 1,
             name: name.into(),
             tier,
-            interactions: vec![],
             reported_end: None,
             started_growing_at: None,
             growth_duration: None,
         };
         let mut tracker = PlantTracker::default();
-        tracker.update(&[plant("Grown Starbulb", 1), plant("Planted Embergrain", 2), plant("Sift", 1)], false);
+        tracker.update(&[plant("Grown Starbulb", 1), plant("Planted Embergrain", 2), plant("Sift", 1)]);
         assert_eq!(tracker.summary().as_deref(), Some("T1 grown; T2 needs fertilizer"));
     }
 }

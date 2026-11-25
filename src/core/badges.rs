@@ -223,10 +223,8 @@ mod tests {
 
     fn plant(name: &str, tier: i64) -> Plant {
         Plant {
-            placeable_id: 0,
             name: name.into(),
             tier,
-            interactions: vec![],
             reported_end: None,
             started_growing_at: None,
             growth_duration: None,

@@ -7,14 +7,11 @@ pub mod live;
 pub mod relay;
 
 use std::collections::{BTreeSet, HashMap};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::core::trackers::PassiveCraftTracker;
 use crate::core::types::{CraftInfo, FoodBuffDesc, PassiveCraft, Plant, PlayerSummary, Position, RawBuff};
 use serde_json::Value;
 
@@ -41,68 +38,43 @@ pub enum NetEvent {
     Experience(Vec<(i64, i64)>),
     Stamina(f64),
     Satiation(f64),
-    /// `character_stats_state` values (same indices as REST stats).
-    CharacterStats(Vec<f64>),
-    /// BitJita live `mobile_entity_state` location (x, z), throttled.
-    Position(Position),
-    CraftProgress { id: String, progress: i64 },
-    Crafts(Vec<CraftInfo>),
-    Stats(Vec<f64>),
+    /// BitJita `players/<id>` (username).
     Player(PlayerSummary),
-    /// REST (only sent while the relay isn't live).
-    Plants(Vec<Plant>),
-    PassiveCrafts(Vec<PassiveCraft>),
-    /// First round of core REST requests finished (for the loading state).
-    InitialRestDone,
     Relay(RelayState),
+    /// Every followed region delivered its rows (sent once per character).
+    RelayLoaded,
+    RelayCrafts(Vec<CraftInfo>),
     RelayPassiveCrafts(Vec<PassiveCraft>),
     RelayPlants(Vec<Plant>),
-    /// The player's started buffs (`active_buff_state`), from the relay
-    /// (sent when they change) or BitJita live (`LiveBuffs`, usually first).
+    /// The player's started buffs (`active_buff_state`), sent on change.
     RelayBuffs(Vec<RawBuff>),
-    LiveBuffs(Vec<RawBuff>),
-    /// Food buff types from the relay's `buff_desc` (cached by the model).
+    /// Food buff types (`buff_desc`).
     FoodBuffDescs(HashMap<i64, FoodBuffDesc>),
-    RelayCrafts(Vec<CraftInfo>),
-    /// The player's own rows (region the player is in). None: not found in
-    /// a live region (relay down / still loading) → use REST.
+    /// The player's own rows (region the player is in). None: no region
+    /// has them.
     RelayPlayer(Option<RelayPlayer>),
 }
 
-/// `active_buff_state.active_buffs` → started buffs. Accepts the relay's
-/// column arrays (`[buff_id, [start], duration, values]`) and objects with
-/// column names (BitJita live). Timestamps may be wrapped (`[n]`,
-/// `{"…": n}`) and in s, ms or µs. None if `list` isn't an array.
+/// Relay `active_buff_state.active_buffs` (`[buff_id, [start (Unix s)],
+/// duration (s), values]`, start possibly `{"…": n}`) → started buffs.
+/// None if `list` isn't an array.
 pub fn parse_buffs(list: &Value) -> Option<Vec<RawBuff>> {
     fn number(v: &Value) -> Option<f64> {
         match v {
             Value::Number(n) => n.as_f64(),
-            Value::String(s) => s.parse().ok(),
             Value::Array(a) => a.first().and_then(number),
             Value::Object(o) => o.values().find_map(number),
             _ => None,
         }
     }
-    fn field<'a>(o: &'a serde_json::Map<String, Value>, names: &[&str]) -> Option<&'a Value> {
-        names.iter().find_map(|n| o.get(*n))
-    }
     let buffs = list
         .as_array()?
         .iter()
         .filter_map(|b| {
-            let (id, start, duration) = match b {
-                Value::Array(a) => (a.first()?, a.get(1)?, a.get(2)?),
-                Value::Object(o) => (
-                    field(o, &["buff_id", "id"])?,
-                    field(o, &["buff_start_timestamp", "start_timestamp", "start"])?,
-                    field(o, &["buff_duration", "duration"])?,
-                ),
-                _ => return None,
-            };
-            let start = number(start)?;
-            let start = if start > 1e14 { start / 1e6 } else if start > 1e11 { start / 1e3 } else { start };
+            let b = b.as_array()?;
+            let start = number(b.get(1)?)?;
             // Inactive entries have start 0.
-            (start > 0.0).then_some(RawBuff { id: number(id)? as i64, start, duration: number(duration)? })
+            (start > 0.0).then_some(RawBuff { id: number(b.first()?)? as i64, start, duration: number(b.get(2)?)? })
         })
         .collect();
     Some(buffs)
@@ -129,7 +101,6 @@ pub enum Outgoing {
 pub enum Command {
     /// Start tracking a character (stops the previous one).
     Track(String),
-    Subscribe(Vec<String>),
     ReconnectLive,
     Search(String),
 }
@@ -155,21 +126,12 @@ pub fn start(out: async_channel::Sender<Outgoing>) -> mpsc::UnboundedSender<Comm
     tx
 }
 
-#[derive(Default)]
-struct Caches {
-    /// Catalog growth duration per placeable id.
-    growth: HashMap<i64, Option<f64>>,
-    /// Passive recipe duration per recipe id.
-    recipes: HashMap<i64, Option<f64>>,
-}
-
 struct Tracking {
     live: mpsc::UnboundedSender<live::LiveCommand>,
     tasks: Vec<JoinHandle<()>>,
 }
 
 async fn manager(mut commands: mpsc::UnboundedReceiver<Command>, out: async_channel::Sender<Outgoing>) {
-    let caches = Arc::new(Mutex::new(Caches::default()));
     tokio::spawn(check_updates(out.clone()));
     let mut current: Option<Tracking> = None;
     while let Some(command) = commands.recv().await {
@@ -178,12 +140,7 @@ async fn manager(mut commands: mpsc::UnboundedReceiver<Command>, out: async_chan
                 if let Some(old) = current.take() {
                     old.tasks.iter().for_each(JoinHandle::abort);
                 }
-                current = Some(track(user, out.clone(), caches.clone()));
-            }
-            Command::Subscribe(channels) => {
-                if let Some(t) = &current {
-                    let _ = t.live.send(live::LiveCommand::Subscribe(channels));
-                }
+                current = Some(track(user, out.clone()));
             }
             Command::ReconnectLive => {
                 if let Some(t) = &current {
@@ -220,7 +177,7 @@ async fn check_updates(out: async_channel::Sender<Outgoing>) {
     }
 }
 
-fn track(user: String, out: async_channel::Sender<Outgoing>, caches: Arc<Mutex<Caches>>) -> Tracking {
+fn track(user: String, out: async_channel::Sender<Outgoing>) -> Tracking {
     let emitter = {
         let user = user.clone();
         let out = out.clone();
@@ -228,155 +185,42 @@ fn track(user: String, out: async_channel::Sender<Outgoing>, caches: Arc<Mutex<C
             let _ = out.try_send(Outgoing::Event { user: user.clone(), event });
         }
     };
-    let relay_live = Arc::new(AtomicBool::new(false));
 
     let (live_tx, live_rx) = mpsc::unbounded_channel();
     let channels = vec![
         live::experience(&user),
         live::stamina(&user),
         live::satiation(&user),
-        live::character_stats(&user),
-        live::mobile(&user),
-        live::buffs(&user),
     ];
     let live_task = tokio::spawn(live::run(channels, live_rx, emitter.clone()));
 
-    let poll_task = tokio::spawn(poll(user, emitter, relay_live, caches));
+    let poll_task = tokio::spawn(poll(user, emitter));
     Tracking { live: live_tx, tasks: vec![live_task, poll_task] }
 }
 
-/// REST every 60s, requests of a round in parallel. Also starts the relay
-/// once the player's region is known.
-async fn poll(user: String, emit: impl Fn(NetEvent) + Clone + Send + Sync + 'static, relay_live: Arc<AtomicBool>, caches: Arc<Mutex<Caches>>) {
+/// Starts the relay on the mirrored regions right away, then polls
+/// BitJita `players/<id>` every 60s for the username and any extra regions
+/// (the player's and their claims').
+async fn poll(user: String, emit: impl Fn(NetEvent) + Clone + Send + Sync + 'static) {
     // Aborted with this task (character switch).
-    let (hub, hub_task) = start_relay_hub(user.clone(), emit.clone(), relay_live.clone(), caches.clone());
+    let (hub, hub_task) = start_relay_hub(user.clone(), emit.clone());
     let _hub_task = AbortOnDrop(hub_task);
-    let mut first = true;
+    let mut regions: BTreeSet<i64> = MIRRORED_REGIONS.into_iter().collect();
+    let _ = hub.send(HubCommand::Regions { all: regions.clone() });
     loop {
-        let passive = tokio::spawn(poll_passive(user.clone(), emit.clone(), relay_live.clone(), caches.clone()));
-        let (crafts, stats, plants, player) = tokio::join!(
-            poll_crafts(&user, &relay_live),
-            api::stats(&user),
-            poll_plants(&user, &relay_live, &caches),
-            api::player(&user),
-        );
-        match crafts {
-            Ok(Some(c)) => emit(NetEvent::Crafts(c)),
-            Ok(None) => {}
-            Err(e) => eprintln!("crafts: {e}"),
-        }
-        match stats {
-            Ok(s) => emit(NetEvent::Stats(s)),
-            Err(e) => eprintln!("stats: {e}"),
-        }
-        match plants {
-            Ok(Some(p)) => emit(NetEvent::Plants(p)),
-            Ok(None) => {}
-            Err(e) => eprintln!("placeables: {e}"),
-        }
-        match player {
+        match api::player(&user).await {
             Ok(p) => {
                 // Placeables and crafting stations stay in their region while
-                // the player travels (buffs move with the player), so follow
-                // every mirrored region + the player's + their claims'.
-                let mut regions: BTreeSet<i64> = MIRRORED_REGIONS.into_iter().collect();
+                // the player travels (buffs move with the player).
                 regions.extend(p.region_id);
                 regions.extend(p.claims.iter().filter_map(|c| c.region_id));
-                let _ = hub.send(HubCommand::Regions { all: regions });
+                let _ = hub.send(HubCommand::Regions { all: regions.clone() });
                 emit(NetEvent::Player(p));
             }
             Err(e) => eprintln!("player: {e}"),
         }
-        if first {
-            // Loading doesn't wait for passive crafts (can take ~10s).
-            emit(NetEvent::InitialRestDone);
-            first = false;
-        }
-        let _ = passive.await;
         tokio::time::sleep(POLL_INTERVAL).await;
     }
-}
-
-/// None while the relay is live (it has crafts too, and BitJita's REST
-/// sometimes answers 500).
-async fn poll_crafts(user: &str, relay_live: &AtomicBool) -> anyhow::Result<Option<Vec<CraftInfo>>> {
-    if relay_live.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-    let crafts = api::crafts(user).await?;
-    Ok((!relay_live.load(Ordering::Relaxed)).then_some(crafts))
-}
-
-/// None while the relay is live (its data is fresher).
-async fn poll_plants(user: &str, relay_live: &AtomicBool, caches: &Arc<Mutex<Caches>>) -> anyhow::Result<Option<Vec<Plant>>> {
-    if relay_live.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-    let plants = api::placeables(user).await?;
-    if relay_live.load(Ordering::Relaxed) {
-        return Ok(None);
-    }
-    Ok(Some(with_growth_durations(plants, caches).await))
-}
-
-async fn poll_passive(user: String, emit: impl Fn(NetEvent), relay_live: Arc<AtomicBool>, caches: Arc<Mutex<Caches>>) {
-    if relay_live.load(Ordering::Relaxed) {
-        return;
-    }
-    let response = match api::passive_crafts(&user).await {
-        Ok(r) => r,
-        Err(e) => return eprintln!("passive crafts: {e}"),
-    };
-    let mut crafts = Vec::new();
-    for c in &response.craft_results {
-        let cached = caches.lock().unwrap().recipes.get(&c.recipe_id).copied();
-        let duration = match (cached, c.item_id()) {
-            (Some(d), _) => d,
-            (None, Some(item)) => {
-                let d = api::recipe_duration(item, c.recipe_id).await.ok().flatten();
-                caches.lock().unwrap().recipes.insert(c.recipe_id, d);
-                d
-            }
-            (None, None) => None,
-        };
-        let (kind, tier) = c.item_id().map_or((None, None), |i| response.item_kind(i));
-        crafts.push(PassiveCraft {
-            kind,
-            tier,
-            id: c.entity_id.clone(),
-            name: PassiveCraftTracker::display_name(
-                c.recipe_name.as_deref(),
-                c.item_id().and_then(|i| response.item_name(i)),
-            ),
-            building: c.building_name.clone().unwrap_or_else(|| "Building".into()),
-            started_at: c.timestamp.as_ref().and_then(api::parse_date),
-            reported_complete: c.status.as_deref().is_some_and(|s| s.eq_ignore_ascii_case("complete")),
-            duration,
-        });
-    }
-    if !relay_live.load(Ordering::Relaxed) {
-        emit(NetEvent::PassiveCrafts(crafts));
-    }
-}
-
-/// Fill in the catalog growth duration for growing plants with a start time
-/// (for the "~ time left" estimate). Looked up once per placeable type.
-async fn with_growth_durations(mut plants: Vec<Plant>, caches: &Arc<Mutex<Caches>>) -> Vec<Plant> {
-    for plant in &mut plants {
-        if !plant.name.starts_with("Growing ") || plant.started_growing_at.is_none() || plant.reported_end.is_some() {
-            continue;
-        }
-        let cached = caches.lock().unwrap().growth.get(&plant.placeable_id).copied();
-        plant.growth_duration = match cached {
-            Some(d) => d,
-            None => {
-                let d = api::growth_duration(plant.placeable_id).await.ok().flatten();
-                caches.lock().unwrap().growth.insert(plant.placeable_id, d);
-                d
-            }
-        };
-    }
-    plants
 }
 
 /// Regions the relay mirrors (its `/health`; others answer 502, retried every
@@ -388,27 +232,17 @@ enum HubCommand {
     Regions { all: BTreeSet<i64> },
 }
 
-fn start_relay_hub(
-    user: String,
-    emit: impl Fn(NetEvent) + Send + Sync + 'static,
-    relay_live: Arc<AtomicBool>,
-    caches: Arc<Mutex<Caches>>,
-) -> (mpsc::UnboundedSender<HubCommand>, JoinHandle<()>) {
+fn start_relay_hub(user: String, emit: impl Fn(NetEvent) + Send + Sync + 'static) -> (mpsc::UnboundedSender<HubCommand>, JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    (tx, tokio::spawn(relay_hub(user, rx, emit, relay_live, caches)))
+    (tx, tokio::spawn(relay_hub(user, rx, emit)))
 }
 
-/// One relay feed per region; merges their data. The relay only counts as
-/// live (and replaces REST for crafts/plants/passive crafts) when every
-/// followed region is live, so a region still loading never hides data.
-/// Regions that refuse for good (not mirrored) are ignored.
-async fn relay_hub(
-    user: String,
-    mut commands: mpsc::UnboundedReceiver<HubCommand>,
-    emit: impl Fn(NetEvent),
-    relay_live: Arc<AtomicBool>,
-    caches: Arc<Mutex<Caches>>,
-) {
+/// One relay feed per region; merges their data. Lists are sent once every
+/// followed region delivered its rows at least once (so a region still
+/// loading never looks like missing crafts/plants), then on every change.
+/// A region that's reconnecting keeps its last rows. Regions that refuse
+/// for good (not mirrored) are ignored.
+async fn relay_hub(user: String, mut commands: mpsc::UnboundedReceiver<HubCommand>, emit: impl Fn(NetEvent)) {
     let (tx, mut updates) = mpsc::unbounded_channel::<(i64, relay::RegionUpdate)>();
     let mut feeds: HashMap<i64, AbortOnDrop> = HashMap::new();
     let mut states: HashMap<i64, RelayState> = HashMap::new();
@@ -417,6 +251,7 @@ async fn relay_hub(
     let mut last_player: Option<RelayPlayer> = None;
     let mut last_buffs: Option<Vec<RawBuff>> = None;
     let mut last_descs: HashMap<i64, FoodBuffDesc> = HashMap::new();
+    let mut loaded = false;
     loop {
         let mut data_changed = false;
         tokio::select! {
@@ -456,33 +291,33 @@ async fn relay_hub(
         }
 
         let overall = overall_state(&feeds, &states);
-        let live = overall == RelayState::Live;
-        relay_live.store(live, Ordering::Relaxed);
         if last_state.as_ref() != Some(&overall) {
             emit(NetEvent::Relay(overall.clone()));
-            // Just went live: send the merged lists right away.
-            data_changed |= live;
             last_state = Some(overall);
         }
-        if live && data_changed {
+        if !all_delivered(&feeds, &states, &data) {
+            continue;
+        }
+        if data_changed || !loaded {
             emit(NetEvent::RelayCrafts(data.values().flat_map(|d| d.crafts.clone()).collect()));
             emit(NetEvent::RelayPassiveCrafts(data.values().flat_map(|d| d.passive.clone()).collect()));
-            let plants = data.values().flat_map(|d| d.plants.clone()).collect();
-            emit(NetEvent::RelayPlants(with_growth_durations(plants, &caches).await));
+            emit(NetEvent::RelayPlants(data.values().flat_map(|d| d.plants.clone()).collect()));
         }
         // The player's own rows (buffs, stats, online status) are in the
-        // region the player is in: the live region that has `player_state`.
+        // region the player is in: the one that has `player_state`. After
+        // traveling, the old region can still hold a stale copy while it's
+        // reconnecting, so a live region wins.
         let player = data
             .iter()
-            .find(|(r, d)| d.signed_in.is_some() && states.get(r) == Some(&RelayState::Live))
+            .filter(|(_, d)| d.signed_in.is_some())
+            .max_by_key(|(r, _)| states.get(r) == Some(&RelayState::Live))
             .map(|(_, d)| d);
         let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone(), health: d.health, position: d.position }));
         if player_info != last_player {
             emit(NetEvent::RelayPlayer(player_info.clone()));
             last_player = player_info;
         }
-        // Only on change: every region update re-sends its data, and a
-        // repeat of older relay buffs would undo newer BitJita live ones.
+        // Only on change: every region update re-sends its data.
         if let Some(d) = player
             && last_buffs.as_ref() != Some(&d.buffs)
         {
@@ -493,6 +328,10 @@ async fn relay_hub(
         if !descs.is_empty() && descs != last_descs {
             emit(NetEvent::FoodBuffDescs(descs.clone()));
             last_descs = descs;
+        }
+        if !loaded {
+            emit(NetEvent::RelayLoaded);
+            loaded = true;
         }
     }
 }
@@ -515,6 +354,15 @@ fn overall_state(feeds: &HashMap<i64, AbortOnDrop>, states: &HashMap<i64, RelayS
     }
 }
 
+/// Every followed region (except those refusing for good) has sent its
+/// rows at least once.
+fn all_delivered(feeds: &HashMap<i64, AbortOnDrop>, states: &HashMap<i64, RelayState>, data: &HashMap<i64, relay::RegionData>) -> bool {
+    !data.is_empty()
+        && feeds.keys().all(|r| {
+            data.contains_key(r) || matches!(states.get(r), Some(RelayState::Unavailable(reason)) if !relay::is_transient(reason))
+        })
+}
+
 struct AbortOnDrop(JoinHandle<()>);
 
 impl Drop for AbortOnDrop {
@@ -529,13 +377,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn parses_relay_and_live_buffs() {
-        // Relay columns; inactive entry (start 0) dropped.
-        let relay = json!([[7, [1_700_000_000], 1800, []], [8, [0], 900, []]]);
-        assert_eq!(parse_buffs(&relay), Some(vec![RawBuff { id: 7, start: 1_700_000_000.0, duration: 1800.0 }]));
-        // Named fields, wrapped µs timestamp, string id.
-        let live = json!([{"buff_id": "7", "buff_start_timestamp": {"__timestamp_micros_since_unix_epoch__": 1_700_000_000_000_000_i64}, "buff_duration": 1800}]);
-        assert_eq!(parse_buffs(&live), Some(vec![RawBuff { id: 7, start: 1_700_000_000.0, duration: 1800.0 }]));
+    fn parses_relay_buffs() {
+        // Inactive entry (start 0) dropped; wrapped start accepted.
+        let relay = json!([[7, [1_700_000_000], 1800, []], [8, [0], 900, []], [9, {"t": 1_700_000_100}, 900, []]]);
+        assert_eq!(
+            parse_buffs(&relay),
+            Some(vec![RawBuff { id: 7, start: 1_700_000_000.0, duration: 1800.0 }, RawBuff { id: 9, start: 1_700_000_100.0, duration: 900.0 }])
+        );
         assert_eq!(parse_buffs(&Value::Null), None);
     }
 }
