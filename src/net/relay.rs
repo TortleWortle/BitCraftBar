@@ -244,9 +244,14 @@ impl Feed {
             .filter(|r| r.get(8).and_then(tag) == Some(0))
             .find_map(|r| {
                 let kind = *ACTION_TYPES.get(r.get(7).and_then(tag)? as usize)?;
+                // Units differ per row (seen: Base layer start in µs,
+                // UpperBody in ms), so detect each from its magnitude.
+                // Actions take ~1–10s: µs > 1e5, ms > 50, else seconds.
                 let start = r.get(3)?.as_f64()?;
-                let scale = if start > 1e14 { 1e6 } else if start > 1e11 { 1e3 } else { 1.0 };
-                Some(PlayerAction { kind, start: start / scale, duration: r.get(4)?.as_f64()? / scale })
+                let start_scale = if start > 1e14 { 1e6 } else if start > 1e11 { 1e3 } else { 1.0 };
+                let duration = r.get(4)?.as_f64()?;
+                let duration_scale = if duration > 1e5 { 1e6 } else if duration > 50.0 { 1e3 } else { 1.0 };
+                Some(PlayerAction { kind, start: start / start_scale, duration: duration / duration_scale })
             })
     }
 

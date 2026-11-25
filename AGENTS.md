@@ -464,8 +464,11 @@ game token was rejected: account risk, and the relay has the same data.
   last_action_result, client_cancel, was_consumed, …]; `action_type` is a
   sum of 34 variants (`relay::ACTION_TYPES`, schema order: None, Attack,
   …, Extract, …, Craft, …). Only the Base layer row is used. start_time
-  and duration are plain u64s; the unit is detected from start_time's
-  magnitude (s / ms / µs) and applied to both. Taken from the player's
+  and duration are plain u64s whose **unit differs per row** (observed:
+  Base start in µs `1795593634476822`, UpperBody start in ms
+  `1795548363369`), so each is detected from its magnitude (start: µs >
+  1e14, ms > 1e11; duration: µs > 1e5, ms > 50). The duration unit of a
+  running action is still unverified (only idle rows, duration 0, seen). Taken from the player's
   region like the other player rows.
 - **Position** (`Feed::position`): `mobile_entity_state` = [entity_id,
   chunk_index, timestamp, location_x, location_z, destination_x,
