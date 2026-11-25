@@ -30,7 +30,9 @@ const FOOD_BUFFS_TYPE: i64 = 861783812;
 const REFUSED_RETRY: Duration = Duration::from_secs(5 * 60);
 
 /// Rows per table keyed by primary key (`pk_column`), ref-counted because join
-/// queries can deliver the same row once per match.
+/// queries can deliver the same row once per match, and several queries the
+/// same row. Fresh per connection; queries add rows when applied and remove
+/// them when unsubscribed.
 #[derive(Default)]
 struct Store {
     tables: HashMap<String, HashMap<String, (Vec<Value>, usize)>>,
@@ -45,11 +47,8 @@ impl Store {
         self.tables.get(table)?.get(key).map(|(row, _)| row)
     }
 
-    fn apply(&mut self, changes: &[Value], initial: bool) {
-        if initial {
-            // A (re-)subscribe re-sends everything subscribed.
-            self.tables.clear();
-        }
+    /// Table updates (`[{table_name, updates: [{deletes, inserts}]}]`).
+    fn apply(&mut self, changes: &[Value]) {
         for change in changes {
             let Some(name) = change["table_name"].as_str() else { continue };
             let table = self.tables.entry(name.to_string()).or_default();
@@ -82,7 +81,7 @@ fn pk_column(table: &str) -> usize {
 }
 
 /// Rows are JSON strings of objects with the columns in schema order
-/// (`InitialSubscription`) or of arrays (`TransactionUpdate`); both become
+/// (subscribe replies) or of arrays (`TransactionUpdate`); both become
 /// column arrays.
 /// Object order relies on serde_json's `preserve_order`.
 fn rows(value: &Value) -> Vec<Vec<Value>> {
@@ -136,15 +135,20 @@ fn crafted_item_id(recipe: &[Value]) -> Option<i64> {
     recipe.get(13)?.as_array()?.first()?.as_array()?.first().and_then(int)
 }
 
+/// `query_id` of the fixed per-character `SubscribeMulti`; lookups count
+/// up from the next one.
+const STABLE_QUERY: u32 = 1;
+
 struct Feed {
     user: String,
     store: Store,
-    item_ids: BTreeSet<i64>,
-    building_desc_ids: BTreeSet<i64>,
-    /// Gather target lookups: `resource_desc` + `extraction_recipe_desc`
-    /// by resource id, `resource_growth_recipe_desc` by id.
-    resource_ids: BTreeSet<i64>,
-    growth_recipe_ids: BTreeSet<i64>,
+    /// Lookup query → its `query_id` (subscribed or awaiting its reply).
+    lookups: HashMap<String, u32>,
+    /// Lookups sent but not applied yet: data is held until they are, so
+    /// names never show half-resolved.
+    pending: HashSet<u32>,
+    stable_pending: bool,
+    next_id: u32,
     /// When each plant was seen switching to a growing stage (live only).
     growing_since: HashMap<String, f64>,
     growing_ids: HashSet<String>,
@@ -153,7 +157,23 @@ struct Feed {
 }
 
 impl Feed {
-    fn queries(&self) -> Vec<String> {
+    fn new(user: String) -> Self {
+        Feed {
+            user,
+            store: Store::default(),
+            lookups: HashMap::new(),
+            pending: HashSet::new(),
+            stable_pending: true,
+            next_id: STABLE_QUERY + 1,
+            growing_since: HashMap::new(),
+            growing_ids: HashSet::new(),
+            last_gather: None,
+        }
+    }
+
+    /// The fixed set: everything filtered by the character. Sent once per
+    /// connection (`SubscribeMulti`), never changed.
+    fn stable_queries(&self) -> Vec<String> {
         let u = &self.user;
         let mut q = vec![
             format!("SELECT * FROM passive_craft_state WHERE owner_entity_id = {u}"),
@@ -184,48 +204,82 @@ impl Feed {
         q.push(format!("SELECT * FROM satiation_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM player_username_state WHERE entity_id = {u}"));
         // Gather target (last resource hit): health, type, in-game timer.
+        // The joins follow the target, so they only ever hold its rows.
         q.push(format!("SELECT * FROM extract_outcome_state WHERE entity_id = {u}"));
         for table in ["resource_state", "resource_health_state", "resource_growth_timer"] {
             q.push(format!("SELECT {table}.* FROM {table} JOIN extract_outcome_state ON {table}.entity_id = extract_outcome_state.target_entity_id WHERE extract_outcome_state.entity_id = {u}"));
         }
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
-        q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
-        q.extend(self.building_desc_ids.iter().map(|id| format!("SELECT * FROM building_desc WHERE id = {id}")));
-        for id in &self.resource_ids {
-            q.push(format!("SELECT * FROM resource_desc WHERE id = {id}"));
-            q.push(format!("SELECT * FROM extraction_recipe_desc WHERE resource_id = {id}"));
-        }
-        q.extend(self.growth_recipe_ids.iter().map(|id| format!("SELECT * FROM resource_growth_recipe_desc WHERE id = {id}")));
         q
     }
 
-    /// v1 `Subscribe` replaces the whole set; also how lookups are added.
-    fn subscribe_message(&self) -> Message {
-        Message::text(json!({"Subscribe": {"query_strings": self.queries(), "request_id": 1}}).to_string())
+    /// Lookups the current rows need (joins can't chain these): crafted
+    /// item and building names for the crafts and passive crafts, and the
+    /// gather target's type (`resource_desc`, extraction recipe → skill,
+    /// growth recipe → timer duration). Only what's referenced right now,
+    /// so it never grows: one gather target at a time.
+    fn wanted_lookups(&self) -> BTreeSet<String> {
+        let mut q = BTreeSet::new();
+        for id in self.store.rows("crafting_recipe_desc").filter_map(|r| crafted_item_id(r)) {
+            q.insert(format!("SELECT * FROM item_desc WHERE id = {id}"));
+        }
+        for id in self.store.rows("building_state").filter_map(|r| r.get(3).and_then(int)) {
+            q.insert(format!("SELECT * FROM building_desc WHERE id = {id}"));
+        }
+        for id in self.store.rows("resource_state").filter_map(|r| r.get(1).and_then(int)) {
+            q.insert(format!("SELECT * FROM resource_desc WHERE id = {id}"));
+            q.insert(format!("SELECT * FROM extraction_recipe_desc WHERE resource_id = {id}"));
+        }
+        for id in self.store.rows("resource_growth_timer").filter_map(|r| r.get(3).and_then(int)) {
+            q.insert(format!("SELECT * FROM resource_growth_recipe_desc WHERE id = {id}"));
+        }
+        q
     }
 
-    /// Item names (recipe "Weave {0}"), building names and gather target
-    /// types need a second lookup. True if new ids were added
-    /// (→ re-subscribe). Only ever grows (a few ids per resource type).
-    fn add_missing_lookups(&mut self) -> bool {
-        let items: BTreeSet<i64> = self.store.rows("crafting_recipe_desc").filter_map(|r| crafted_item_id(r)).collect();
-        let buildings: BTreeSet<i64> =
-            self.store.rows("building_state").filter_map(|r| r.get(3).and_then(int)).collect();
-        let resources: BTreeSet<i64> = self.store.rows("resource_state").filter_map(|r| r.get(1).and_then(int)).collect();
-        let growth: BTreeSet<i64> = self.store.rows("resource_growth_timer").filter_map(|r| r.get(3).and_then(int)).collect();
-        if items.is_subset(&self.item_ids)
-            && buildings.is_subset(&self.building_desc_ids)
-            && resources.is_subset(&self.resource_ids)
-            && growth.is_subset(&self.growth_recipe_ids)
-        {
-            return false;
+    fn next_id(&mut self) -> u32 {
+        self.next_id += 1;
+        self.next_id - 1
+    }
+
+    /// Messages that bring the lookups in line with [`Self::wanted_lookups`]:
+    /// `SubscribeSingle` per new query, `Unsubscribe` per one no longer
+    /// referenced. Nothing else is re-sent.
+    fn sync_lookups(&mut self) -> Vec<Message> {
+        let wanted = self.wanted_lookups();
+        let mut messages = Vec::new();
+        let stale: Vec<String> = self.lookups.keys().filter(|q| !wanted.contains(*q)).cloned().collect();
+        for query in stale {
+            let Some(id) = self.lookups.remove(&query) else { continue };
+            // If its reply is still on the way, the unsubscribe reply
+            // (sent after it) removes those rows again.
+            self.pending.remove(&id);
+            let request = self.next_id();
+            messages.push(json!({"Unsubscribe": {"request_id": request, "query_id": {"id": id}}}));
         }
-        self.item_ids.extend(items);
-        self.building_desc_ids.extend(buildings);
-        self.resource_ids.extend(resources);
-        self.growth_recipe_ids.extend(growth);
-        true
+        for query in wanted {
+            if self.lookups.contains_key(&query) {
+                continue;
+            }
+            let id = self.next_id();
+            self.lookups.insert(query.clone(), id);
+            self.pending.insert(id);
+            messages.push(json!({"SubscribeSingle": {"query": query, "request_id": id, "query_id": {"id": id}}}));
+        }
+        messages.into_iter().map(|m| Message::text(m.to_string())).collect()
+    }
+
+    /// A new connection starts empty: the fixed set, then the lookups
+    /// again as its rows come in.
+    fn reset_connection(&mut self) {
+        self.store = Store::default();
+        self.lookups.clear();
+        self.pending.clear();
+        self.stable_pending = true;
+    }
+
+    fn stable_message(&self) -> Message {
+        Message::text(json!({"SubscribeMulti": {"query_strings": self.stable_queries(), "request_id": STABLE_QUERY, "query_id": {"id": STABLE_QUERY}}}).to_string())
     }
 
     /// The resource last hit: `extract_outcome_state` = [entity_id,
@@ -530,17 +584,7 @@ pub fn is_transient(reason: &str) -> bool {
 
 /// Follows `user`'s rows in one region's database until cancelled.
 pub async fn run(user: String, region: i64, emit: impl Fn(RegionUpdate)) {
-    let mut feed = Feed {
-        user,
-        store: Store::default(),
-        item_ids: BTreeSet::new(),
-        building_desc_ids: BTreeSet::new(),
-        resource_ids: BTreeSet::new(),
-        growth_recipe_ids: BTreeSet::new(),
-        growing_since: HashMap::new(),
-        growing_ids: HashSet::new(),
-        last_gather: None,
-    };
+    let mut feed = Feed::new(user);
     let mut backoff = Duration::from_secs(1);
     loop {
         emit(RegionUpdate::State(RelayState::Connecting));
@@ -588,13 +632,16 @@ async fn session(
         _ => return Ok(()),
     };
     let (mut sink, mut stream) = ws.split();
-    if sink.send(feed.subscribe_message()).await.is_err() {
+    feed.reset_connection();
+    if sink.send(feed.stable_message()).await.is_err() {
         return Ok(());
     }
     let mut ping = interval(Duration::from_secs(15));
     ping.tick().await;
     let mut awaiting_pong: Option<tokio::time::Instant> = None;
-    let mut awaiting_subscription = true;
+    // First data of this connection: plants already growing weren't just
+    // seen switching to growing.
+    let mut first_data = true;
 
     loop {
         tokio::select! {
@@ -607,49 +654,58 @@ async fn session(
                     Some(Err(_)) | None => return Ok(()),
                 };
                 let Ok(message) = serde_json::from_str::<Value>(&text) else { continue };
+                let kind = message.as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_default();
+                let body = &message[kind.as_str()];
+                let query_id = body.pointer("/query_id/id").and_then(Value::as_u64).map(|id| id as u32);
                 // BITCRAFT_DEBUG: log everything except the frequent updates.
-                if std::env::var_os("BITCRAFT_DEBUG").is_some() && message.get("TransactionUpdate").is_none() {
-                    let kind = message.as_object().and_then(|o| o.keys().next().cloned()).unwrap_or_default();
-                    let tables: Vec<String> = message
-                        .pointer("/InitialSubscription/database_update/tables")
-                        .or_else(|| message.pointer("/TransactionUpdate/status/Committed/tables"))
-                        .and_then(Value::as_array)
-                        .map(|t| t.iter().map(|t| format!("{}:{}", t["table_name"].as_str().unwrap_or("?"), t["num_rows"])).collect())
-                        .unwrap_or_default();
-                    let status = message.pointer("/TransactionUpdate/status").and_then(|s| s.as_object()).and_then(|o| o.keys().next().cloned()).unwrap_or_default();
-                    eprintln!("relay idc-{region}: {kind} {status} {tables:?} {}", if tables.is_empty() { text.chars().take(300).collect::<String>() } else { String::new() });
+                if std::env::var_os("BITCRAFT_DEBUG").is_some() && kind != "TransactionUpdate" {
+                    let tables: Vec<String> = changes(&kind, body)
+                        .iter()
+                        .map(|t| format!("{}:{}", t["table_name"].as_str().unwrap_or("?"), t["num_rows"]))
+                        .collect();
+                    let extra = if tables.is_empty() { text.chars().take(300).collect::<String>() } else { String::new() };
+                    eprintln!("relay idc-{region}: {kind} {query_id:?} {tables:?} {extra}");
                 }
-                if let Some(error) = message.get("SubscriptionError") {
-                    return Err(error["error"].as_str().unwrap_or("subscription refused").to_string());
+                match kind.as_str() {
+                    "SubscriptionError" => {
+                        let error = body["error"].as_str().unwrap_or("subscription refused").to_string();
+                        match query_id {
+                            // A lookup failed: drop it, keep the connection.
+                            Some(id) if id != STABLE_QUERY => {
+                                eprintln!("relay idc-{region}: lookup {id} refused: {error}");
+                                feed.lookups.retain(|_, q| *q != id);
+                                feed.pending.remove(&id);
+                            }
+                            // The fixed set (or the connection) was refused.
+                            _ => return Err(error),
+                        }
+                    }
+                    "SubscribeMultiApplied" if query_id == Some(STABLE_QUERY) => feed.stable_pending = false,
+                    "SubscribeApplied" => {
+                        if let Some(id) = query_id {
+                            feed.pending.remove(&id);
+                        }
+                    }
+                    "UnsubscribeApplied" | "TransactionUpdate" => {}
+                    _ => continue,
                 }
-                let (changes, initial) = if let Some(init) = message.get("InitialSubscription") {
-                    (init["database_update"]["tables"].clone(), true)
-                } else if let Some(committed) = message.get("TransactionUpdate").and_then(|u| u["status"].get("Committed")) {
-                    (committed["tables"].clone(), false)
-                } else {
-                    continue;
-                };
-                feed.store.apply(changes.as_array().map(Vec::as_slice).unwrap_or_default(), initial);
+                feed.store.apply(&changes(&kind, body));
                 *backoff = Duration::from_secs(1);
-                // New recipes/buildings need a name lookup first: hold the
-                // data until the re-subscribe's InitialSubscription is in
-                // (updates can arrive before it), so names never show
-                // half-resolved.
-                awaiting_subscription &= !initial;
-                if feed.add_missing_lookups() {
-                    if sink.send(feed.subscribe_message()).await.is_err() {
+                for m in feed.sync_lookups() {
+                    if sink.send(m).await.is_err() {
                         return Ok(());
                     }
-                    awaiting_subscription = true;
                 }
-                if awaiting_subscription {
+                // Hold the data until the fixed set and every pending lookup
+                // are in, so names never show half-resolved.
+                if feed.stable_pending || !feed.pending.is_empty() {
                     continue;
                 }
                 emit(RegionUpdate::State(RelayState::Live));
                 emit(RegionUpdate::Data(RegionData {
                     crafts: feed.crafts(),
                     passive: feed.passive_crafts(),
-                    plants: feed.plants(initial),
+                    plants: feed.plants(first_data),
                     buffs: feed.buffs(),
                     food_descs: feed.food_descs(),
                     signed_in: feed.signed_in(),
@@ -662,6 +718,7 @@ async fn session(
                     username: feed.username(),
                     gather: feed.gather(),
                 }));
+                first_data = false;
             },
             _ = ping.tick() => {
                 if awaiting_pong.is_some_and(|sent| sent.elapsed() >= Duration::from_secs(10)) {
@@ -676,9 +733,89 @@ async fn session(
     }
 }
 
+/// The table updates a server message carries: `SubscribeMultiApplied` /
+/// `UnsubscribeMultiApplied` → `update.tables`, `SubscribeApplied` /
+/// `UnsubscribeApplied` → `rows.table_rows` (one table),
+/// `TransactionUpdate` → `status.Committed.tables`.
+fn changes(kind: &str, body: &Value) -> Vec<Value> {
+    let list = match kind {
+        "SubscribeMultiApplied" | "UnsubscribeMultiApplied" => body.pointer("/update/tables"),
+        "SubscribeApplied" | "UnsubscribeApplied" => {
+            return body.pointer("/rows/table_rows").cloned().into_iter().collect();
+        }
+        "TransactionUpdate" => body.pointer("/status/Committed/tables"),
+        _ => None,
+    };
+    list.and_then(Value::as_array).cloned().unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `TransactionUpdate` table update for `table`.
+    fn update(table: &str, deletes: &[&str], inserts: &[&str]) -> Value {
+        json!({"table_name": table, "updates": [{"deletes": deletes, "inserts": inserts}]})
+    }
+
+    fn sent(messages: Vec<Message>) -> Vec<String> {
+        messages
+            .into_iter()
+            .map(|m| {
+                let v: Value = serde_json::from_str(m.to_text().unwrap()).unwrap();
+                match v.get("SubscribeSingle") {
+                    Some(s) => format!("+{}", s["query"].as_str().unwrap()),
+                    None => format!("-{}", v["Unsubscribe"]["query_id"]["id"]),
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn lookups_follow_the_current_target_only() {
+        let mut feed = Feed::new("7".into());
+        // Gathering a Young Beech Tree (resource 12).
+        feed.store.apply(&[update("resource_state", &[], &["[100, 12, 0]"])]);
+        assert_eq!(
+            sent(feed.sync_lookups()),
+            ["+SELECT * FROM extraction_recipe_desc WHERE resource_id = 12", "+SELECT * FROM resource_desc WHERE id = 12"]
+        );
+        assert_eq!(feed.pending.len(), 2);
+        // Another tree of the same type: nothing to send.
+        feed.store.apply(&[update("resource_state", &["[100, 12, 0]"], &["[101, 12, 0]"])]);
+        assert!(feed.sync_lookups().is_empty());
+        // A different type: the old lookups go, the new ones come.
+        feed.store.apply(&[update("resource_state", &["[101, 12, 0]"], &["[102, 19, 0]"])]);
+        let mut changes = sent(feed.sync_lookups());
+        changes.sort();
+        assert_eq!(
+            changes,
+            [
+                "+SELECT * FROM extraction_recipe_desc WHERE resource_id = 19",
+                "+SELECT * FROM resource_desc WHERE id = 19",
+                "-2",
+                "-3"
+            ]
+        );
+        // Used up (rows deleted): nothing tracked anymore.
+        feed.store.apply(&[update("resource_state", &["[102, 19, 0]"], &[])]);
+        assert_eq!(sent(feed.sync_lookups()).len(), 2);
+        assert!(feed.lookups.is_empty() && feed.pending.is_empty());
+    }
+
+    #[test]
+    fn subscribe_replies_carry_table_updates() {
+        let single = json!({"rows": {"table_id": 1, "table_name": "resource_desc", "table_rows": update("resource_desc", &[], &["[12, \"Young Beech Tree\"]"])}});
+        let mut store = Store::default();
+        store.apply(&changes("SubscribeApplied", &single));
+        assert!(store.get("resource_desc", "12").is_some());
+        let gone = json!({"rows": {"table_id": 1, "table_name": "resource_desc", "table_rows": update("resource_desc", &["[12, \"Young Beech Tree\"]"], &[])}});
+        store.apply(&changes("UnsubscribeApplied", &gone));
+        assert!(store.get("resource_desc", "12").is_none());
+        let multi = json!({"update": {"tables": [update("player_state", &[], &["[0, 7, 0, 0, 0, 0, true]"])]}});
+        store.apply(&changes("SubscribeMultiApplied", &multi));
+        assert!(store.get("player_state", "7").is_some());
+    }
 
     #[test]
     fn rows_from_arrays_and_objects() {

@@ -485,16 +485,39 @@ game token was rejected: account risk, and the relay has the same data.
   "module is still loading its initial state from upstream; retry
   shortly" (relay restarting, 8+ min seen) are retried with the normal
   backoff and count as connecting.
-- **Name lookups**: recipe → `item_desc` and `building_state` →
-  `building_desc` need a second subscribe round. A region holds its data
-  until that re-subscribe's `InitialSubscription` arrived (updates can
-  come in between), so names never show half-resolved ("Forge" instead
-  of "Ingot T2").
-- Protocol: send `{"Subscribe":{"query_strings":[SQL…],"request_id":1}}`
-  (replaces the whole set; also used to add lookups) → `InitialSubscription`
-  (all current rows) → `TransactionUpdate`s (`deletes` + `inserts` per table).
+- **Two kinds of subscriptions per region connection** (user request:
+  stop re-sending everything, and don't let lookups grow):
+  - **Fixed set** (`Feed::stable_queries`): everything filtered by the
+    character (incl. the joins that follow the gather target), one
+    `SubscribeMulti` with `query_id` 1, sent once per connection and
+    never changed.
+  - **Lookups** (`Feed::wanted_lookups` / `sync_lookups`): rows a join
+    can't reach: `item_desc` / `building_desc` for the current crafts'
+    recipes and buildings, and for the **current gather target only**
+    `resource_desc`, `extraction_recipe_desc WHERE resource_id = …` and
+    `resource_growth_recipe_desc`. One `SubscribeSingle` per query, each
+    with its own `query_id`; after every update the wanted set is
+    recomputed from the current rows: new ones subscribed, unreferenced
+    ones `Unsubscribe`d. So nothing is re-sent and the set never grows
+    (another tree of the same type changes nothing; a new type swaps 2–3
+    queries). Seen live: 9 `SubscribeMulti` (one per region) + 8 lookups
+    in the player's region at startup.
+  A region holds its data until the fixed set and every pending lookup
+  are applied (updates can come in between), so names never show
+  half-resolved ("Forge" instead of "Ingot T2"). A refused lookup is
+  dropped (logged); a refused fixed set fails the connection (retry /
+  "not mirrored" rules above). The legacy `Subscribe` (replaces the whole
+  set, answered with `InitialSubscription`) isn't used anymore.
+- Protocol: client → `SubscribeMulti {query_strings, request_id,
+  query_id: {id}}` → `SubscribeMultiApplied {query_id, update: {tables}}`;
+  `SubscribeSingle {query, request_id, query_id}` → `SubscribeApplied
+  {query_id, rows: {table_rows: <one table update>}}`; `Unsubscribe
+  {request_id, query_id}` → `UnsubscribeApplied` (the query's rows as
+  deletes); then `TransactionUpdate`s (`deletes` + `inserts` per table).
+  All verified on the relay. The row store (`relay::Store`) is fresh per
+  connection and ref-counted (one row can come from several queries).
   Rows are JSON strings: **objects with the columns in schema order** in
-  `InitialSubscription`, **arrays** in `TransactionUpdate`s (seen on
+  subscribe replies, **arrays** in `TransactionUpdate`s (seen on
   bitcraftsync). `relay::rows` turns both into column arrays, so the
   column indices below apply; object order needs serde_json's
   **`preserve_order`** feature (set in `Cargo.toml`). Nested product types
@@ -556,7 +579,7 @@ game token was rejected: account risk, and the relay has the same data.
   resource_id, direction], `resource_health_state` = [entity_id, health],
   `resource_growth_timer` = [scheduled_id, scheduled_at (1 = Time),
   entity_id, growth_recipe_id] (public; the in-game timer some resources
-  show, `resource_desc.show_time_left`). Second lookup round by resource
+  show, `resource_desc.show_time_left`). Lookups (current target only) by resource
   id: `resource_desc` (name 1, max_health 4, tier 13, tag 14) and
   `extraction_recipe_desc WHERE resource_id = …` (column 15
   `experience_per_progress` = [[skill_id, xp]]: the skill; fish schools →
