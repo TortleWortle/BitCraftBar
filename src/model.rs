@@ -9,7 +9,7 @@ use crate::core::trackers::{
     ActivityCheck, Craft, CraftTracker, ExperienceTracker, PassiveCraftTracker, PlantTracker, SatiationTracker,
     StaminaTracker,
 };
-use crate::core::types::{FoodState, PlayerAction, PlayerSummary, now};
+use crate::core::types::{FoodState, PlayerSummary, Position, now};
 use crate::sound::Sound;
 use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState, live};
 use crate::settings::Settings;
@@ -47,12 +47,10 @@ pub struct Model {
     /// Relay only (`health_state`, max = stats value 0).
     pub health: Option<f64>,
     pub max_health: Option<f64>,
-    /// Relay only (`player_action_state`).
-    pub action: Option<PlayerAction>,
     sounds: Vec<Sound>,
     was_idle_full: bool,
     /// Relay position and when it last changed ("Active" while moving).
-    position: Option<(i64, i64)>,
+    position: Option<Position>,
     pub moved_at: Option<f64>,
     /// Activity went idle straight from "Active" (moving): no idle alerts.
     idle_after_moving: bool,
@@ -102,7 +100,6 @@ impl Model {
             food: None,
             health: None,
             max_health: None,
-            action: None,
             sounds: Vec::new(),
             was_idle_full: false,
             position: None,
@@ -168,7 +165,6 @@ impl Model {
             self.food = None;
             self.health = None;
             self.max_health = None;
-            self.action = None;
             self.position = None;
             self.moved_at = None;
             self.idle_after_moving = false;
@@ -217,7 +213,10 @@ impl Model {
             }
             NetEvent::CharacterStats(values) => {
                 self.last_live_event_at = Some(now);
-                self.apply_stats(&values);
+                // Same row as the relay's; the relay wins while it has it.
+                if self.relay_player.as_ref().is_none_or(|p| p.stats.is_none()) {
+                    self.apply_stats(&values);
+                }
             }
             NetEvent::CraftProgress { id, progress } => {
                 self.last_live_event_at = Some(now);
@@ -247,7 +246,6 @@ impl Model {
                     self.apply_stats(values);
                 }
                 self.health = player.as_ref().and_then(|p| p.health);
-                self.action = player.as_ref().and_then(|p| p.action.clone());
                 if let Some(position) = player.as_ref().and_then(|p| p.position) {
                     self.update_position(position, now);
                 }
@@ -397,8 +395,17 @@ impl Model {
     }
 
     /// Position from the relay or BitJita live; a change = moved ("Active").
-    fn update_position(&mut self, position: (i64, i64), now: f64) {
-        if self.position.is_some_and(|p| p != position) {
+    /// Two sources (BitJita live, relay) report the same row; the live one
+    /// is throttled, so it can arrive with an older location after the
+    /// relay's newer one. Comparing would count that as moving (twice:
+    /// back, then forward again), so older rows are dropped.
+    fn update_position(&mut self, position: Position, now: f64) {
+        if let (Some(last), Some(at)) = (self.position.and_then(|p| p.at), position.at)
+            && at < last
+        {
+            return;
+        }
+        if self.position.is_some_and(|p| (p.x, p.z) != (position.x, position.z)) {
             self.moved_at = Some(now);
         }
         self.position = Some(position);

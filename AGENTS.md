@@ -142,12 +142,6 @@ the default. Never takes focus. Content:
 - status line: the worst issue, or the Activity message when all is well,
   with the last skill; the current craft (active, else the last worked on)
   with percent and bar (hidden offline);
-- **action bar** (user request): the in-game action in progress
-  (gathering, crafting, building, …) with its own bar and time left
-  (`1.4s`), under the status line; from relay `player_action_state` (see
-  Data sources). Redraws every frame while an action runs (the model only
-  ticks once a second). Hidden when idle, offline, or for non-work
-  actions (moving, emotes; `PlayerAction::label`);
 - bars (16px, value centered **inside** the bar, user request;
   `info::labeled_bar`): stamina (`current / max`), **health** (relay `health_state`, max =
   stats value 0; red under 30%), food (time left; **hover** lists the
@@ -180,11 +174,11 @@ Player, Connection).
 
 | Source | Condition | Status | Message |
 |---|---|---|---|
-| Activity | character moved in the last 10s (relay position changed) | healthy | Active |
+| Activity | character moved in the last 10s (relay position changed), unless counting XP gained after the last move | healthy | Active |
 | Activity | last action was a craft and it completed | warning | Craft finished |
-| Activity | no counting XP, stamina "ready" (API max known) | warning | Idle: stamina full / Idle: stamina above N% (or Craft idle (N%) if the last action was an unfinished craft) |
-| Activity | stamina regenerating (immediately, even with recent XP) | warning | Resting |
 | Activity | counting XP | healthy | Gaining experience |
+| Activity | stamina "ready" (API max known) | warning | Idle: stamina full / Idle: stamina above N% (or Craft idle (N%) if the last action was an unfinished craft) |
+| Activity | stamina regenerating | warning | Resting |
 | Activity | last action was an unfinished craft, no XP, no regen | warning | Craft idle (N%) |
 | Activity | no XP, no regen in 10s | warning | Idle: no XP, no regen |
 | Activity | nothing received yet | warning | No XP or regen yet |
@@ -210,7 +204,10 @@ Activity rows are checked top to bottom.
 - **Counting XP** = XP gained in the last 20s *and* after stamina last went
   up: XP while regenerating is improbable (user's rule), so once regen starts,
   earlier XP no longer means "active". The 20s window (was 5s) bridges gaps
-  between XP ticks; regeneration overrides it.
+  between XP ticks; regeneration overrides it. It's checked **before**
+  Resting (user request: switch to "Gaining experience" as soon as XP
+  arrives, not when the stamina spend follows), and XP after the last move
+  overrides "Active" too.
 - **Regenerating** = stamina went up in the last 10s and hasn't gone down since
   (`StaminaTracker::is_regenerating`); spending stamina ends it immediately,
   so resuming work flips straight back to green.
@@ -460,18 +457,6 @@ game token was rejected: account risk, and the relay has the same data.
   health, died_timestamp] is subscribed the same way (info window; no
   REST fallback, BitJita's live `health_state` channel sent nothing when
   probed).
-- **Current action** (`Feed::action`): `player_action_state` (pk
-  `auto_id`) = [auto_id, chunk_index, entity_id, start_time, duration,
-  target, recipe_id, action_type, layer (Base / UpperBody),
-  last_action_result, client_cancel, was_consumed, …]; `action_type` is a
-  sum of 34 variants (`relay::ACTION_TYPES`, schema order: None, Attack,
-  …, Extract, …, Craft, …). Only the Base layer row is used. start_time
-  and duration are plain u64s whose **unit differs per row** (observed:
-  Base start in µs `1795593634476822`, UpperBody start in ms
-  `1795548363369`), so each is detected from its magnitude (start: µs >
-  1e14, ms > 1e11; duration: µs > 1e5, ms > 50). The duration unit of a
-  running action is still unverified (only idle rows, duration 0, seen). Taken from the player's
-  region like the other player rows.
 - **Position** (`Feed::position`): `mobile_entity_state` = [entity_id,
   chunk_index, timestamp, location_x, location_z, destination_x,
   destination_z, dimension, is_walking, …]; location changes → "Active"
@@ -543,6 +528,20 @@ agent: Python's default `urllib` agent got 403).
 | `players/<id>` | `username`, `signedIn` (offline state; fallback when the relay has no `player_state`), `regionId` + `claims[].regionId` (extra relay regions to follow). Polled every 60s. `skillMap` was the source for `skill.rs` (hardcoded). |
 
 ### Data decisions
+
+- **Out-of-order events between sources** (user: "events feel flickery").
+  Single-source feeds (XP, stamina, satiation, relay health/food)
+  arrive in order over one websocket and are applied as they come. Where
+  two sources report the same row, older values are dropped:
+  - **Position** (BitJita live, throttled to 1/s, + relay): both carry the
+    row's `timestamp` (ms); `Model::update_position` ignores a position
+    older than the last one. Otherwise the throttled live copy could arrive
+    after the relay's newer one and count as moving back and forth.
+  - **Craft progress** (relay + BitJita live channel + REST): only ever
+    goes up (`CraftTracker::handle_progress` ignores values ≤ current;
+    REST merges with `max`).
+  - **Max stamina/satiation**: the relay's stats win; REST and BitJita
+    live `character_stats_state` are only applied while the relay has none.
 
 - **Max stamina / satiation**: relay `character_stats_state` when
   available, else REST stats + BitJita live `character_stats_state`
@@ -633,9 +632,14 @@ agent: Python's default `urllib` agent got 403).
 - **Vendored `xattr` patch** (`vendor/xattr`, `[patch.crates-io]`): gpui
   0.2.2 → `zed-async-tar` → `xattr 0.2.3` uses `libc::ENOATTR`, which
   libc 0.2.19x no longer exports on Linux, so the Linux build failed
-  (first release run). The copy uses `ENODATA` on Linux (same value).
+  (first release run). The copy uses `ENODATA` on Linux (same value),
+  and `u32` instead of the deprecated `libc::uint32_t` on macOS.
   Pinning an older libc wasn't possible (tokio/mio need the new one).
   Drop the patch once gpui stops pulling xattr 0.2.
+- **Future-incompat notice silenced** (`.cargo/config.toml`,
+  `[future-incompat-report] frequency = "never"`): `block 0.1.6` and
+  `proc-macro-error2 2.0.1` (both via gpui 0.2.2) printed it on every
+  build/run; not fixable on our side. Remove once gpui drops them.
 - **Update check** (`net::check_updates`, user request): at startup and
   every 12h, `GET api.github.com/repos/<repository>/releases/latest`
   (repository = `Cargo.toml` `repository`; latest skips drafts and
@@ -651,6 +655,20 @@ agent: Python's default `urllib` agent got 403).
   fails in `ring`'s build script (needs an MSVC C toolchain).
 
 ## Known limitations / ideas
+
+- **Action bar removed** (user: "flickery and not too useful"). The info
+  window had a bar for the in-game action (gathering, crafting, …) from
+  relay `player_action_state` = [auto_id, chunk_index, entity_id,
+  start_time, duration, target, recipe_id, action_type (34-variant sum,
+  schema order: None, Attack, DestroyPaving, StationaryEmote, Extract, …,
+  Craft = 20, …), layer (Base / UpperBody), …]. Between actions the row
+  goes idle, so it blinked on and off with every gather (an empty bar in
+  between didn't help enough). start_time/duration units differ per row
+  (seen: Base start in µs, UpperBody in ms). Gather target health was
+  also explored for it: `extract_outcome_state` (player → last
+  `target_entity_id`), `resource_health_state` (entity_id, health),
+  `resource_state` → `resource_desc.max_health`; a used-up resource's
+  rows disappear. `resource_depleted_event` isn't replicated by the relay.
 
 - **Food via REST** (`players/<id>/buffs`) was tried in the Swift app and
   removed: BitJita doesn't keep buffs up to date. Food now comes from the

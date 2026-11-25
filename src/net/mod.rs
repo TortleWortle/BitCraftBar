@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{CraftInfo, FoodState, PassiveCraft, Plant, PlayerAction, PlayerSummary};
+use crate::core::types::{CraftInfo, FoodState, PassiveCraft, Plant, PlayerSummary, Position};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnState {
@@ -43,7 +43,7 @@ pub enum NetEvent {
     /// `character_stats_state` values (same indices as REST stats).
     CharacterStats(Vec<f64>),
     /// BitJita live `mobile_entity_state` location (x, z), throttled.
-    Position((i64, i64)),
+    Position(Position),
     CraftProgress { id: String, progress: i64 },
     Crafts(Vec<CraftInfo>),
     Stats(Vec<f64>),
@@ -70,10 +70,8 @@ pub struct RelayPlayer {
     pub stats: Option<Vec<f64>>,
     /// `health_state.health` (max = stats value 0).
     pub health: Option<f64>,
-    /// Current action (`player_action_state`), for the action bar.
-    pub action: Option<PlayerAction>,
     /// `mobile_entity_state` location (x, z), for "moved recently".
-    pub position: Option<(i64, i64)>,
+    pub position: Option<Position>,
 }
 
 pub enum Outgoing {
@@ -424,7 +422,7 @@ async fn relay_hub(
             .iter()
             .find(|(r, d)| d.signed_in.is_some() && states.get(r) == Some(&RelayState::Live))
             .map(|(_, d)| d);
-        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone(), health: d.health, action: d.action.clone(), position: d.position }));
+        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone(), health: d.health, position: d.position }));
         if player_info != last_player {
             emit(NetEvent::RelayPlayer(player_info.clone()));
             last_player = player_info;

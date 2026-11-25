@@ -1,0 +1,5 @@
+# block 0.1.6 / proc-macro-error2 2.0.1 (both via gpui 0.2.2) trigger a
+# future-incompatibility notice on every build. Not fixable on our side;
+# remove this once gpui drops them (`cargo report future-incompatibilities`).
+[future-incompat-report]
+frequency = "never"

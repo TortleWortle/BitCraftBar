@@ -1,6 +1,7 @@
 //! BitJita live websocket (`wss://live.bitjita.com/`): subscribe to channels,
 //! keepalive ping, reconnect with backoff. See AGENTS.md "Data sources".
 
+use crate::core::types::Position;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -179,7 +180,8 @@ fn handle(text: &str, emit: &impl Fn(NetEvent)) {
                 return;
             }
             *last = Some((std::time::Instant::now(), (x, z)));
-            NetEvent::Position((x, z))
+            let at = data["timestamp"].as_f64().filter(|t| *t > 0.0).map(|ms| ms / 1e3);
+            NetEvent::Position(Position { x, z, at })
         }
         "progressive_action_state" => {
             let id = match &data["entity_id"] {

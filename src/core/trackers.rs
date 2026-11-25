@@ -308,7 +308,10 @@ impl CraftTracker {
 
     pub fn handle_progress(&mut self, entity_id: &str, progress: i64, now: f64) {
         let Some(craft) = self.crafts.get_mut(entity_id) else { return };
-        if craft.progress == progress {
+        // Progress only goes up. The relay and BitJita's live channel both
+        // report it, and the slower one would otherwise move it back (and
+        // count as "progressed" again): ignore anything not newer.
+        if progress <= craft.progress {
             return;
         }
         craft.progress = progress;
@@ -603,11 +606,19 @@ impl ActivityCheck {
 
         // Moving around (relay position changed in the last 10s): the
         // player is at the keyboard, so nothing else matters (user request).
-        if moved_at.is_some_and(|t| now - t <= self.move_window) {
+        // XP after the last move means the player started working: show
+        // that right away instead of "Active" (user request).
+        let gained_since_move = gained && moved_at.is_none_or(|m| xp.last_gain_at.is_some_and(|g| g >= m));
+        if moved_at.is_some_and(|t| now - t <= self.move_window) && !gained_since_move {
             monitor.report(src, HealthStatus::Healthy, Self::ACTIVE);
         } else if craft.is_some_and(|c| c.is_complete()) {
             monitor.report(src, HealthStatus::Warning, "Craft finished");
-        } else if !gained && stamina.is_at_least(ready) {
+        } else if gained {
+            // Before "Resting": XP newer than the last regen means work
+            // resumed, even before the stamina spend arrives (user request:
+            // switch immediately). Regen after the XP clears `gained`.
+            monitor.report(src, HealthStatus::Healthy, "Gaining experience");
+        } else if stamina.is_at_least(ready) {
             let msg = idle_craft.unwrap_or_else(|| {
                 if ready >= 1.0 {
                     "Idle: stamina full".into()
@@ -618,8 +629,6 @@ impl ActivityCheck {
             monitor.report(src, HealthStatus::Warning, msg);
         } else if stamina.is_regenerating(self.regen_window, now) {
             monitor.report(src, HealthStatus::Warning, "Resting");
-        } else if gained {
-            monitor.report(src, HealthStatus::Healthy, "Gaining experience");
         } else if let Some(msg) = idle_craft {
             monitor.report(src, HealthStatus::Warning, msg);
         } else if xp.last_gain_at.is_none() {
@@ -649,6 +658,57 @@ mod tests {
         stamina.handle(100.0, 3.0);
         ActivityCheck::default().evaluate(&xp, &stamina, None, None, &mut monitor, 3.0);
         assert_eq!(monitor.sorted_reports()[0].message, "Idle: stamina full");
+    }
+
+    #[test]
+    fn xp_after_regen_is_gaining_immediately() {
+        let mut xp = ExperienceTracker::default();
+        let mut stamina = StaminaTracker::default();
+        let mut monitor = StatusMonitor::default();
+        stamina.set_reported_max(Some(100.0), 0.0);
+        xp.handle(&[(2, 10)], 0.0);
+        stamina.handle(50.0, 1.0);
+        stamina.handle(51.0, 2.0);
+        let check = ActivityCheck::default();
+        check.evaluate(&xp, &stamina, None, None, &mut monitor, 2.0);
+        assert_eq!(monitor.sorted_reports()[0].message, "Resting");
+        // XP arrives before the stamina spend: no longer resting.
+        xp.handle(&[(2, 20)], 3.0);
+        check.evaluate(&xp, &stamina, None, None, &mut monitor, 3.0);
+        assert_eq!(monitor.sorted_reports()[0].message, "Gaining experience");
+    }
+
+    #[test]
+    fn xp_after_moving_is_gaining() {
+        let mut xp = ExperienceTracker::default();
+        let mut stamina = StaminaTracker::default();
+        let mut monitor = StatusMonitor::default();
+        stamina.set_reported_max(Some(100.0), 0.0);
+        stamina.handle(100.0, 0.0);
+        xp.handle(&[(2, 10)], 0.0);
+        xp.handle(&[(2, 20)], 6.0);
+        ActivityCheck::default().evaluate(&xp, &stamina, None, Some(5.0), &mut monitor, 7.0);
+        assert_eq!(monitor.sorted_reports()[0].message, "Gaining experience");
+    }
+
+    #[test]
+    fn craft_progress_never_goes_back() {
+        let mut crafts = CraftTracker::default();
+        crafts.update(&[CraftInfo {
+            id: "1".into(),
+            name: "Plank".into(),
+            building: None,
+            progress: 10,
+            total: 100,
+            completed: false,
+            kind: None,
+            tier: None,
+        }]);
+        crafts.handle_progress("1", 12, 5.0);
+        // The slower source still reports 11.
+        crafts.handle_progress("1", 11, 6.0);
+        let craft = &crafts.sorted()[0];
+        assert_eq!((craft.progress, craft.last_progress_at), (12, Some(5.0)));
     }
 
     #[test]

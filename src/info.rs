@@ -178,13 +178,6 @@ impl Render for InfoWindow {
             body.push(div().text_color(theme.secondary).child("Loading…").into_any_element());
         } else {
             body.push(status_line(m, theme).into_any_element());
-            // The in-game action bar (gathering, crafting, …): smooth, so
-            // redraw every frame while an action runs (the model only
-            // ticks once a second).
-            if let Some(el) = action_bar(m, theme) {
-                window.request_animation_frame();
-                body.push(el.into_any_element());
-            }
             // Offline: stamina/health/food are stale and don't matter.
             if !m.is_offline {
                 body.push(bars(m, theme).into_any_element());
@@ -264,28 +257,6 @@ fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
                 )
                 .child(div().flex().child(bar(c.fraction(), gpui::rgb(0x0a84ff), theme)))
         }))
-}
-
-/// Progress of the current action (relay `player_action_state`), with its
-/// name and time left. None when idle, offline, or not a work action.
-fn action_bar(m: &Model, theme: Theme) -> Option<impl IntoElement> {
-    if m.is_offline {
-        return None;
-    }
-    let action = m.action.as_ref()?;
-    let label = action.label()?;
-    let now = crate::core::types::now();
-    let fraction = action.fraction(now)?;
-    let left = (action.start + action.duration - now).max(0.0);
-    Some(
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(div().w(px(50.0)).flex_none().text_xs().text_color(theme.secondary).child(label))
-            .child(bar(fraction, status_color(HealthStatus::Warning), theme))
-            .child(div().flex_none().min_w(px(34.0)).flex().justify_end().text_xs().child(format!("{left:.1}s"))),
-    )
 }
 
 /// A taller bar with its value ("212 / 262", "41m") centered inside
