@@ -1,5 +1,6 @@
-//! Live passive crafts + plants from BitCraft's SpacetimeDB via BitJita's
-//! read-only relay (`relay.bitjita.com`). No account/token needed. Protocol:
+//! Live passive crafts + plants from BitCraft's SpacetimeDB via the
+//! community read-only relay `relay.bitcraftsync.app` (one port per region:
+//! 3000 + region). No account/token needed. Protocol:
 //! SpacetimeDB v1 JSON (`v1.json.spacetimedb`). See AGENTS.md "SpacetimeDB
 //! relay" for tables, column indices and quirks.
 
@@ -14,9 +15,11 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::RelayState;
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{CraftInfo, FoodBuff, FoodState, PassiveCraft, Plant, Position, now};
+use crate::core::types::{CraftInfo, FoodBuffDesc, PassiveCraft, Plant, Position, RawBuff, now};
 
-const HOST: &str = "relay.bitjita.com";
+const HOST: &str = "relay.bitcraftsync.app";
+/// Each region is its own relay instance on port `PORT_BASE + region`.
+const PORT_BASE: i64 = 3000;
 /// `buff_type_desc` ids: "Food Regen" (every food) and "Food Buffs" (extras).
 const FOOD_REGEN_TYPE: i64 = 1790361536;
 const FOOD_BUFFS_TYPE: i64 = 861783812;
@@ -76,16 +79,24 @@ fn pk_column(table: &str) -> usize {
     if table == "player_state" { 1 } else { 0 }
 }
 
-/// Rows are JSON strings of arrays (or arrays).
+/// Rows are JSON strings of arrays (BitJita's relay) or of objects with
+/// the columns in schema order (bitcraftsync); both become column arrays.
+/// Object order relies on serde_json's `preserve_order`.
 fn rows(value: &Value) -> Vec<Vec<Value>> {
+    fn columns(v: Value) -> Option<Vec<Value>> {
+        match v {
+            Value::Array(a) => Some(a),
+            Value::Object(o) => Some(o.into_iter().map(|(_, v)| v).collect()),
+            _ => None,
+        }
+    }
     value
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(|v| match v {
-            Value::String(s) => serde_json::from_str::<Vec<Value>>(s).ok(),
-            Value::Array(a) => Some(a.clone()),
-            _ => None,
+            Value::String(s) => serde_json::from_str::<Value>(s).ok().and_then(columns),
+            other => columns(other.clone()),
         })
         .collect()
 }
@@ -106,9 +117,14 @@ fn tag(v: &Value) -> Option<i64> {
     v.as_array()?.first().and_then(int)
 }
 
-/// Timestamp `[micros since epoch]` → seconds.
+/// Timestamp `[micros since epoch]` or
+/// `{"__timestamp_micros_since_unix_epoch__": micros}` → seconds.
 fn date(v: &Value) -> Option<f64> {
-    let micros = v.as_array()?.first()?.as_f64()?;
+    let micros = match v {
+        Value::Array(a) => a.first()?.as_f64()?,
+        Value::Object(o) => o.values().next()?.as_f64()?,
+        _ => return None,
+    };
     (micros > 0.0).then_some(micros / 1e6)
 }
 
@@ -177,35 +193,23 @@ impl Feed {
         true
     }
 
-    /// Active food buffs: `active_buff_state.active_buffs[]` =
+    /// Started buffs: `active_buff_state.active_buffs[]` =
     /// `[buff_id, [start (Unix s)], duration (s), values]`; inactive entries
-    /// have start 0. Only food types are subscribed in `buff_desc`, so a
-    /// match there means it's a food buff.
-    fn food_buffs(&self) -> Vec<(i64, FoodBuff)> {
-        let now = now();
+    /// have start 0. Which are food: [`Self::food_descs`].
+    fn buffs(&self) -> Vec<RawBuff> {
         let Some(row) = self.store.rows("active_buff_state").next() else { return vec![] };
-        row.get(1)
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|buff| {
-                let buff = buff.as_array()?;
-                let id = buff.first().and_then(int)?;
-                let start = buff.get(1)?.as_array()?.first()?.as_f64()?;
-                let duration = buff.get(2)?.as_f64()?;
-                let desc = self.store.get("buff_desc", &id.to_string())?;
-                let ends_at = start + duration;
-                (start > 0.0 && ends_at > now).then(|| {
-                    (
-                        id,
-                        FoodBuff {
-                            name: desc.get(2).and_then(Value::as_str).unwrap_or("Food buff").to_string(),
-                            is_regen: desc.get(1).and_then(int) == Some(FOOD_REGEN_TYPE),
-                            ends_at,
-                            duration,
-                        },
-                    )
-                })
+        row.get(1).and_then(super::parse_buffs).unwrap_or_default()
+    }
+
+    /// Only food types are subscribed in `buff_desc` = [id, buff_type_id,
+    /// name, …].
+    fn food_descs(&self) -> HashMap<i64, FoodBuffDesc> {
+        self.store
+            .rows("buff_desc")
+            .filter_map(|d| {
+                let id = d.first().and_then(int)?;
+                let name = d.get(2).and_then(Value::as_str).unwrap_or("Food buff").to_string();
+                Some((id, FoodBuffDesc { name, is_regen: d.get(1).and_then(int) == Some(FOOD_REGEN_TYPE) }))
             })
             .collect()
     }
@@ -239,10 +243,6 @@ impl Feed {
         let row = self.store.rows("mobile_entity_state").next()?;
         let at = row.get(2).and_then(Value::as_f64).filter(|t| *t > 0.0).map(|ms| ms / 1e3);
         Some(Position { x: row.get(3).and_then(int)?, z: row.get(4).and_then(int)?, at })
-    }
-
-    fn food(&self) -> FoodState {
-        FoodState { buffs: self.food_buffs().into_iter().map(|(_, b)| b).collect() }
     }
 
     /// Building name via `building_state` → `building_desc`.
@@ -363,7 +363,9 @@ pub struct RegionData {
     pub crafts: Vec<CraftInfo>,
     pub passive: Vec<PassiveCraft>,
     pub plants: Vec<Plant>,
-    pub food: FoodState,
+    /// Player's started buffs (meaningful in the player's region only).
+    pub buffs: Vec<RawBuff>,
+    pub food_descs: HashMap<i64, FoodBuffDesc>,
     /// Character rows; Some only in the region the player is in.
     pub signed_in: Option<bool>,
     pub stats: Option<Vec<f64>>,
@@ -420,14 +422,23 @@ async fn session(
     emit: &impl Fn(RegionUpdate),
     backoff: &mut Duration,
 ) -> Result<(), String> {
-    let url = format!("wss://{HOST}/v1/database/idc-{region}/subscribe");
+    let port = PORT_BASE + region;
+    let url = format!("wss://{HOST}:{port}/v1/database/idc-{region}/subscribe?compression=None");
     let Ok(mut request) = url.into_client_request() else { return Ok(()) };
     request.headers_mut().insert("Sec-WebSocket-Protocol", "v1.json.spacetimedb".parse().expect("header"));
     let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
         .max_message_size(Some(64 << 20))
         .max_frame_size(Some(64 << 20));
     let connect = tokio_tungstenite::connect_async_with_config(request, Some(config), false);
-    let Ok(Ok((ws, _))) = timeout(Duration::from_secs(20), connect).await else { return Ok(()) };
+    let ws = match timeout(Duration::from_secs(20), connect).await {
+        Ok(Ok((ws, _))) => ws,
+        // Ports without a mirrored region behind them answer nginx 502:
+        // a lasting refusal (retried every 5 min), not a dropped connection.
+        Ok(Err(tokio_tungstenite::tungstenite::Error::Http(response))) if response.status().as_u16() == 502 => {
+            return Err(format!("region {region} not mirrored (HTTP 502)"));
+        }
+        _ => return Ok(()),
+    };
     let (mut sink, mut stream) = ws.split();
     if sink.send(feed.subscribe_message()).await.is_err() {
         return Ok(());
@@ -476,7 +487,8 @@ async fn session(
                     crafts: feed.crafts(),
                     passive: feed.passive_crafts(),
                     plants: feed.plants(initial),
-                    food: feed.food(),
+                    buffs: feed.buffs(),
+                    food_descs: feed.food_descs(),
                     signed_in: feed.signed_in(),
                     stats: feed.stats(),
                     health: feed.health(),
@@ -496,5 +508,25 @@ async fn session(
                 awaiting_pong.get_or_insert_with(tokio::time::Instant::now);
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_from_arrays_and_objects() {
+        // BitJita's relay: arrays; bitcraftsync: objects in column order.
+        let update = json!([
+            "[1, 7, [1700000000000000]]",
+            "{\"entity_id\":2,\"owner_entity_id\":7,\"timestamp\":{\"__timestamp_micros_since_unix_epoch__\":1700000000000000}}"
+        ]);
+        let rows = rows(&update);
+        assert_eq!(rows[0][0], json!(1));
+        assert_eq!(rows[1][0], json!(2));
+        assert_eq!(rows[1][1], json!(7));
+        assert_eq!(date(&rows[0][2]), Some(1_700_000_000.0));
+        assert_eq!(date(&rows[1][2]), Some(1_700_000_000.0));
     }
 }

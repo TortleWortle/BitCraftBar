@@ -9,7 +9,7 @@ use crate::core::trackers::{
     ActivityCheck, Craft, CraftTracker, ExperienceTracker, PassiveCraftTracker, PlantTracker, SatiationTracker,
     StaminaTracker,
 };
-use crate::core::types::{FoodState, PlayerSummary, Position, now};
+use crate::core::types::{FoodState, PlayerSummary, Position, RawBuff, now};
 use crate::sound::Sound;
 use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState, live};
 use crate::settings::Settings;
@@ -44,6 +44,9 @@ pub struct Model {
     /// Food buffs from the relay; None until the relay delivered them (no
     /// "Food" report then: REST buff data is unreliable).
     pub food: Option<FoodState>,
+    /// Started buffs (relay or BitJita live), turned into `food` with the
+    /// cached food buff types.
+    buffs: Option<Vec<RawBuff>>,
     /// Relay only (`health_state`, max = stats value 0).
     pub health: Option<f64>,
     pub max_health: Option<f64>,
@@ -98,6 +101,7 @@ impl Model {
             plants: PlantTracker::default(),
             passive: PassiveCraftTracker::default(),
             food: None,
+            buffs: None,
             health: None,
             max_health: None,
             sounds: Vec::new(),
@@ -163,6 +167,7 @@ impl Model {
             self.plants = PlantTracker::default();
             self.passive = PassiveCraftTracker::default();
             self.food = None;
+            self.buffs = None;
             self.health = None;
             self.max_health = None;
             self.position = None;
@@ -280,7 +285,19 @@ impl Model {
             NetEvent::Position(position) => self.update_position(position, now),
             NetEvent::InitialRestDone => self.initial_rest_done = true,
             NetEvent::Relay(state) => self.relay_state = state,
-            NetEvent::RelayFood(food) => self.food = Some(food),
+            // Both sources mirror the same row; the latest wins (the hub
+            // only sends relay buffs when they change).
+            NetEvent::RelayBuffs(buffs) | NetEvent::LiveBuffs(buffs) => {
+                self.buffs = Some(buffs);
+                self.update_food();
+            }
+            NetEvent::FoodBuffDescs(descs) => {
+                if self.settings.food_buff_descs != descs {
+                    self.settings.food_buff_descs = descs;
+                    self.settings.save();
+                }
+                self.update_food();
+            }
         }
         self.collect_notifications();
         self.update_loading();
@@ -306,6 +323,13 @@ impl Model {
         let changed = slot.is_some_and(|was| was != relay);
         *slot = Some(relay);
         changed
+    }
+
+    /// Food from the last buffs; unknown (None) until buffs and the food
+    /// buff types are both known (no types → everything looks like "No food").
+    fn update_food(&mut self) {
+        let descs = &self.settings.food_buff_descs;
+        self.food = self.buffs.as_ref().filter(|_| !descs.is_empty()).map(|b| FoodState::from_raw(b, descs));
     }
 
     /// Food: healthy while a food regen buff runs, alert "No food" when it

@@ -15,7 +15,8 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{CraftInfo, FoodState, PassiveCraft, Plant, PlayerSummary, Position};
+use crate::core::types::{CraftInfo, FoodBuffDesc, PassiveCraft, Plant, PlayerSummary, Position, RawBuff};
+use serde_json::Value;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnState {
@@ -56,11 +57,55 @@ pub enum NetEvent {
     Relay(RelayState),
     RelayPassiveCrafts(Vec<PassiveCraft>),
     RelayPlants(Vec<Plant>),
-    RelayFood(FoodState),
+    /// The player's started buffs (`active_buff_state`), from the relay
+    /// (sent when they change) or BitJita live (`LiveBuffs`, usually first).
+    RelayBuffs(Vec<RawBuff>),
+    LiveBuffs(Vec<RawBuff>),
+    /// Food buff types from the relay's `buff_desc` (cached by the model).
+    FoodBuffDescs(HashMap<i64, FoodBuffDesc>),
     RelayCrafts(Vec<CraftInfo>),
     /// The player's own rows (region the player is in). None: not found in
     /// a live region (relay down / still loading) → use REST.
     RelayPlayer(Option<RelayPlayer>),
+}
+
+/// `active_buff_state.active_buffs` → started buffs. Accepts the relay's
+/// column arrays (`[buff_id, [start], duration, values]`) and objects with
+/// column names (BitJita live). Timestamps may be wrapped (`[n]`,
+/// `{"…": n}`) and in s, ms or µs. None if `list` isn't an array.
+pub fn parse_buffs(list: &Value) -> Option<Vec<RawBuff>> {
+    fn number(v: &Value) -> Option<f64> {
+        match v {
+            Value::Number(n) => n.as_f64(),
+            Value::String(s) => s.parse().ok(),
+            Value::Array(a) => a.first().and_then(number),
+            Value::Object(o) => o.values().find_map(number),
+            _ => None,
+        }
+    }
+    fn field<'a>(o: &'a serde_json::Map<String, Value>, names: &[&str]) -> Option<&'a Value> {
+        names.iter().find_map(|n| o.get(*n))
+    }
+    let buffs = list
+        .as_array()?
+        .iter()
+        .filter_map(|b| {
+            let (id, start, duration) = match b {
+                Value::Array(a) => (a.first()?, a.get(1)?, a.get(2)?),
+                Value::Object(o) => (
+                    field(o, &["buff_id", "id"])?,
+                    field(o, &["buff_start_timestamp", "start_timestamp", "start"])?,
+                    field(o, &["buff_duration", "duration"])?,
+                ),
+                _ => return None,
+            };
+            let start = number(start)?;
+            let start = if start > 1e14 { start / 1e6 } else if start > 1e11 { start / 1e3 } else { start };
+            // Inactive entries have start 0.
+            (start > 0.0).then_some(RawBuff { id: number(id)? as i64, start, duration: number(duration)? })
+        })
+        .collect();
+    Some(buffs)
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -186,7 +231,14 @@ fn track(user: String, out: async_channel::Sender<Outgoing>, caches: Arc<Mutex<C
     let relay_live = Arc::new(AtomicBool::new(false));
 
     let (live_tx, live_rx) = mpsc::unbounded_channel();
-    let channels = vec![live::experience(&user), live::stamina(&user), live::satiation(&user), live::character_stats(&user), live::mobile(&user)];
+    let channels = vec![
+        live::experience(&user),
+        live::stamina(&user),
+        live::satiation(&user),
+        live::character_stats(&user),
+        live::mobile(&user),
+        live::buffs(&user),
+    ];
     let live_task = tokio::spawn(live::run(channels, live_rx, emitter.clone()));
 
     let poll_task = tokio::spawn(poll(user, emitter, relay_live, caches));
@@ -327,7 +379,7 @@ async fn with_growth_durations(mut plants: Vec<Plant>, caches: &Arc<Mutex<Caches
     plants
 }
 
-/// Regions BitJita's relay mirrors (observed; others refuse, retried every
+/// Regions the relay mirrors (its `/health`; others answer 502, retried every
 /// 5 min).
 const MIRRORED_REGIONS: [i64; 9] = [7, 8, 9, 12, 13, 14, 17, 18, 19];
 
@@ -363,6 +415,8 @@ async fn relay_hub(
     let mut data: HashMap<i64, relay::RegionData> = HashMap::new();
     let mut last_state: Option<RelayState> = None;
     let mut last_player: Option<RelayPlayer> = None;
+    let mut last_buffs: Option<Vec<RawBuff>> = None;
+    let mut last_descs: HashMap<i64, FoodBuffDesc> = HashMap::new();
     loop {
         let mut data_changed = false;
         tokio::select! {
@@ -427,8 +481,18 @@ async fn relay_hub(
             emit(NetEvent::RelayPlayer(player_info.clone()));
             last_player = player_info;
         }
-        if data_changed && let Some(d) = player {
-            emit(NetEvent::RelayFood(d.food.clone()));
+        // Only on change: every region update re-sends its data, and a
+        // repeat of older relay buffs would undo newer BitJita live ones.
+        if let Some(d) = player
+            && last_buffs.as_ref() != Some(&d.buffs)
+        {
+            emit(NetEvent::RelayBuffs(d.buffs.clone()));
+            last_buffs = Some(d.buffs.clone());
+        }
+        let descs: HashMap<i64, FoodBuffDesc> = data.values().flat_map(|d| d.food_descs.clone()).collect();
+        if !descs.is_empty() && descs != last_descs {
+            emit(NetEvent::FoodBuffDescs(descs.clone()));
+            last_descs = descs;
         }
     }
 }
@@ -456,5 +520,22 @@ struct AbortOnDrop(JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn parses_relay_and_live_buffs() {
+        // Relay columns; inactive entry (start 0) dropped.
+        let relay = json!([[7, [1_700_000_000], 1800, []], [8, [0], 900, []]]);
+        assert_eq!(parse_buffs(&relay), Some(vec![RawBuff { id: 7, start: 1_700_000_000.0, duration: 1800.0 }]));
+        // Named fields, wrapped µs timestamp, string id.
+        let live = json!([{"buff_id": "7", "buff_start_timestamp": {"__timestamp_micros_since_unix_epoch__": 1_700_000_000_000_000_i64}, "buff_duration": 1800}]);
+        assert_eq!(parse_buffs(&live), Some(vec![RawBuff { id: 7, start: 1_700_000_000.0, duration: 1800.0 }]));
+        assert_eq!(parse_buffs(&Value::Null), None);
     }
 }

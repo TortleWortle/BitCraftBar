@@ -1,7 +1,9 @@
 //! Data passed from the network layer to the trackers. Times are Unix
 //! seconds (`f64`), see [`now`].
 
-use serde::Deserialize;
+use std::collections::HashMap;
+
+use serde::{Deserialize, Serialize};
 
 pub fn now() -> f64 {
     std::time::SystemTime::now()
@@ -109,7 +111,39 @@ impl FoodBuff {
     }
 }
 
+/// One started entry of `active_buff_state.active_buffs` (relay row or
+/// BitJita live event); which buffs are food comes from [`FoodBuffDesc`].
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RawBuff {
+    pub id: i64,
+    /// Unix seconds.
+    pub start: f64,
+    /// Seconds.
+    pub duration: f64,
+}
+
+/// A food buff type (relay `buff_desc` rows of the two food buff types).
+/// Cached in settings: the live channel only has buff ids, and the relay
+/// can be down for a long time.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FoodBuffDesc {
+    pub name: String,
+    pub is_regen: bool,
+}
+
 impl FoodState {
+    /// Food buffs among `buffs` (ids found in `descs`).
+    pub fn from_raw(buffs: &[RawBuff], descs: &HashMap<i64, FoodBuffDesc>) -> Self {
+        let buffs = buffs
+            .iter()
+            .filter_map(|b| {
+                let desc = descs.get(&b.id)?;
+                Some(FoodBuff { name: desc.name.clone(), is_regen: desc.is_regen, ends_at: b.start + b.duration, duration: b.duration })
+            })
+            .collect();
+        Self { buffs }
+    }
+
     /// When the food regen runs out, if it's active.
     pub fn regen_ends_at(&self, now: f64) -> Option<f64> {
         self.buffs.iter().filter(|b| b.is_regen && b.ends_at > now).map(|b| b.ends_at).reduce(f64::max)

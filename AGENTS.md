@@ -11,8 +11,9 @@
 A tray / menu bar app (macOS, Windows, Linux) that shows, at a glance, the
 status of the user's character in the game **BitCraft**. Written in Rust with
 [GPUI](https://gpui.rs) (Zed's UI framework). Data comes from the community
-site [BitJita](https://bitjita.com): live websocket, REST API, and its
-read-only SpacetimeDB relay. There is no main window or Dock icon; everything
+site [BitJita](https://bitjita.com) (live websocket, REST API) and the
+community read-only SpacetimeDB relay
+[relay.bitcraftsync.app](https://relay.bitcraftsync.app). There is no main window or Dock icon; everything
 lives in the tray icon and its popup panel.
 
 The goal is a quick "is my character still doing something useful?" check
@@ -204,9 +205,15 @@ Activity rows are checked top to bottom.
   notification nor the idle sound fires, until Activity is something other
   than idle again (`Model::idle_after_moving`).
 
-- **Counting XP** = XP gained in the last 20s *and* after stamina last went
-  up: XP while regenerating is improbable (user's rule), so once regen starts,
-  earlier XP no longer means "active". The 20s window (was 5s) bridges gaps
+- **Counting XP** = XP gained in the last 20s *and* stamina hasn't
+  regenerated since: XP while regenerating is improbable (user's rule), so
+  once regen starts, earlier XP no longer means "active". "Regenerated" =
+  **2+ stamina increases after the XP without spending in between**
+  (`ActivityCheck::rest_ticks`, `StaminaTracker::regen_ticks_since`). A
+  single tick isn't enough: stamina ticks up between craft actions
+  (passive / food regen), which showed "Craft idle" while crafting (full
+  stamina topped back up, or the next action's spend arriving before its
+  XP). Costs ~1s before "Resting" shows. The 20s window (was 5s) bridges gaps
   between XP ticks; regeneration overrides it. It's checked **before**
   Resting (user request: switch to "Gaining experience" as soon as XP
   arrives, not when the stamina spend follows), and XP after the last move
@@ -230,7 +237,8 @@ Activity rows are checked top to bottom.
 - There is **no low-stamina warning** (removed): you run out of stamina
   exactly when you stop to regenerate, so it only duplicated "Resting".
 - **Food** (user request, re-added once reliable data existed): reported
-  only after the relay delivered `active_buff_state`; cleared while offline.
+  only once buffs arrived (relay or BitJita live `active_buff_state`) and
+  the food buff types are known (relay, cached); cleared while offline.
   Only the "Food Regen" buff counts (every food gives one); extra "Food
   Buffs" alone (e.g. action speed) don't. "No food" is a normal alert, so it
   notifies when food runs out (5 min cooldown).
@@ -399,15 +407,25 @@ character that's no longer tracked are dropped.
 
 ### SpacetimeDB relay (crafts, passive crafts, plants, food; live) — `src/net/relay.rs`, hub in `src/net/mod.rs`
 
-BitCraft runs on SpacetimeDB. BitJita runs a read-only relay ("BITCONNECT",
-https://relay.bitjita.com) that mirrors it; **no account or BitCraft token**
-(the relay issues its own identities; connecting without one works too).
-Unofficial, no published terms/limits; could change without notice, hence the
-REST fallback. Connecting to Clockwork's own SpacetimeDB with the player's
+BitCraft runs on SpacetimeDB. We use the community read-only mirror
+**https://relay.bitcraftsync.app** (user request; source
+`ekscrypto/spacetimedb-bitcraft-mirror`, MIT; BitJita's tools share it). It
+replaced BitJita's relay (`relay.bitjita.com`, "BITCONNECT"), which was
+often down for long periods (`/healthz` 503) and slow to deliver food
+buffs. **No account or BitCraft token** (the relay issues its own
+identities). Unofficial, no published terms/limits; could change without
+notice, hence the REST fallback. Read-only: `OneOffQuery` / `CallReducer`
+are rejected. Connecting to Clockwork's own SpacetimeDB with the player's
 game token was rejected: account risk, and the relay has the same data.
 
-- `wss://relay.bitjita.com/v1/database/idc-<region>/subscribe`, websocket
-  subprotocol `v1.json.spacetimedb`. **One database per region**, and rows
+- `wss://relay.bitcraftsync.app:<3000 + region>/v1/database/idc-<region>/subscribe?compression=None`,
+  websocket subprotocol `v1.json.spacetimedb` (the relay recommends
+  `v2.bsatn`, but v1 JSON works). **Each region is its own instance on
+  port 3000 + region** (global: 3000, `idc-global`); live ones are listed
+  at `https://relay.bitcraftsync.app/health`. A port with no region behind
+  it answers **nginx 502** on the handshake, treated as a lasting refusal
+  (`relay::session`; otherwise it would retry forever and the relay would
+  never count as live). **One database per region**, and rows
   live in the region of the *thing*: placeables and crafting stations stay
   in their region, while the player's buffs move with the player. (Bug
   found: following only the player's region showed 0 plants/crafts after
@@ -423,25 +441,39 @@ game token was rejected: account risk, and the relay has the same data.
   refuse for good (`SubscriptionError` other than "loading", e.g. not
   mirrored; retried every 5 min) are ignored. While not live, REST provides
   crafts/plants/passive crafts and relay lists aren't sent, so a region
-  that's still loading never hides data. While the relay restarts it refuses
-  with "module is still loading its initial state from upstream; retry
-  shortly" (`/healthz` 503, observed for 8+ min; it also briefly served
-  incomplete tables); that's retried with the normal backoff.
+  that's still loading never hides data. BitJita's relay refused with
+  "module is still loading its initial state from upstream; retry
+  shortly" while restarting (8+ min); such errors are still retried with
+  the normal backoff.
 - Protocol: send `{"Subscribe":{"query_strings":[SQL…],"request_id":1}}`
   (replaces the whole set; also used to add lookups) → `InitialSubscription`
   (all current rows) → `TransactionUpdate`s (`deletes` + `inserts` per table).
-  Rows are JSON strings of arrays in column order; sums `[tag, payload]`,
-  timestamps `[micros]`. Joins (`SELECT a.* FROM a JOIN b ON … WHERE …`)
+  Rows are JSON strings of **objects with the columns in schema order**
+  (bitcraftsync; BitJita's relay sent arrays). `relay::rows` turns both
+  into column arrays, so the column indices below still apply; object
+  order needs serde_json's **`preserve_order`** feature (set in
+  `Cargo.toml`). Nested product types inside a row stay as they are
+  (e.g. `active_buffs` entries are arrays). Sums `[tag, payload]`;
+  timestamps `{"__timestamp_micros_since_unix_epoch__": micros}` (BitJita:
+  `[micros]`; `relay::date` takes both). Joins (`SELECT a.* FROM a JOIN b ON … WHERE …`)
   work and can repeat a row once per match → the row store is ref-counted.
   `LIMIT` / HTTP `/sql` aren't available. Schema (column order/types):
-  `GET /v1/database/idc-14/schema?version=9`.
+  `GET https://relay.bitcraftsync.app:3014/v1/database/idc-14/schema?version=9`.
 - **Food buffs** (`Feed::food`): `active_buff_state` (pk entity_id) =
   `[entity_id, [[buff_id, [start], duration, values], …]]`, ~370 entries
   per player; inactive ones have start `[0]`. **start is Unix seconds**,
   duration seconds (food: 900/1800/3600). `buff_desc` is subscribed only for
   the two food buff types (`buff_type_id` 1790361536 "Food Regen", 11 rows;
   861783812 "Food Buffs", 96 rows): a match = food buff; column 2 = name.
-  Expiry is computed from start + duration on each tick. Not subscribed
+  Expiry is computed from start + duration on each tick. **Two sources**
+  for the same row: the hub sends the relay's started buffs
+  (`NetEvent::RelayBuffs`) **only when they change** (every region update
+  re-sends data, and a stale repeat would undo newer live buffs), BitJita
+  live sends `LiveBuffs`; the model keeps the latest. Which buffs are food
+  comes from the relay's `buff_desc` (`NetEvent::FoodBuffDescs`), **cached
+  in `settings.json`** (`food_buff_descs`) so live buffs work while the
+  relay is down; with no cached types there's no Food report (it would
+  say "No food"). Not subscribed
   anymore: `food_desc` (413 rows; column 8 = `[[buff_id, duration option],
   …]` maps food items → buffs). It was used to name the food, but 369 foods
   share 223 buff sets (often ambiguous) and the names were too long. `buff_desc.online_timestamp` is true for food buffs; whether
@@ -507,9 +539,10 @@ doesn't prove a channel exists). Events: `{"type":"event","channel":...,"data":{
 | `character_stats_state:<player id>` | `values[1]` = max stamina, `values[19]` = max satiation | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe. Fallback for when the relay's `character_stats_state` isn't available. |
 | `mobile_entity_state:<player id>` | `location_x`, `location_z` (also `destination_*`, `is_walking`, `timestamp` ms, `region_id`) | **~16 events/s** (330 in 20s while playing), so `live::handle` sends a `Position` at most once per second and only when it changed. Movement → "Active". |
 | `progressive_action_state:<craft entity id>` | `progress`, `entity_id` | One event per craft action (+ a duplicate `preparation: true` event). |
+| `active_buff_state:<player id>` | `active_buffs` | Food buffs, faster than the relay (user: relay food "takes quite long, if at all"). **Format unverified**: an earlier probe saw no events (likely only sent on change, e.g. eating). `net::parse_buffs` accepts the relay's column arrays or objects (`buff_id`, `buff_start_timestamp`, `buff_duration`; timestamps wrapped or not, s/ms/µs); an unrecognized payload is ignored. `BITCRAFT_DEBUG=1` logs the raw data: check it and tighten the parser once seen. |
 
 Channels probed that produced no events: `character_stats`, `player_state`,
-`health_state`, `active_buff_state`. BitJita's frontend also uses
+`health_state`. BitJita's frontend also uses
 `health_state`, `active_buff_state`, `passive_craft_state:owner_entity_id:<id>`,
 `placeable_state`, `growth_state`; like `character_stats_state` they probably
 only send on change.
@@ -589,7 +622,8 @@ agent: Python's default `urllib` agent got 403).
   notifications to stderr; the only way to observe the app without a
   screen), `BITCRAFT_NO_NOTIFY=1` (suppress notifications). `cargo test` for
   the core rules and date parsing.
-- **Settings file** (tracked character, info window state/position):
+- **Settings file** (tracked character, info window state/position,
+  sounds, cached stats and food buff types):
   `<config dir>/bitcraft-tracker/settings.json` (macOS
   `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`).
 - **GPUI** 0.2.2 with `runtime_shaders`: Metal shaders compile at runtime,
@@ -675,7 +709,8 @@ agent: Python's default `urllib` agent got 403).
 
 - **Food via REST** (`players/<id>/buffs`) was tried in the Swift app and
   removed: BitJita doesn't keep buffs up to date. Food now comes from the
-  relay only; without the relay (unmirrored region) there's no Food report,
+  relay and BitJita live; without either (and no cached buff types)
+  there's no Food report,
   and food is inferred from stamina regen (Activity rule) and satiation.
 - Relay `player_state` has `time_signed_in`, `sign_in_timestamp`,
   `signed_in`: a possible live alternative to the REST `signedIn` poll.

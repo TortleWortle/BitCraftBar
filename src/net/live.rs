@@ -38,6 +38,10 @@ pub fn character_stats(user: &str) -> String {
 pub fn mobile(user: &str) -> String {
     format!("mobile_entity_state:{user}")
 }
+/// Buffs (food); only sent on change, faster than the relay.
+pub fn buffs(user: &str) -> String {
+    format!("active_buff_state:{user}")
+}
 pub const CRAFT_PREFIX: &str = "progressive_action_state:";
 
 /// Last position event sent on (when, where), for throttling.
@@ -182,6 +186,17 @@ fn handle(text: &str, emit: &impl Fn(NetEvent)) {
             *last = Some((std::time::Instant::now(), (x, z)));
             let at = data["timestamp"].as_f64().filter(|t| *t > 0.0).map(|ms| ms / 1e3);
             NetEvent::Position(Position { x, z, at })
+        }
+        "active_buff_state" => {
+            // Format unverified (no event seen yet): log it to check.
+            if std::env::var_os("BITCRAFT_DEBUG").is_some() {
+                eprintln!("live active_buff_state: {}", data.to_string().chars().take(2000).collect::<String>());
+            }
+            // Unknown format: send nothing rather than "no food".
+            match super::parse_buffs(data.get("active_buffs").unwrap_or(&Value::Null)) {
+                Some(buffs) => NetEvent::LiveBuffs(buffs),
+                None => return,
+            }
         }
         "progressive_action_state" => {
             let id = match &data["entity_id"] {

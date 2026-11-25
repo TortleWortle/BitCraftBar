@@ -1,6 +1,10 @@
 //! Persisted settings (`<config dir>/bitcraft-tracker/settings.json`).
 
+use std::collections::HashMap;
+
 use serde::{Deserialize, Serialize};
+
+use crate::core::types::FoodBuffDesc;
 
 /// The original user's character; change it with the character search.
 pub const DEFAULT_USER_ID: &str = "648518346633885895";
@@ -25,6 +29,10 @@ pub struct Settings {
     /// (relay restarting, `players/<id>/stats` 404).
     #[serde(default)]
     pub cached_stats: Option<Vec<f64>>,
+    /// Food buff types (relay `buff_desc`), so BitJita live buff events
+    /// can be read while the relay is down. Same for every character.
+    #[serde(default)]
+    pub food_buff_descs: HashMap<i64, FoodBuffDesc>,
 }
 
 /// Which events play a sound, and how loud (settings in the popup).
@@ -46,7 +54,7 @@ impl Default for SoundSettings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { user_id: DEFAULT_USER_ID.into(), username: None, info_window: false, info_origin: None, sounds: SoundSettings::default(), cached_stats: None }
+        Self { user_id: DEFAULT_USER_ID.into(), username: None, info_window: false, info_origin: None, sounds: SoundSettings::default(), cached_stats: None, food_buff_descs: HashMap::new() }
     }
 }
 

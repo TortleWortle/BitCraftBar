@@ -69,6 +69,9 @@ pub struct StaminaTracker {
     pub max: Option<f64>,
     pub last_regen_at: Option<f64>,
     pub last_drain_at: Option<f64>,
+    /// Times stamina went up since it was last spent (the current regen
+    /// streak). A single tick between actions isn't resting.
+    regen_streak: Vec<f64>,
     /// From the stats API / live `character_stats_state`.
     pub reported_max: Option<f64>,
     samples: Vec<(f64, f64)>,
@@ -82,6 +85,7 @@ impl Default for StaminaTracker {
             max: None,
             last_regen_at: None,
             last_drain_at: None,
+            regen_streak: Vec::new(),
             reported_max: None,
             samples: Vec::new(),
             max_window: 10.0 * 60.0,
@@ -108,8 +112,10 @@ impl StaminaTracker {
         if let Some(old) = self.stamina {
             if value > old {
                 self.last_regen_at = Some(now);
+                self.regen_streak.push(now);
             } else if value < old {
                 self.last_drain_at = Some(now);
+                self.regen_streak.clear();
             }
         }
         self.stamina = Some(value);
@@ -121,6 +127,11 @@ impl StaminaTracker {
     pub fn is_regenerating(&self, window: f64, now: f64) -> bool {
         let Some(regen) = self.last_regen_at else { return false };
         now - regen <= window && self.last_drain_at.is_none_or(|drain| regen > drain)
+    }
+
+    /// Stamina increases after `time` without being spent since.
+    pub fn regen_ticks_since(&self, time: f64) -> usize {
+        self.regen_streak.iter().filter(|t| **t > time).count()
     }
 
     pub fn set_reported_max(&mut self, value: Option<f64>, now: f64) {
@@ -554,11 +565,14 @@ pub struct ActivityCheck {
     pub craft_xp_tolerance: f64,
     /// Moved this recently → "Active".
     pub move_window: f64,
+    /// Stamina increases (without spending) after the last XP that mean
+    /// the player stopped to rest.
+    pub rest_ticks: usize,
 }
 
 impl Default for ActivityCheck {
     fn default() -> Self {
-        Self { experience_window: 20.0, regen_window: 10.0, craft_xp_tolerance: 5.0, move_window: 10.0 }
+        Self { experience_window: 20.0, regen_window: 10.0, craft_xp_tolerance: 5.0, move_window: 10.0, rest_ticks: 2 }
     }
 }
 
@@ -591,10 +605,14 @@ impl ActivityCheck {
         now: f64,
     ) {
         let ready = Self::ready_fraction(xp.last_skill_id);
+        // Resting since the last XP = stamina kept going up without being
+        // spent. A single tick between actions (passive / food regen while
+        // crafting) isn't resting; counting it showed "Craft idle" while
+        // crafting.
         let regen_since_xp = match (stamina.last_regen_at, xp.last_gain_at) {
             (None, _) => false,
             (Some(_), None) => true,
-            (Some(regen), Some(gain)) => regen > gain,
+            (Some(_), Some(gain)) => stamina.regen_ticks_since(gain) >= self.rest_ticks,
         };
         let gained = xp.has_gained(self.experience_window, now) && !regen_since_xp;
         let craft = last_craft.filter(|c| {
@@ -653,11 +671,46 @@ mod tests {
         xp.handle(&[(2, 20)], 1.0);
         stamina.handle(50.0, 1.0);
         stamina.handle(51.0, 2.0);
+        // One tick isn't resting yet (could be regen between actions).
         ActivityCheck::default().evaluate(&xp, &stamina, None, None, &mut monitor, 2.0);
-        assert_eq!(monitor.sorted_reports()[0].message, "Resting");
-        stamina.handle(100.0, 3.0);
+        assert_eq!(monitor.sorted_reports()[0].message, "Gaining experience");
+        stamina.handle(52.0, 3.0);
         ActivityCheck::default().evaluate(&xp, &stamina, None, None, &mut monitor, 3.0);
+        assert_eq!(monitor.sorted_reports()[0].message, "Resting");
+        stamina.handle(100.0, 4.0);
+        ActivityCheck::default().evaluate(&xp, &stamina, None, None, &mut monitor, 4.0);
         assert_eq!(monitor.sorted_reports()[0].message, "Idle: stamina full");
+    }
+
+    #[test]
+    fn regen_tick_between_craft_actions_is_not_craft_idle() {
+        let mut xp = ExperienceTracker::default();
+        let mut stamina = StaminaTracker::default();
+        let mut monitor = StatusMonitor::default();
+        let check = ActivityCheck::default();
+        stamina.set_reported_max(Some(100.0), 0.0);
+        stamina.handle(100.0, 0.0);
+        xp.handle(&[(2, 10)], 0.0);
+        let craft = |t: f64| Craft {
+            id: "1".into(),
+            name: "Plank".into(),
+            building: None,
+            progress: 5,
+            total: 100,
+            last_progress_at: Some(t),
+            kind: None,
+            tier: None,
+        };
+        // Action: spend + XP, then regen tops stamina back up to full.
+        stamina.handle(98.0, 1.0);
+        xp.handle(&[(2, 20)], 1.0);
+        stamina.handle(100.0, 1.5);
+        check.evaluate(&xp, &stamina, Some(&craft(1.0)), None, &mut monitor, 1.6);
+        assert_eq!(monitor.sorted_reports()[0].message, "Gaining experience");
+        // Next action's spend arrives before its XP.
+        stamina.handle(98.0, 2.0);
+        check.evaluate(&xp, &stamina, Some(&craft(2.0)), None, &mut monitor, 2.1);
+        assert_eq!(monitor.sorted_reports()[0].message, "Gaining experience");
     }
 
     #[test]
@@ -669,6 +722,7 @@ mod tests {
         xp.handle(&[(2, 10)], 0.0);
         stamina.handle(50.0, 1.0);
         stamina.handle(51.0, 2.0);
+        stamina.handle(52.0, 2.5);
         let check = ActivityCheck::default();
         check.evaluate(&xp, &stamina, None, None, &mut monitor, 2.0);
         assert_eq!(monitor.sorted_reports()[0].message, "Resting");
