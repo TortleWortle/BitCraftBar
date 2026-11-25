@@ -224,6 +224,8 @@ pub const GATHER_WINDOW: f64 = 30.0;
 /// target): tree, plant, ore, fish school, …
 #[derive(Clone, Debug, PartialEq)]
 pub struct Gather {
+    /// The resource's entity id.
+    pub target: String,
     /// `resource_desc.name`, e.g. "Young Beech Tree".
     pub name: String,
     pub tier: Option<i64>,
@@ -242,6 +244,16 @@ pub struct Gather {
 impl Gather {
     pub fn is_active(&self, now: f64) -> bool {
         now - self.last_hit_at <= GATHER_WINDOW
+    }
+
+    /// Used up: the shown value reached 0 (fishing timer ran out, or
+    /// health 0, which is also how a resource whose rows are gone looks).
+    pub fn is_dead(&self, now: f64) -> bool {
+        if self.shows_timer() {
+            self.ends_at.is_some_and(|end| end <= now)
+        } else {
+            self.health.is_some_and(|h| h <= 0.0)
+        }
     }
 
     /// Bar fill and text: fishing shows the spot's time left (user
@@ -273,6 +285,7 @@ mod gather_tests {
 
     fn gather(skill: i64) -> Gather {
         Gather {
+            target: "1".into(),
             name: "Young Beech Tree".into(),
             tier: Some(1),
             skill: Some(skill),
@@ -296,5 +309,15 @@ mod gather_tests {
         no_timer.ends_at = None;
         assert_eq!(no_timer.bar(1000.0).map(|b| b.1), Some("88%".into()));
         assert!(gather(2).is_active(1030.0) && !gather(2).is_active(1031.0));
+    }
+
+    #[test]
+    fn dies_at_zero_health_or_timer() {
+        let mut tree = gather(2);
+        assert!(!tree.is_dead(2000.0)); // timer ignored for non-fishing
+        tree.health = Some(0.0);
+        assert!(tree.is_dead(1000.0));
+        let fish = gather(12);
+        assert!(!fish.is_dead(1249.0) && fish.is_dead(1250.0));
     }
 }

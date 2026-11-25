@@ -149,6 +149,7 @@ impl AppState {
                 Sound::CraftFinished => prefs.craft_finished,
                 Sound::OutOfFood => prefs.out_of_food,
                 Sound::IdleFull => prefs.idle_full,
+                Sound::ResourceDepleted => prefs.resource_depleted,
             };
             if enabled {
                 crate::sound::play(sound, prefs.volume);
@@ -856,6 +857,7 @@ impl Panel {
             .child(toggle("snd-craft", "Craft finished", prefs.craft_finished, |p, v| p.craft_finished = v))
             .child(toggle("snd-food", "Out of food", prefs.out_of_food, |p, v| p.out_of_food = v))
             .child(toggle("snd-idle", "Idle with stamina above 90%", prefs.idle_full, |p, v| p.idle_full = v))
+            .child(toggle("snd-depleted", "Resource depleted", prefs.resource_depleted, |p, v| p.resource_depleted = v))
             .child(
                 div()
                     .flex()

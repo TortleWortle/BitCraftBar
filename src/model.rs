@@ -22,6 +22,12 @@ const FOOD_SOURCE: &str = "Food";
 
 /// Stamina fraction above which "idle" plays the idle sound.
 pub const IDLE_SOUND_STAMINA: f64 = 0.9;
+/// A used-up gather target only alerts above this stamina: lower, the
+/// player stops to regenerate anyway and the idle / rest alerts cover it.
+pub const GATHER_ALERT_STAMINA: f64 = 0.2;
+/// After a "resource depleted" alert, the went-idle alert that usually
+/// follows is skipped (same news twice).
+const GATHER_ALERT_QUIETS_IDLE: f64 = 60.0;
 
 pub struct Notification {
     pub title: String,
@@ -45,6 +51,9 @@ pub struct Model {
     food_descs: HashMap<i64, FoodBuffDesc>,
     /// The resource last hit (tree, ore, fish school, …).
     pub gather: Option<Gather>,
+    /// Gather target whose death was handled (alerted or skipped).
+    gather_dead_handled: Option<String>,
+    gather_alert_at: Option<f64>,
     /// Relay only (`health_state`, max = stats value 0).
     pub health: Option<f64>,
     pub max_health: Option<f64>,
@@ -89,6 +98,8 @@ impl Model {
             buffs: None,
             food_descs: HashMap::new(),
             gather: None,
+            gather_dead_handled: None,
+            gather_alert_at: None,
             health: None,
             max_health: None,
             sounds: Vec::new(),
@@ -154,6 +165,8 @@ impl Model {
             self.food = None;
             self.buffs = None;
             self.gather = None;
+            self.gather_dead_handled = None;
+            self.gather_alert_at = None;
             self.health = None;
             self.max_health = None;
             self.position = None;
@@ -349,7 +362,8 @@ impl Model {
             let went_idle = report.source == ActivityCheck::SOURCE
                 && ActivityCheck::is_idle(&report.message)
                 && !ActivityCheck::is_idle(&previous.message)
-                && !self.idle_after_moving;
+                && !self.idle_after_moving
+                && self.gather_alert_at.is_none_or(|t| self.now - t > GATHER_ALERT_QUIETS_IDLE);
             if !turned_red && !went_idle {
                 continue;
             }
@@ -365,7 +379,28 @@ impl Model {
         }
     }
 
+    /// The resource being gathered died (health 0 or fishing timer 0),
+    /// once per resource. Only alerts while still being worked on (hit in
+    /// the last 30s) and with stamina above 20% (user request: below that
+    /// the player rests anyway and the idle / regen alerts say so).
+    fn check_gather_dead(&mut self) {
+        let Some(g) = &self.gather else { return };
+        if self.gather_dead_handled.as_ref() == Some(&g.target) || !g.is_dead(self.now) {
+            return;
+        }
+        self.gather_dead_handled = Some(g.target.clone());
+        let stamina_ok = self.stamina.fraction().is_some_and(|f| f > GATHER_ALERT_STAMINA);
+        if self.is_loading || self.is_offline || !g.is_active(self.now) || !stamina_ok {
+            return;
+        }
+        let body = if g.shows_timer() { format!("{}: time's up", g.name) } else { format!("{} is used up", g.name) };
+        self.notifications.push(Notification { title: "Resource depleted".into(), body });
+        self.sounds.push(Sound::ResourceDepleted);
+        self.gather_alert_at = Some(self.now);
+    }
+
     fn collect_notifications(&mut self) {
+        self.check_gather_dead();
         let completed = self.crafts.take_completed();
         if !completed.is_empty() && !self.is_loading {
             self.sounds.push(Sound::CraftFinished);

@@ -16,6 +16,9 @@ pub enum Sound {
     OutOfFood,
     /// Idle with stamina above 90%: three soft pulses.
     IdleFull,
+    /// The resource being gathered is used up: two low knocks, then a
+    /// higher note.
+    ResourceDepleted,
 }
 
 impl Sound {
@@ -25,6 +28,7 @@ impl Sound {
             Sound::CraftFinished => &[(659.3, 0.0, 0.35), (987.8, 0.12, 0.5)],
             Sound::OutOfFood => &[(784.0, 0.0, 0.25), (523.3, 0.14, 0.35), (784.0, 0.5, 0.25), (523.3, 0.64, 0.4)],
             Sound::IdleFull => &[(587.3, 0.0, 0.18), (587.3, 0.25, 0.18), (880.0, 0.5, 0.35)],
+            Sound::ResourceDepleted => &[(440.0, 0.0, 0.12), (440.0, 0.15, 0.12), (659.3, 0.3, 0.45)],
         }
     }
 

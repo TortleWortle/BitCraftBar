@@ -97,8 +97,11 @@ row when GitHub has a newer release (see Releases), character picker,
   health if the spot has no timer. Shown while the resource was hit in
   the last 30s (`GATHER_WINDOW`, so it doesn't blink between hits; an
   earlier per-action bar was removed for that) and more recently than
-  the last craft progressed. Disappears when the resource is used up
-  (its rows are deleted). Not in the tray label.
+  the last craft progressed. When the resource is used up its rows are
+  deleted; the feed then keeps the last seen state with health 0
+  (`Feed::gather`, `last_gather`), so the bar shows 0% until the 30s
+  window ends and the "Resource depleted" notification fires. Not in the
+  tray label.
 - **Passive crafts section**: grouped by building + item, with running count,
   time until the whole group is done, and how many are ready to collect.
   Running groups first. Not in the label (user didn't ask for it).
@@ -278,6 +281,7 @@ thread. Produced by `Model` (`collect_notifications`,
 | Went idle | Not when it comes straight from "Active" (moving; see Status rules). Activity changes to an idle message (`ActivityCheck::is_idle`: "Idle…", "Craft idle…") from a known non-idle one (e.g. Gaining experience / Resting → Idle: stamina full). Idle → idle (message change) is silent. Same 5 min cooldown. Idle used to be red and notified as an error state; it became orange, and this keeps the notification. |
 | Craft finished | Once per craft, when its relay progress reaches the total. |
 | Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished in the first list are silent. |
+| Resource depleted | User request. The gather target (see Gathering section) dies: **health reaches 0**, or a **fishing spot's timer reaches 0** (`Gather::is_dead`, checked on every update and the 1s tick). Once per resource (`gather_dead_handled`), only while it's still worked on (hit in the last 30s), and **only with stamina above 20%** (`GATHER_ALERT_STAMINA`; below that the player rests anyway and the idle / regen alerts cover it, user request). The went-idle alert in the next 60s is skipped (same news). Sound: see Sounds. |
 | Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first list. |
 
 Connection reports `healthy` when connected (instead of clearing) so a later
@@ -297,12 +301,15 @@ request): play a sound when an active **craft finishes**, when the
 character **runs out of food** (Food report turns red, same 5 min
 cooldown as the notification), and when **idle with stamina above 90%**
 (Activity idle message + stamina > `model::IDLE_SOUND_STAMINA`; once each
-time it becomes true). Each is a checkbox (all off by default), plus a
+time it becomes true), and when the **gathered resource is depleted**
+(user request; with the "Resource depleted" notification, same rules).
+Each is a checkbox (all off by default), plus a
 **volume slider** (20 segments of 5%, click or drag; default 50%) and a
 *Test* button. Stored in `settings.json` (`sounds`).
 
 Sounds are synthesized chimes (`src/sound.rs`, sine notes with decay; no
-sound files): rising two notes = craft finished, falling twice = out of
+sound files): two low knocks + a higher note = resource depleted,
+rising two notes = craft finished, falling twice = out of
 food, three pulses = idle. Played with **rodio** (no default features, so
 no decoders) on a short-lived thread. The model emits `Sound` events
 (`Model::take_sounds`, never while loading); `AppState::flush` plays the

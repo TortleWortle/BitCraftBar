@@ -148,6 +148,8 @@ struct Feed {
     /// When each plant was seen switching to a growing stage (live only).
     growing_since: HashMap<String, f64>,
     growing_ids: HashSet<String>,
+    /// Last gather target seen alive (kept with health 0 once it's gone).
+    last_gather: Option<Gather>,
 }
 
 impl Feed {
@@ -235,12 +237,29 @@ impl Feed {
     /// `experience_per_progress` = [[skill_id, xp], …], and
     /// `resource_growth_timer` = [scheduled_id, scheduled_at (1 = Time),
     /// entity_id, growth_recipe_id] → `resource_growth_recipe_desc` = [id,
-    /// resource_id, time [min, max], …]. None once the resource is gone
-    /// (its rows are deleted) or while its type isn't looked up yet.
-    fn gather(&self) -> Option<Gather> {
+    /// resource_id, time [min, max], …]. A used-up resource's rows are
+    /// deleted: while the player's last hit still points at it, the last
+    /// seen state is kept with health 0 (that's how it "dies"). None while
+    /// its type isn't looked up yet, or for a target this feed never saw
+    /// alive (e.g. right after traveling).
+    fn gather(&mut self) -> Option<Gather> {
         let outcome = self.store.rows("extract_outcome_state").next()?;
         let target = key(outcome.get(1)?);
         let last_hit_at = outcome.get(2).and_then(date)?;
+        match self.live_gather(&target, last_hit_at) {
+            Some(g) => {
+                self.last_gather = Some(g.clone());
+                Some(g)
+            }
+            None => {
+                let last = self.last_gather.as_ref().filter(|g| g.target == target)?;
+                Some(Gather { health: Some(0.0), last_hit_at, ..last.clone() })
+            }
+        }
+    }
+
+    fn live_gather(&self, target: &str, last_hit_at: f64) -> Option<Gather> {
+        let target = target.to_string();
         let resource_id = self.store.get("resource_state", &target)?.get(1).and_then(int)?;
         let desc = self.store.get("resource_desc", &resource_id.to_string())?;
         let skill = self
@@ -258,6 +277,7 @@ impl Feed {
             .and_then(|id| self.store.get("resource_growth_recipe_desc", &id.to_string()))
             .and_then(|r| r.get(2)?.as_array()?.iter().filter_map(Value::as_f64).reduce(f64::max));
         Some(Gather {
+            target: target.clone(),
             name: desc.get(1).and_then(Value::as_str).unwrap_or("Resource").to_string(),
             tier: desc.get(13).and_then(int).filter(|t| *t > 0),
             skill,
@@ -519,6 +539,7 @@ pub async fn run(user: String, region: i64, emit: impl Fn(RegionUpdate)) {
         growth_recipe_ids: BTreeSet::new(),
         growing_since: HashMap::new(),
         growing_ids: HashSet::new(),
+        last_gather: None,
     };
     let mut backoff = Duration::from_secs(1);
     loop {
