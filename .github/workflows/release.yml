@@ -1,11 +1,17 @@
-# Push a tag like `v0.2.0` (matching Cargo.toml `version`) to build and
-# publish a GitHub release for Windows, macOS and Linux. See AGENTS.md
-# "Releases".
+# Builds for Windows, macOS and Linux and publishes a GitHub release. See
+# AGENTS.md "Releases".
+# - Tag push `v0.2.0` (matching Cargo.toml `version`): a normal release.
+# - Nightly (03:00 UTC) or manual run: replaces the `nightly` pre-release,
+#   but only if the default branch changed since the last nightly (manual
+#   runs always build). The update check ignores pre-releases.
 name: Release
 
 on:
   push:
     tags: ["v*"]
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -14,7 +20,49 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      nightly: ${{ steps.check.outputs.nightly }}
+      label: ${{ steps.check.outputs.label }}
+      version: ${{ steps.check.outputs.version }}
+      previous: ${{ steps.check.outputs.previous }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - id: check
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "v$version" != "$GITHUB_REF_NAME" ]; then
+              echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version (the update check compares them; bump Cargo.toml first)"
+              exit 1
+            fi
+            echo "nightly=false" >> "$GITHUB_OUTPUT"
+            echo "label=$version" >> "$GITHUB_OUTPUT"
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Nightly: the `nightly` tag points at the commit of the last one.
+          previous=$(git rev-list -n 1 nightly 2>/dev/null || true)
+          echo "previous=$previous" >> "$GITHUB_OUTPUT"
+          echo "nightly=true" >> "$GITHUB_OUTPUT"
+          echo "label=nightly-$(date -u +%Y%m%d)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_EVENT_NAME" = "schedule" ] && [ "$previous" = "$GITHUB_SHA" ]; then
+            echo "No changes since the last nightly ($previous); skipping."
+            echo "build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -28,18 +76,13 @@ jobs:
           - os: ubuntu-22.04
             name: linux-x64
     runs-on: ${{ matrix.os }}
+    env:
+      # Cargo.toml version (Info.plist); file names use the label
+      # (`0.2.0`, or `nightly-20261125-abc1234`).
+      VERSION: ${{ needs.check.outputs.version }}
+      LABEL: ${{ needs.check.outputs.label }}
     steps:
       - uses: actions/checkout@v5
-
-      - name: Check tag matches Cargo.toml version
-        shell: bash
-        run: |
-          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          if [ "v$version" != "$GITHUB_REF_NAME" ]; then
-            echo "::error::Tag $GITHUB_REF_NAME doesn't match Cargo.toml version $version (the update check compares them; bump Cargo.toml first)"
-            exit 1
-          fi
-          echo "VERSION=$version" >> "$GITHUB_ENV"
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -65,14 +108,14 @@ jobs:
         run: |
           cargo build --release
           New-Item -ItemType Directory dist | Out-Null
-          Compress-Archive -Path target/release/bitcraft-tracker.exe -DestinationPath "dist/bitcraft-tracker-$env:VERSION-${{ matrix.name }}.zip"
+          Compress-Archive -Path target/release/bitcraft-tracker.exe -DestinationPath "dist/bitcraft-tracker-$env:LABEL-${{ matrix.name }}.zip"
 
       - name: Build (Linux)
         if: runner.os == 'Linux'
         run: |
           cargo build --release
           mkdir dist
-          tar -czf "dist/bitcraft-tracker-$VERSION-${{ matrix.name }}.tar.gz" -C target/release bitcraft-tracker
+          tar -czf "dist/bitcraft-tracker-$LABEL-${{ matrix.name }}.tar.gz" -C target/release bitcraft-tracker
 
       - name: Build (macOS .app, universal)
         if: runner.os == 'macOS'
@@ -88,7 +131,7 @@ jobs:
           # Ad-hoc signature (no Apple Developer account): required to run on
           # Apple Silicon, and gives notifications a stable app identity.
           codesign --force --deep --sign - "$app"
-          ditto -c -k --keepParent "$app" "dist/bitcraft-tracker-$VERSION-${{ matrix.name }}.zip"
+          ditto -c -k --keepParent "$app" "dist/bitcraft-tracker-$LABEL-${{ matrix.name }}.zip"
           rm -rf "$app"
 
       - uses: actions/upload-artifact@v4
@@ -97,14 +140,40 @@ jobs:
           path: dist/*
 
   release:
-    needs: build
+    needs: [check, build]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
           merge-multiple: true
+
       - name: Publish release
+        if: needs.check.outputs.nightly != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+
+      - name: Publish nightly (replaces the previous one)
+        if: needs.check.outputs.nightly == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LABEL: ${{ needs.check.outputs.label }}
+          PREVIOUS: ${{ needs.check.outputs.previous }}
+        run: |
+          {
+            echo "Automated build of \`${GITHUB_SHA::7}\` on the default branch. Not a stable release; the in-app update check ignores it."
+            echo
+            if [ -n "$PREVIOUS" ] && [ "$PREVIOUS" != "$GITHUB_SHA" ]; then
+              echo "Changes since the previous nightly (\`${PREVIOUS::7}\`):"
+              echo
+              git log --no-merges --format='- %s (%h)' "$PREVIOUS..$GITHUB_SHA"
+            fi
+          } > notes.md
+          gh release delete nightly --repo "$GITHUB_REPOSITORY" --cleanup-tag --yes || true
+          gh release create nightly dist/* --repo "$GITHUB_REPOSITORY" \
+            --prerelease --target "$GITHUB_SHA" --title "Nightly ($LABEL)" --notes-file notes.md

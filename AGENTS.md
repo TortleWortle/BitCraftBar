@@ -765,6 +765,18 @@ connection. Replaced by the relay (user request).
   - Linux: `.tar.gz` with the binary, built on `ubuntu-22.04` (older
     glibc → runs on more distros). Users need the runtime libs listed
     below.
+  **Nightly** (user request; same workflow): a `schedule` run at 03:00
+  UTC (default branch only, GitHub's rule) or a manual *Run workflow*
+  builds the default branch and replaces the single **`nightly`
+  pre-release** (old release + tag deleted, new one tagged at the built
+  commit). The `check` job skips scheduled runs when the `nightly` tag
+  already points at HEAD (no changes since the last nightly); manual runs
+  always build. Files are named `bitcraft-tracker-nightly-<yyyymmdd>-<sha7>-<platform>`
+  (tag releases keep `bitcraft-tracker-<version>-<platform>`); the macOS
+  `Info.plist` still gets the `Cargo.toml` version. Notes list the commits
+  since the previous nightly. The update check uses `releases/latest`,
+  which **excludes pre-releases**, so nightlies never show as "Update
+  available".
   Repository: `TortleWortle/BitCraftBar` (`Cargo.toml` `repository`).
 - **Vendored `xattr` patch** (`vendor/xattr`, `[patch.crates-io]`): gpui
   0.2.2 → `zed-async-tar` → `xattr 0.2.3` uses `libc::ENOATTR`, which
