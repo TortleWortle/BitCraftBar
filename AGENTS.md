@@ -85,6 +85,20 @@ row when GitHub has a newer release (see Releases), character picker,
   estimated), then separate rows for *Needs fertilizer*, *Needs water* and
   *Ready to harvest* with per-tier counts (user asked for growing-only in the
   tracker and the needs shown separately).
+- **Gathering section** (user request; above Crafts, only while
+  gathering): the resource last hit (`Model::active_gather`) like a craft
+  row: name, value, green bar (`ui::GATHER_RGB`), and "skill · tier ·
+  health / max" below. **Forestry, foraging, mining** (and anything else
+  extracted): the resource's **health left** in percent (rounded up).
+  **Fishing**: the spot's **in-game timer** instead (user's choice; e.g.
+  a baited lake school turns dormant after 400–500s, a frenzied ocean
+  school after 900s), as time left (`duration_string`: minutes, seconds
+  only under a minute), bar = time left / the timer's catalog duration;
+  health if the spot has no timer. Shown while the resource was hit in
+  the last 30s (`GATHER_WINDOW`, so it doesn't blink between hits; an
+  earlier per-action bar was removed for that) and more recently than
+  the last craft progressed. Disappears when the resource is used up
+  (its rows are deleted). Not in the tray label.
 - **Passive crafts section**: grouped by building + item, with running count,
   time until the whole group is done, and how many are ready to collect.
   Running groups first. Not in the label (user didn't ask for it).
@@ -144,7 +158,11 @@ the default. Never takes focus. Content:
 - header: overall status dot, character name, ✕ (closes it);
 - status line: the worst issue, or the Activity message when all is well,
   with the last skill; the current craft (active, else the last worked on)
-  with percent and bar (hidden offline);
+  with percent and bar, or, while gathering and more recent than the
+  craft, the gather target (same rule as the popup's Gathering section):
+  name + health %, and a 16px green `labeled_bar` with `health / max`
+  inside (user request, like stamina/health/food; a fishing timer shows
+  its time left inside instead); hidden offline;
 - bars (16px, value centered **inside** the bar, user request;
   `info::labeled_bar`): stamina (`current / max`, popup colors),
   **health** (relay `health_state`, max = stats value 0; pink, orange at
@@ -524,6 +542,22 @@ game token was rejected: account risk, and the relay has the same data.
   chunk_index, timestamp, location_x, location_z, destination_x,
   destination_z, dimension, is_walking, …]; location changes → "Active"
   (see Status rules). Player region, like the other player rows.
+- **Gather target** (`Feed::gather`, player region): `extract_outcome_state`
+  = [entity_id, target_entity_id, last_timestamp, damage, is_crit]
+  (updated per hit; verified while chopping: −30 health per hit every
+  ~1.3s). Joined on the target: `resource_state` = [entity_id,
+  resource_id, direction], `resource_health_state` = [entity_id, health],
+  `resource_growth_timer` = [scheduled_id, scheduled_at (1 = Time),
+  entity_id, growth_recipe_id] (public; the in-game timer some resources
+  show, `resource_desc.show_time_left`). Second lookup round by resource
+  id: `resource_desc` (name 1, max_health 4, tier 13, tag 14) and
+  `extraction_recipe_desc WHERE resource_id = …` (column 15
+  `experience_per_progress` = [[skill_id, xp]]: the skill; fish schools →
+  12 Fishing, Young Beech Tree → 2 Forestry); by growth recipe id:
+  `resource_growth_recipe_desc` = [id, resource_id, time [min, max],
+  grown_resource_id, …]. A used-up resource's rows disappear
+  (`resource_depleted_event` isn't replicated). `player_action_state`
+  isn't used (see Known limitations).
 - **Active crafts** (`Feed::crafts`): `progressive_action_state` (owner
   filter) = [entity_id, building_entity_id, function_type, progress,
   recipe_id, craft_count, last_crit_outcome, owner, lock_expiration,
@@ -701,10 +735,9 @@ connection. Replaced by the relay (user request).
   Craft = 20, …), layer (Base / UpperBody), …]. Between actions the row
   goes idle, so it blinked on and off with every gather (an empty bar in
   between didn't help enough). start_time/duration units differ per row
-  (seen: Base start in µs, UpperBody in ms). Gather target health was
-  also explored for it: `extract_outcome_state` (player → last
-  `target_entity_id`), `resource_health_state` (entity_id, health),
-  `resource_state` → `resource_desc.max_health`; a used-up resource's
+  (seen: Base start in µs, UpperBody in ms). The gather bar that came
+  later (see Gathering section) uses the target resource instead, held
+  for 30s after the last hit, so it doesn't blink.
   rows disappear. `resource_depleted_event` isn't replicated by the relay.
 
 - **Food via REST** (`players/<id>/buffs`) was tried in the Swift app and

@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::core::types::{CraftInfo, FoodBuffDesc, PassiveCraft, Plant, PlayerSummary, Position, RawBuff};
+use crate::core::types::{CraftInfo, FoodBuffDesc, Gather, PassiveCraft, Plant, PlayerSummary, Position, RawBuff};
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -86,6 +86,8 @@ pub struct RelayPlayer {
     pub health: Option<f64>,
     /// `mobile_entity_state` location (x, z), for "moved recently".
     pub position: Option<Position>,
+    /// The resource last hit (`extract_outcome_state` target).
+    pub gather: Option<Gather>,
 }
 
 pub enum Outgoing {
@@ -285,6 +287,7 @@ async fn relay_hub(user: String, mut commands: mpsc::UnboundedReceiver<HubComman
                 stats: d.stats.clone(),
                 health: d.health,
                 position: d.position,
+                gather: d.gather.clone(),
             })
         });
         if player_info != last_player {

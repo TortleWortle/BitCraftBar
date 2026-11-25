@@ -228,7 +228,19 @@ fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
         .or_else(|| reports.iter().find(|r| r.source == ActivityCheck::SOURCE))
         .cloned();
     let skill = (!m.is_offline).then(|| m.experience.last_skill_name()).flatten();
-    let craft = if m.is_offline { None } else { m.active_craft().or_else(|| m.crafts.last_worked.clone()) };
+    // (name, (fraction, "39%" / time left), "1,155 / 3,000" for health).
+    let gather = m.active_gather().and_then(|g| {
+        let inside = match (g.shows_timer(), g.health, g.max_health) {
+            (false, Some(h), Some(max)) => {
+                Some(format!("{} / {}", crate::ui::group_thousands(h as i64), crate::ui::group_thousands(max as i64)))
+            }
+            _ => None,
+        };
+        Some((g.name.clone(), g.bar(m.now)?, inside))
+    });
+    // Gathering (tree/ore health, fishing spot time) replaces the craft
+    // while it's the latest thing the player did.
+    let craft = if m.is_offline || gather.is_some() { None } else { m.active_craft().or_else(|| m.crafts.last_worked.clone()) };
     div()
         .flex()
         .flex_col()
@@ -256,6 +268,27 @@ fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
                         .child(div().flex_none().child(c.percent_string())),
                 )
                 .child(div().flex().child(bar(c.fraction(), gpui::rgb(0x0a84ff), theme)))
+        }))
+        .children(gather.map(|(name, (fraction, text), inside)| {
+            // Value inside the bar like stamina/health/food (user request):
+            // "health / max", or a fishing spot's time left; the percent
+            // stays next to the name.
+            let (right, inside) = match inside {
+                Some(inside) => (Some(text), inside),
+                None => (None, text),
+            };
+            div()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().flex_1().child(name))
+                        .children(right.map(|r| div().flex_none().child(r))),
+                )
+                .child(div().flex().child(labeled_bar(fraction, gpui::rgb(crate::ui::GATHER_RGB), inside, theme.text, theme)))
         }))
 }
 

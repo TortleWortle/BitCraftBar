@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::RelayState;
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{CraftInfo, FoodBuffDesc, PassiveCraft, Plant, Position, RawBuff, now};
+use crate::core::types::{CraftInfo, FoodBuffDesc, Gather, PassiveCraft, Plant, Position, RawBuff, now};
 
 const HOST: &str = "relay.bitcraftsync.app";
 /// Each region is its own relay instance on port `PORT_BASE + region`.
@@ -141,6 +141,10 @@ struct Feed {
     store: Store,
     item_ids: BTreeSet<i64>,
     building_desc_ids: BTreeSet<i64>,
+    /// Gather target lookups: `resource_desc` + `extraction_recipe_desc`
+    /// by resource id, `resource_growth_recipe_desc` by id.
+    resource_ids: BTreeSet<i64>,
+    growth_recipe_ids: BTreeSet<i64>,
     /// When each plant was seen switching to a growing stage (live only).
     growing_since: HashMap<String, f64>,
     growing_ids: HashSet<String>,
@@ -177,10 +181,20 @@ impl Feed {
         q.push(format!("SELECT * FROM stamina_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM satiation_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM player_username_state WHERE entity_id = {u}"));
+        // Gather target (last resource hit): health, type, in-game timer.
+        q.push(format!("SELECT * FROM extract_outcome_state WHERE entity_id = {u}"));
+        for table in ["resource_state", "resource_health_state", "resource_growth_timer"] {
+            q.push(format!("SELECT {table}.* FROM {table} JOIN extract_outcome_state ON {table}.entity_id = extract_outcome_state.target_entity_id WHERE extract_outcome_state.entity_id = {u}"));
+        }
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
         q.extend(self.building_desc_ids.iter().map(|id| format!("SELECT * FROM building_desc WHERE id = {id}")));
+        for id in &self.resource_ids {
+            q.push(format!("SELECT * FROM resource_desc WHERE id = {id}"));
+            q.push(format!("SELECT * FROM extraction_recipe_desc WHERE resource_id = {id}"));
+        }
+        q.extend(self.growth_recipe_ids.iter().map(|id| format!("SELECT * FROM resource_growth_recipe_desc WHERE id = {id}")));
         q
     }
 
@@ -189,18 +203,70 @@ impl Feed {
         Message::text(json!({"Subscribe": {"query_strings": self.queries(), "request_id": 1}}).to_string())
     }
 
-    /// Item names (recipe "Weave {0}") and building names need a second
-    /// lookup. True if new ids were added (→ re-subscribe).
+    /// Item names (recipe "Weave {0}"), building names and gather target
+    /// types need a second lookup. True if new ids were added
+    /// (→ re-subscribe). Only ever grows (a few ids per resource type).
     fn add_missing_lookups(&mut self) -> bool {
         let items: BTreeSet<i64> = self.store.rows("crafting_recipe_desc").filter_map(|r| crafted_item_id(r)).collect();
         let buildings: BTreeSet<i64> =
             self.store.rows("building_state").filter_map(|r| r.get(3).and_then(int)).collect();
-        if items.is_subset(&self.item_ids) && buildings.is_subset(&self.building_desc_ids) {
+        let resources: BTreeSet<i64> = self.store.rows("resource_state").filter_map(|r| r.get(1).and_then(int)).collect();
+        let growth: BTreeSet<i64> = self.store.rows("resource_growth_timer").filter_map(|r| r.get(3).and_then(int)).collect();
+        if items.is_subset(&self.item_ids)
+            && buildings.is_subset(&self.building_desc_ids)
+            && resources.is_subset(&self.resource_ids)
+            && growth.is_subset(&self.growth_recipe_ids)
+        {
             return false;
         }
         self.item_ids.extend(items);
         self.building_desc_ids.extend(buildings);
+        self.resource_ids.extend(resources);
+        self.growth_recipe_ids.extend(growth);
         true
+    }
+
+    /// The resource last hit: `extract_outcome_state` = [entity_id,
+    /// target_entity_id, last_timestamp, damage, is_crit] → target's
+    /// `resource_state` = [entity_id, resource_id, direction],
+    /// `resource_health_state` = [entity_id, health], `resource_desc` =
+    /// [id, name, …, max_health (4), …, tier (13), tag (14), …],
+    /// `extraction_recipe_desc` (by resource_id, column 1) column 15
+    /// `experience_per_progress` = [[skill_id, xp], …], and
+    /// `resource_growth_timer` = [scheduled_id, scheduled_at (1 = Time),
+    /// entity_id, growth_recipe_id] → `resource_growth_recipe_desc` = [id,
+    /// resource_id, time [min, max], …]. None once the resource is gone
+    /// (its rows are deleted) or while its type isn't looked up yet.
+    fn gather(&self) -> Option<Gather> {
+        let outcome = self.store.rows("extract_outcome_state").next()?;
+        let target = key(outcome.get(1)?);
+        let last_hit_at = outcome.get(2).and_then(date)?;
+        let resource_id = self.store.get("resource_state", &target)?.get(1).and_then(int)?;
+        let desc = self.store.get("resource_desc", &resource_id.to_string())?;
+        let skill = self
+            .store
+            .rows("extraction_recipe_desc")
+            .find(|r| r.get(1).and_then(int) == Some(resource_id))
+            .and_then(|r| r.get(15)?.as_array()?.first()?.as_array()?.first().and_then(int));
+        let timer = self.store.rows("resource_growth_timer").find(|t| t.get(2).map(key).as_deref() == Some(target.as_str()));
+        let ends_at = timer.and_then(|t| {
+            let at = t.get(1)?.as_array()?;
+            (at.first().and_then(int) == Some(1)).then(|| at.get(1).and_then(date)).flatten()
+        });
+        let timer_duration = timer
+            .and_then(|t| t.get(3).and_then(int))
+            .and_then(|id| self.store.get("resource_growth_recipe_desc", &id.to_string()))
+            .and_then(|r| r.get(2)?.as_array()?.iter().filter_map(Value::as_f64).reduce(f64::max));
+        Some(Gather {
+            name: desc.get(1).and_then(Value::as_str).unwrap_or("Resource").to_string(),
+            tier: desc.get(13).and_then(int).filter(|t| *t > 0),
+            skill,
+            health: self.store.get("resource_health_state", &target).and_then(|h| h.get(1)?.as_f64()),
+            max_health: desc.get(4).and_then(Value::as_f64),
+            ends_at,
+            timer_duration,
+            last_hit_at,
+        })
     }
 
     /// Started buffs: `active_buff_state.active_buffs[]` =
@@ -428,6 +494,7 @@ pub struct RegionData {
     pub stamina: Option<f64>,
     pub satiation: Option<f64>,
     pub username: Option<String>,
+    pub gather: Option<Gather>,
 }
 
 pub enum RegionUpdate {
@@ -448,6 +515,8 @@ pub async fn run(user: String, region: i64, emit: impl Fn(RegionUpdate)) {
         store: Store::default(),
         item_ids: BTreeSet::new(),
         building_desc_ids: BTreeSet::new(),
+        resource_ids: BTreeSet::new(),
+        growth_recipe_ids: BTreeSet::new(),
         growing_since: HashMap::new(),
         growing_ids: HashSet::new(),
     };
@@ -570,6 +639,7 @@ async fn session(
                     stamina: feed.stamina(),
                     satiation: feed.satiation(),
                     username: feed.username(),
+                    gather: feed.gather(),
                 }));
             },
             _ = ping.tick() => {

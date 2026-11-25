@@ -9,7 +9,7 @@ use crate::core::trackers::{
     ActivityCheck, Craft, CraftTracker, ExperienceTracker, PassiveCraftTracker, PlantTracker, SatiationTracker,
     StaminaTracker,
 };
-use crate::core::types::{FoodBuffDesc, FoodState, PlayerSummary, Position, RawBuff, now};
+use crate::core::types::{FoodBuffDesc, FoodState, Gather, PlayerSummary, Position, RawBuff, now};
 use crate::sound::Sound;
 use crate::net::{Command, NetEvent, RelayPlayer, RelayState};
 use crate::settings::Settings;
@@ -43,6 +43,8 @@ pub struct Model {
     /// Started buffs, turned into `food` with the food buff types.
     buffs: Option<Vec<RawBuff>>,
     food_descs: HashMap<i64, FoodBuffDesc>,
+    /// The resource last hit (tree, ore, fish school, …).
+    pub gather: Option<Gather>,
     /// Relay only (`health_state`, max = stats value 0).
     pub health: Option<f64>,
     pub max_health: Option<f64>,
@@ -86,6 +88,7 @@ impl Model {
             food: None,
             buffs: None,
             food_descs: HashMap::new(),
+            gather: None,
             health: None,
             max_health: None,
             sounds: Vec::new(),
@@ -128,6 +131,15 @@ impl Model {
         self.crafts.active(self.now)
     }
 
+    /// The resource being gathered: hit in the last 30s, online, and more
+    /// recent than the last craft progress (whichever the player did last
+    /// is what the info window shows).
+    pub fn active_gather(&self) -> Option<&Gather> {
+        let gather = self.gather.as_ref().filter(|g| !self.is_offline && g.is_active(self.now) && g.bar(self.now).is_some())?;
+        let craft_at = self.crafts.last_worked.as_ref().and_then(|c| c.last_progress_at);
+        craft_at.is_none_or(|t| gather.last_hit_at >= t).then_some(gather)
+    }
+
     /// Switch to another character (from the search).
     pub fn select_player(&mut self, player: &PlayerSummary) {
         self.settings.username = Some(player.username.clone());
@@ -141,6 +153,7 @@ impl Model {
             self.passive = PassiveCraftTracker::default();
             self.food = None;
             self.buffs = None;
+            self.gather = None;
             self.health = None;
             self.max_health = None;
             self.position = None;
@@ -183,6 +196,7 @@ impl Model {
                     self.apply_stats(values);
                 }
                 self.health = player.as_ref().and_then(|p| p.health);
+                self.gather = player.as_ref().and_then(|p| p.gather.clone());
                 if let Some(position) = player.as_ref().and_then(|p| p.position) {
                     self.update_position(position, now);
                 }

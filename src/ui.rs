@@ -13,7 +13,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use crate::core::badges::{self, Badge, BadgeState};
 use crate::core::status::{HealthStatus, food_rgb, stamina_rgb};
 use crate::core::trackers::{Craft, TierSummary};
-use crate::core::types::PlayerSummary;
+use crate::core::skill::Skill;
+use crate::core::types::{Gather, PlayerSummary};
 use crate::model::Model;
 use crate::net::{Command, Outgoing, RelayState};
 use crate::notifier;
@@ -184,8 +185,11 @@ impl AppState {
                 )),
             );
             let texts = |list: Vec<Badge>| list.iter().map(|b| format!("{}:{:?} ({})", b.text(), b.state, b.tooltip(m.now))).collect::<Vec<_>>().join(", ");
+            let gather = m.active_gather().map_or("-".to_string(), |g| {
+                format!("{} skill {:?} {:?} {:?}/{:?}", g.name, g.skill, g.bar(m.now).map(|b| b.1), g.health, g.max_health)
+            });
             let line = format!(
-                "{line} | badges plants [{}] passive [{}] crafts [{}]",
+                "{line} | gather {gather} | badges plants [{}] passive [{}] crafts [{}]",
                 texts(badges::plants(&m.plants.plants)),
                 texts(badges::passive(&m.passive.crafts, m.now)),
                 texts(badges::crafts(&m.crafts.sorted(), m.now, m.crafts.active_window)),
@@ -352,6 +356,10 @@ pub use crate::core::types::duration_string;
 pub(crate) fn dot(color: impl Into<Hsla>, size: f32) -> impl IntoElement {
     div().size(px(size)).flex_none().rounded_full().bg(color.into())
 }
+
+/// Gather bar (resource health / fishing spot time): green, so it reads
+/// differently from the blue craft bar.
+pub(crate) const GATHER_RGB: u32 = 0x34c759;
 
 pub(crate) fn bar(fraction: f64, color: Rgba, theme: Theme) -> impl IntoElement {
     div()
@@ -534,6 +542,10 @@ impl Render for Panel {
             } else if !m.passive.crafts.is_empty() {
                 body.push(divider(theme).into_any_element());
                 body.push(self.passive(m, theme).into_any_element());
+            }
+            if let Some(gather) = m.active_gather() {
+                body.push(divider(theme).into_any_element());
+                body.push(self.gathering(gather, m.now, theme).into_any_element());
             }
             let crafts = m.crafts.sorted();
             if !crafts.is_empty() {
@@ -945,6 +957,43 @@ impl Panel {
                     .child(div().text_xs().text_color(theme.secondary).child(detail.join(" · ")))
             },
         ))
+    }
+
+    /// The resource being gathered, like a craft row: name, value (health
+    /// %, or a fishing spot's time left), bar, and the details below.
+    fn gathering(&self, g: &Gather, now: f64, theme: Theme) -> impl IntoElement {
+        let (fraction, text) = g.bar(now).unwrap_or((0.0, String::new()));
+        let mut details: Vec<String> = Vec::new();
+        if let Some(skill) = g.skill.map(Skill::name_for) {
+            details.push(skill);
+        }
+        if let Some(t) = g.tier {
+            details.push(format!("T{t}"));
+        }
+        if let (Some(h), Some(max)) = (g.health, g.max_health) {
+            details.push(format!("{} / {}", group_thousands(h as i64), group_thousands(max as i64)));
+        }
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_title("Gathering"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_0p5()
+                    .child(
+                        div()
+                            .flex()
+                            .gap_2()
+                            .child(div().font_weight(FontWeight::MEDIUM).child(g.name.clone()))
+                            .child(div().flex_1())
+                            .child(text),
+                    )
+                    .child(div().flex().child(bar(fraction, rgb(GATHER_RGB), theme)))
+                    .child(div().text_xs().text_color(theme.secondary).child(details.join(" · "))),
+            )
     }
 
     fn crafts(&self, crafts: &[Craft], m: &Model, theme: Theme) -> impl IntoElement {

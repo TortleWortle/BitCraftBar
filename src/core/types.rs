@@ -215,3 +215,86 @@ pub fn duration_string(seconds: f64) -> String {
         format!("{s}s")
     }
 }
+
+/// How long after the last hit a gather target still shows (hits come
+/// every ~1–2s; a bar that blinks between them was "flickery" before).
+pub const GATHER_WINDOW: f64 = 30.0;
+
+/// The resource the player is gathering (relay `extract_outcome_state`
+/// target): tree, plant, ore, fish school, …
+#[derive(Clone, Debug, PartialEq)]
+pub struct Gather {
+    /// `resource_desc.name`, e.g. "Young Beech Tree".
+    pub name: String,
+    pub tier: Option<i64>,
+    /// Skill its extraction recipe trains (`Skill` id).
+    pub skill: Option<i64>,
+    pub health: Option<f64>,
+    pub max_health: Option<f64>,
+    /// End of the resource's in-game timer (`resource_growth_timer`), e.g.
+    /// a baited fish school turning dormant.
+    pub ends_at: Option<f64>,
+    /// That timer's catalog duration (max), for the bar.
+    pub timer_duration: Option<f64>,
+    pub last_hit_at: f64,
+}
+
+impl Gather {
+    pub fn is_active(&self, now: f64) -> bool {
+        now - self.last_hit_at <= GATHER_WINDOW
+    }
+
+    /// Bar fill and text: fishing shows the spot's time left (user
+    /// request), everything else the resource's health left in percent
+    /// (rounded up, so it never shows 0% before it's gone).
+    /// Fishing with an in-game timer: the bar shows time left, not health.
+    pub fn shows_timer(&self) -> bool {
+        self.skill == Some(super::skill::Skill::Fishing as i64) && self.ends_at.is_some()
+    }
+
+    pub fn bar(&self, now: f64) -> Option<(f64, String)> {
+        if self.shows_timer()
+            && let Some(end) = self.ends_at
+        {
+            let left = (end - now).max(0.0);
+            let total = self.timer_duration.unwrap_or(left).max(left);
+            let fraction = if total > 0.0 { left / total } else { 0.0 };
+            return Some((fraction, duration_string(left)));
+        }
+        let (health, max) = (self.health?, self.max_health.filter(|m| *m > 0.0)?);
+        let fraction = (health / max).clamp(0.0, 1.0);
+        Some((fraction, format!("{}%", (fraction * 100.0).ceil() as i64)))
+    }
+}
+
+#[cfg(test)]
+mod gather_tests {
+    use super::*;
+
+    fn gather(skill: i64) -> Gather {
+        Gather {
+            name: "Young Beech Tree".into(),
+            tier: Some(1),
+            skill: Some(skill),
+            health: Some(2640.0),
+            max_health: Some(3000.0),
+            ends_at: Some(1250.0),
+            timer_duration: Some(500.0),
+            last_hit_at: 1000.0,
+        }
+    }
+
+    #[test]
+    fn health_bar_and_fishing_timer() {
+        // Forestry: health left, timer ignored.
+        assert_eq!(gather(2).bar(1000.0), Some((0.88, "88%".into())));
+        // Fishing: the spot's time left (4m 10s → "5m"; seconds under 1m).
+        assert_eq!(gather(12).bar(1000.0), Some((0.5, "5m".into())));
+        assert_eq!(gather(12).bar(1208.0), Some((42.0 / 500.0, "42s".into())));
+        // Fishing spot without a timer: health.
+        let mut no_timer = gather(12);
+        no_timer.ends_at = None;
+        assert_eq!(no_timer.bar(1000.0).map(|b| b.1), Some("88%".into()));
+        assert!(gather(2).is_active(1030.0) && !gather(2).is_active(1031.0));
+    }
+}
