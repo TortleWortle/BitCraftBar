@@ -30,13 +30,14 @@ pub struct SoundSettings {
     pub out_of_food: bool,
     pub idle_full: bool,
     pub resource_depleted: bool,
+    pub trade_request: bool,
     /// 0–1.
     pub volume: f32,
 }
 
 impl Default for SoundSettings {
     fn default() -> Self {
-        Self { craft_finished: false, out_of_food: false, idle_full: false, resource_depleted: false, volume: 0.5 }
+        Self { craft_finished: false, out_of_food: false, idle_full: false, resource_depleted: false, trade_request: false, volume: 0.5 }
     }
 }
 

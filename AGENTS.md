@@ -282,6 +282,7 @@ thread. Produced by `Model` (`collect_notifications`,
 | Craft finished | Once per craft, when its relay progress reaches the total. |
 | Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished in the first list are silent. |
 | Resource depleted | User request. The gather target (see Gathering section) dies: **health reaches 0**, or a **fishing spot's timer reaches 0** (`Gather::is_dead`, checked on every update and the 1s tick). Once per resource (`gather_dead_handled`), only while it's still worked on (hit in the last 30s), and **only with stamina above 20%** (`GATHER_ALERT_STAMINA`; below that the player rests anyway and the idle / regen alerts cover it, user request). The went-idle alert in the next 60s is skipped (same news). Sound: see Sounds. |
+| Trade request | User request. Another player starts a trade with the character: a new `trade_session_state` row with the character as acceptor and status `sessionOffered`. "Trade request — <name> wants to trade" (initiator's `player_username_state`, "A player" until known). Once per session; sessions already open in the first list (app start, character switch) are silent. Sound: see Sounds. **Unverified live** (no trade happened while building it; the query is accepted). |
 | Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first list. |
 
 Connection reports `healthy` when connected (instead of clearing) so a later
@@ -302,13 +303,16 @@ character **runs out of food** (Food report turns red, same 5 min
 cooldown as the notification), and when **idle with stamina above 90%**
 (Activity idle message + stamina > `model::IDLE_SOUND_STAMINA`; once each
 time it becomes true), and when the **gathered resource is depleted**
-(user request; with the "Resource depleted" notification, same rules).
+(user request; with the "Resource depleted" notification, same rules),
+and when **another player starts a trade** (user request; with the
+"Trade request" notification).
 Each is a checkbox (all off by default), plus a
 **volume slider** (20 segments of 5%, click or drag; default 50%) and a
 *Test* button. Stored in `settings.json` (`sounds`).
 
 Sounds are synthesized chimes (`src/sound.rs`, sine notes with decay; no
 sound files): two low knocks + a higher note = resource depleted,
+three quick rising notes = trade request,
 rising two notes = craft finished, falling twice = out of
 food, three pulses = idle. Played with **rodio** (no default features, so
 no decoders) on a short-lived thread. The model emits `Sound` events
@@ -603,6 +607,15 @@ game token was rejected: account risk, and the relay has the same data.
   `building_state` → `building_desc` (names; second lookup round),
   `placeable_state` (owner, placeable_id) → `placeable_desc` (name, tag,
   tier).
+- **Trade offers** (`Feed::trade_offers`, fixed query, all regions,
+  merged by id): `trade_session_state WHERE acceptor_entity_id = <player>`
+  = [entity_id, status (0 sessionOffered, 1 sessionAccepted,
+  2 initiatorAccepted, 3 acceptorAccepted, 4 sessionResolved),
+  initiator_entity_id, acceptor_entity_id, initiator_offer,
+  acceptor_offer, updated_at, resolution_message]; status 0 = offered.
+  The initiator's name is a lookup (`player_username_state WHERE
+  entity_id = …`), so `Feed::username` reads the character's own row by
+  id. The hub sends `NetEvent::TradeOffers` on change.
 - **Plant growth** (`Feed::plants`): `placeable_growth_timer` =
   [scheduled_id, scheduled_at (sum: 0 Interval, **1 Time** = growth end),
   entity_id (the plant), growth_recipe_id] is public and gives the

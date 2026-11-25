@@ -13,7 +13,7 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-use crate::core::types::{CraftInfo, FoodBuffDesc, Gather, PassiveCraft, Plant, PlayerSummary, Position, RawBuff};
+use crate::core::types::{CraftInfo, FoodBuffDesc, Gather, PassiveCraft, Plant, PlayerSummary, Position, RawBuff, TradeOffer};
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -48,6 +48,8 @@ pub enum NetEvent {
     /// The player's own rows (region the player is in). None: no region
     /// has them.
     RelayPlayer(Option<RelayPlayer>),
+    /// Open trade offers to the character (all regions), on change.
+    TradeOffers(Vec<TradeOffer>),
 }
 
 /// Relay `active_buff_state.active_buffs` (`[buff_id, [start (Unix s)],
@@ -219,6 +221,7 @@ async fn relay_hub(user: String, mut commands: mpsc::UnboundedReceiver<HubComman
     let mut last_xp: Option<Vec<(i64, i64)>> = None;
     let mut last_stamina: Option<f64> = None;
     let mut last_satiation: Option<f64> = None;
+    let mut last_trades: Option<Vec<TradeOffer>> = None;
     let mut loaded = false;
     loop {
         let mut data_changed = false;
@@ -311,6 +314,14 @@ async fn relay_hub(user: String, mut commands: mpsc::UnboundedReceiver<HubComman
                 emit(NetEvent::RelayBuffs(d.buffs.clone()));
                 last_buffs = Some(d.buffs.clone());
             }
+        }
+        // Sessions live in the region the players are in; merged, by id.
+        let mut trades: Vec<TradeOffer> = data.values().flat_map(|d| d.trades.clone()).collect();
+        trades.sort_by(|a, b| a.id.cmp(&b.id));
+        trades.dedup_by(|a, b| a.id == b.id);
+        if last_trades.as_ref() != Some(&trades) {
+            emit(NetEvent::TradeOffers(trades.clone()));
+            last_trades = Some(trades);
         }
         let descs: HashMap<i64, FoodBuffDesc> = data.values().flat_map(|d| d.food_descs.clone()).collect();
         if !descs.is_empty() && descs != last_descs {

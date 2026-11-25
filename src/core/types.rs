@@ -216,6 +216,16 @@ pub fn duration_string(seconds: f64) -> String {
     }
 }
 
+/// Another player offering the character a trade (relay
+/// `trade_session_state`, status `sessionOffered`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct TradeOffer {
+    /// The session's entity id.
+    pub id: String,
+    /// The initiator's username, once looked up.
+    pub from: Option<String>,
+}
+
 /// How long after the last hit a gather target still shows (hits come
 /// every ~1–2s; a bar that blinks between them was "flickery" before).
 pub const GATHER_WINDOW: f64 = 30.0;

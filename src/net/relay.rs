@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use super::RelayState;
 use crate::core::trackers::PassiveCraftTracker;
-use crate::core::types::{CraftInfo, FoodBuffDesc, Gather, PassiveCraft, Plant, Position, RawBuff, now};
+use crate::core::types::{CraftInfo, FoodBuffDesc, Gather, PassiveCraft, Plant, Position, RawBuff, TradeOffer, now};
 
 const HOST: &str = "relay.bitcraftsync.app";
 /// Each region is its own relay instance on port `PORT_BASE + region`.
@@ -209,6 +209,8 @@ impl Feed {
         for table in ["resource_state", "resource_health_state", "resource_growth_timer"] {
             q.push(format!("SELECT {table}.* FROM {table} JOIN extract_outcome_state ON {table}.entity_id = extract_outcome_state.target_entity_id WHERE extract_outcome_state.entity_id = {u}"));
         }
+        // Trades other players start with the character.
+        q.push(format!("SELECT * FROM trade_session_state WHERE acceptor_entity_id = {u}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q
@@ -233,6 +235,12 @@ impl Feed {
         }
         for id in self.store.rows("resource_growth_timer").filter_map(|r| r.get(3).and_then(int)) {
             q.insert(format!("SELECT * FROM resource_growth_recipe_desc WHERE id = {id}"));
+        }
+        // Trade partner names.
+        for row in self.store.rows("trade_session_state") {
+            if let Some(id) = row.get(2).and_then(int) {
+                q.insert(format!("SELECT * FROM player_username_state WHERE entity_id = {id}"));
+            }
         }
         q
     }
@@ -413,8 +421,28 @@ impl Feed {
     }
 
     /// `player_username_state` = [entity_id, username].
+    /// (By id: trade partners' names are in the same table.)
     fn username(&self) -> Option<String> {
-        self.store.rows("player_username_state").next()?.get(1)?.as_str().map(str::to_string)
+        self.store.get("player_username_state", &self.user)?.get(1)?.as_str().map(str::to_string)
+    }
+
+    /// Trades offered to the character: `trade_session_state` = [entity_id,
+    /// status (0 sessionOffered, 1 sessionAccepted, 2 initiatorAccepted,
+    /// 3 acceptorAccepted, 4 sessionResolved), initiator_entity_id,
+    /// acceptor_entity_id, initiator_offer, acceptor_offer, updated_at,
+    /// resolution_message]; only status 0. Name via `player_username_state`.
+    fn trade_offers(&self) -> Vec<TradeOffer> {
+        self.store
+            .rows("trade_session_state")
+            .filter(|r| r.get(1).and_then(tag) == Some(0))
+            .map(|r| TradeOffer {
+                id: key(&r[0]),
+                from: r
+                    .get(2)
+                    .and_then(|i| self.store.get("player_username_state", &key(i)))
+                    .and_then(|u| u.get(1)?.as_str().map(str::to_string)),
+            })
+            .collect()
     }
 
     /// Building name via `building_state` → `building_desc`.
@@ -569,6 +597,7 @@ pub struct RegionData {
     pub satiation: Option<f64>,
     pub username: Option<String>,
     pub gather: Option<Gather>,
+    pub trades: Vec<TradeOffer>,
 }
 
 pub enum RegionUpdate {
@@ -717,6 +746,7 @@ async fn session(
                     satiation: feed.satiation(),
                     username: feed.username(),
                     gather: feed.gather(),
+                    trades: feed.trade_offers(),
                 }));
                 first_data = false;
             },
@@ -801,6 +831,26 @@ mod tests {
         feed.store.apply(&[update("resource_state", &["[102, 19, 0]"], &[])]);
         assert_eq!(sent(feed.sync_lookups()).len(), 2);
         assert!(feed.lookups.is_empty() && feed.pending.is_empty());
+    }
+
+    #[test]
+    fn trade_offers_with_initiator_name() {
+        let mut feed = Feed::new("7".into());
+        feed.store.apply(&[
+            update("trade_session_state", &[], &[
+                // Offered by 9 (status 0) and an already accepted one (1).
+                "[500, [0, {}], 9, 7, [], [], [1700000000000000], \"\"]",
+                "[501, [1, {}], 8, 7, [], [], [1700000000000000], \"\"]",
+            ]),
+            update("player_username_state", &[], &["[9, \"Trader\"]", "[7, \"Me\"]"]),
+        ]);
+        assert_eq!(feed.trade_offers(), vec![TradeOffer { id: "500".into(), from: Some("Trader".into()) }]);
+        // The character's own name isn't confused with the partner's.
+        assert_eq!(feed.username().as_deref(), Some("Me"));
+        // Both partners' names are looked up.
+        let wanted = feed.wanted_lookups();
+        assert!(wanted.contains("SELECT * FROM player_username_state WHERE entity_id = 9"));
+        assert!(wanted.contains("SELECT * FROM player_username_state WHERE entity_id = 8"));
     }
 
     #[test]

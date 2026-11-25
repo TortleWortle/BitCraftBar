@@ -54,6 +54,8 @@ pub struct Model {
     /// Gather target whose death was handled (alerted or skipped).
     gather_dead_handled: Option<String>,
     gather_alert_at: Option<f64>,
+    /// Trade sessions already seen (alerted, or open at the first list).
+    seen_trades: Option<std::collections::HashSet<String>>,
     /// Relay only (`health_state`, max = stats value 0).
     pub health: Option<f64>,
     pub max_health: Option<f64>,
@@ -100,6 +102,7 @@ impl Model {
             gather: None,
             gather_dead_handled: None,
             gather_alert_at: None,
+            seen_trades: None,
             health: None,
             max_health: None,
             sounds: Vec::new(),
@@ -167,6 +170,7 @@ impl Model {
             self.gather = None;
             self.gather_dead_handled = None;
             self.gather_alert_at = None;
+            self.seen_trades = None;
             self.health = None;
             self.max_health = None;
             self.position = None;
@@ -225,6 +229,7 @@ impl Model {
             NetEvent::RelayPassiveCrafts(crafts) => self.passive.update(crafts, now),
             NetEvent::Relay(state) => self.relay_state = state,
             NetEvent::RelayLoaded => self.relay_loaded = true,
+            NetEvent::TradeOffers(offers) => self.handle_trades(offers),
             NetEvent::RelayBuffs(buffs) => {
                 self.buffs = Some(buffs);
                 self.update_food();
@@ -376,6 +381,23 @@ impl Model {
             }
             let who = self.settings.username.clone().unwrap_or_else(|| "BitCraft".into());
             self.notifications.push(Notification { title: format!("{who}: {}", report.source), body: report.message });
+        }
+    }
+
+    /// A player starts a trade with the character (user request):
+    /// notification + sound, once per session. Sessions open in the first
+    /// list (app start, character switch) aren't news.
+    fn handle_trades(&mut self, offers: Vec<crate::core::types::TradeOffer>) {
+        let first = self.seen_trades.is_none();
+        let seen = self.seen_trades.get_or_insert_with(Default::default);
+        let new: Vec<_> = offers.into_iter().filter(|o| seen.insert(o.id.clone())).collect();
+        if first || self.is_loading {
+            return;
+        }
+        for offer in new {
+            let who = offer.from.unwrap_or_else(|| "A player".into());
+            self.notifications.push(Notification { title: "Trade request".into(), body: format!("{who} wants to trade") });
+            self.sounds.push(Sound::TradeRequest);
         }
     }
 
