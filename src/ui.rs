@@ -15,7 +15,7 @@ use crate::core::status::{HealthStatus, food_rgb, stamina_rgb};
 use crate::core::trackers::{Craft, TierSummary};
 use crate::core::types::PlayerSummary;
 use crate::model::Model;
-use crate::net::{Command, ConnState, Outgoing, RelayState};
+use crate::net::{Command, Outgoing, RelayState};
 use crate::notifier;
 use crate::settings::SoundSettings;
 use crate::sound::Sound;
@@ -480,15 +480,11 @@ impl Render for Panel {
         let m = &state.model;
 
         let header_color = if m.is_loading { status_color(HealthStatus::Warning) } else { status_color(m.monitor.overall()) };
-        let live = match m.live_state {
-            ConnState::Connected => "Connected",
-            ConnState::Connecting => "Connecting…",
-            ConnState::Disconnected => "Disconnected",
-        };
-        let relay = match m.relay_state {
-            RelayState::Live => " · relay",
-            RelayState::Connecting => " · relay…",
-            RelayState::Off | RelayState::Unavailable(_) => "",
+        let live = match m.relay_state {
+            RelayState::Live => "Connected",
+            RelayState::Off | RelayState::Connecting => "Connecting…",
+            RelayState::Disconnected => "Disconnected",
+            RelayState::Unavailable(_) => "Relay unavailable",
         };
 
         let mut body: Vec<AnyElement> = Vec::new();
@@ -500,7 +496,7 @@ impl Render for Panel {
                 .child(dot(header_color, 12.0))
                 .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(14.0)).child("BitCraft Tracker"))
                 .child(div().flex_1())
-                .child(div().text_xs().text_color(theme.secondary).child(format!("{live}{relay}")))
+                .child(div().text_xs().text_color(theme.secondary).child(live))
                 .into_any_element(),
         );
 
@@ -1029,8 +1025,8 @@ impl Panel {
             Some("Searching…".into())
         } else if state.results.is_empty() {
             Some("No players found".into())
-        } else if state.results.len() >= 50 {
-            Some("Showing the first 50; type more to narrow it down".into())
+        } else if state.results.len() >= crate::net::api::SEARCH_LIMIT {
+            Some(format!("Showing the first {}; type more to narrow it down", crate::net::api::SEARCH_LIMIT))
         } else {
             None
         };

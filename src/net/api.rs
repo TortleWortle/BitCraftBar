@@ -1,5 +1,6 @@
-//! BitJita REST API (`https://bitjita.com/api/`): player search and
-//! `players/<id>` (username, regions). See AGENTS.md "Data sources".
+//! HTTP: the relay's JSON API (`https://relay.bitcraftsync.app`: player
+//! search, mirrored regions) and the GitHub update check. See AGENTS.md
+//! "Data sources".
 
 use std::sync::OnceLock;
 
@@ -9,13 +10,14 @@ use serde::de::DeserializeOwned;
 
 use crate::core::types::PlayerSummary;
 
-const BASE: &str = "https://bitjita.com/api/";
+const RELAY: &str = "https://relay.bitcraftsync.app";
+/// Search results shown (the relay returns every match, e.g. 400+ for "to").
+pub const SEARCH_LIMIT: usize = 50;
 
 fn client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
-            // Some default library user agents get a 403; use a plain one.
             .user_agent("BitCraftTracker/0.1")
             .timeout(std::time::Duration::from_secs(30))
             .build()
@@ -23,58 +25,52 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
-async fn get<T: DeserializeOwned>(path: &str) -> Result<T> {
-    let response = client().get(format!("{BASE}{path}")).send().await?;
+async fn get<T: DeserializeOwned>(url: reqwest::Url) -> Result<T> {
+    let response = client().get(url.clone()).send().await?;
     if !response.status().is_success() {
-        bail!("GET {path}: {}", response.status());
+        bail!("GET {}: {}", url.path(), response.status());
     }
     Ok(response.json().await?)
 }
 
-#[derive(Deserialize)]
-struct PlayerResponse {
-    player: PlayerSummary,
-}
-
-pub async fn player(id: &str) -> Result<PlayerSummary> {
-    let r: PlayerResponse = get(&format!("players/{id}")).await?;
-    Ok(r.player)
-}
-
-#[derive(Deserialize)]
-struct SearchResponse {
-    players: Vec<PlayerSummary>,
-}
-
-/// Substring search (≥ 2 chars, max 50, alphabetical). Re-ranked: exact,
-/// prefix, rest.
+/// `GET /player?name=` (case-insensitive substring, all regions, no
+/// limit). Re-ranked: exact, prefix, rest (each alphabetical), then cut to
+/// [`SEARCH_LIMIT`].
 pub async fn search_players(query: &str) -> Result<Vec<PlayerSummary>> {
     let q = query.trim();
     if q.chars().count() < 2 {
         return Ok(vec![]);
     }
-    let mut url = reqwest::Url::parse(&format!("{BASE}players"))?;
-    url.query_pairs_mut().append_pair("q", q);
-    let response = client().get(url).send().await?;
-    if !response.status().is_success() {
-        bail!("search: {}", response.status());
-    }
-    let r: SearchResponse = response.json().await?;
+    let mut url = reqwest::Url::parse(&format!("{RELAY}/player"))?;
+    url.query_pairs_mut().append_pair("name", q);
+    let mut players: Vec<PlayerSummary> = get(url).await?;
     let lower = q.to_lowercase();
-    let mut players = r.players;
-    players.sort_by_key(|p| {
+    players.sort_by_cached_key(|p| {
         let name = p.username.to_lowercase();
-        if name == lower {
+        let rank = if name == lower {
             0
         } else if name.starts_with(&lower) {
             1
         } else {
             2
-        }
+        };
+        (rank, name)
     });
+    players.truncate(SEARCH_LIMIT);
     Ok(players)
 }
 
+#[derive(Deserialize)]
+struct Health {
+    sources: std::collections::HashMap<String, serde::de::IgnoredAny>,
+}
+
+/// Mirrored regions from `/health` (sources `idc-<N>`; `global` has no
+/// player rows).
+pub async fn relay_regions() -> Result<Vec<i64>> {
+    let health: Health = get(reqwest::Url::parse(&format!("{RELAY}/health"))?).await?;
+    Ok(health.sources.keys().filter_map(|k| k.strip_prefix("idc-")?.parse().ok()).collect())
+}
 
 /// A published GitHub release (update check).
 #[derive(Clone, Debug, Deserialize)]

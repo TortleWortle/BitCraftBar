@@ -1,6 +1,7 @@
-//! The character's crafts, passive crafts, plants, food, stats, health,
-//! position and online status from BitCraft's SpacetimeDB via the
-//! community read-only relay `relay.bitcraftsync.app` (one port per region:
+//! Everything about the character (XP, stamina, satiation, crafts, passive
+//! crafts, plants, food, stats, health, position, online status, username)
+//! from BitCraft's SpacetimeDB via the community read-only relay
+//! `relay.bitcraftsync.app` (one port per region:
 //! 3000 + region). No account/token needed. Protocol:
 //! SpacetimeDB v1 JSON (`v1.json.spacetimedb`). See AGENTS.md "SpacetimeDB
 //! relay" for tables, column indices and quirks.
@@ -80,8 +81,9 @@ fn pk_column(table: &str) -> usize {
     if table == "player_state" { 1 } else { 0 }
 }
 
-/// Rows are JSON strings of arrays (BitJita's relay) or of objects with
-/// the columns in schema order (bitcraftsync); both become column arrays.
+/// Rows are JSON strings of objects with the columns in schema order
+/// (`InitialSubscription`) or of arrays (`TransactionUpdate`); both become
+/// column arrays.
 /// Object order relies on serde_json's `preserve_order`.
 fn rows(value: &Value) -> Vec<Vec<Value>> {
     fn columns(v: Value) -> Option<Vec<Value>> {
@@ -171,6 +173,10 @@ impl Feed {
         q.push(format!("SELECT * FROM player_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM health_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM mobile_entity_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM experience_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM stamina_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM satiation_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM player_username_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
@@ -246,6 +252,29 @@ impl Feed {
     fn position(&self) -> Option<Position> {
         let row = self.store.rows("mobile_entity_state").next()?;
         Some(Position { x: row.get(3).and_then(int)?, z: row.get(4).and_then(int)? })
+    }
+
+    /// `experience_state` = [entity_id, experience_stacks [[skill_id,
+    /// quantity], …]].
+    fn experience(&self) -> Option<Vec<(i64, i64)>> {
+        let stacks = self.store.rows("experience_state").next()?.get(1)?.as_array()?;
+        Some(stacks.iter().filter_map(|s| Some((int(s.get(0)?)?, int(s.get(1)?)?))).collect())
+    }
+
+    /// `stamina_state` = [entity_id, last_stamina_decrease_timestamp,
+    /// stamina].
+    fn stamina(&self) -> Option<f64> {
+        self.store.rows("stamina_state").next()?.get(2)?.as_f64()
+    }
+
+    /// `satiation_state` = [entity_id, satiation].
+    fn satiation(&self) -> Option<f64> {
+        self.store.rows("satiation_state").next()?.get(1)?.as_f64()
+    }
+
+    /// `player_username_state` = [entity_id, username].
+    fn username(&self) -> Option<String> {
+        self.store.rows("player_username_state").next()?.get(1)?.as_str().map(str::to_string)
     }
 
     /// Building name via `building_state` → `building_desc`.
@@ -395,6 +424,10 @@ pub struct RegionData {
     pub stats: Option<Vec<f64>>,
     pub health: Option<f64>,
     pub position: Option<Position>,
+    pub experience: Option<Vec<(i64, i64)>>,
+    pub stamina: Option<f64>,
+    pub satiation: Option<f64>,
+    pub username: Option<String>,
 }
 
 pub enum RegionUpdate {
@@ -429,8 +462,9 @@ pub async fn run(user: String, region: i64, emit: impl Fn(RegionUpdate)) {
                 emit(RegionUpdate::State(RelayState::Unavailable(reason)));
                 if transient { backoff.max(Duration::from_secs(5)) } else { REFUSED_RETRY }
             }
+            // Dropped or couldn't connect: disconnected until the retry.
             Ok(()) => {
-                emit(RegionUpdate::State(RelayState::Connecting));
+                emit(RegionUpdate::State(RelayState::Disconnected));
                 backoff
             }
         };
@@ -532,6 +566,10 @@ async fn session(
                     stats: feed.stats(),
                     health: feed.health(),
                     position: feed.position(),
+                    experience: feed.experience(),
+                    stamina: feed.stamina(),
+                    satiation: feed.satiation(),
+                    username: feed.username(),
                 }));
             },
             _ = ping.tick() => {
@@ -553,7 +591,7 @@ mod tests {
 
     #[test]
     fn rows_from_arrays_and_objects() {
-        // BitJita's relay: arrays; bitcraftsync: objects in column order.
+        // Updates: arrays; initial rows: objects in column order.
         let update = json!([
             "[1, 7, [1700000000000000]]",
             "{\"entity_id\":2,\"owner_entity_id\":7,\"timestamp\":{\"__timestamp_micros_since_unix_epoch__\":1700000000000000}}"

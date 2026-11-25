@@ -11,16 +11,13 @@ use crate::core::trackers::{
 };
 use crate::core::types::{FoodBuffDesc, FoodState, PlayerSummary, Position, RawBuff, now};
 use crate::sound::Sound;
-use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState};
+use crate::net::{Command, NetEvent, RelayPlayer, RelayState};
 use crate::settings::Settings;
 
 pub const LOADING_TIMEOUT: f64 = 20.0;
-/// Signed in but no live event for this long → stale feed, reconnect.
-pub const STALE_FEED_WINDOW: f64 = 60.0;
 pub const ALERT_COOLDOWN: f64 = 5.0 * 60.0;
 const PLAYER_SOURCE: &str = "Player";
 const CONNECTION_SOURCE: &str = "Connection";
-const RELAY_SOURCE: &str = "Relay";
 const FOOD_SOURCE: &str = "Food";
 
 /// Stamina fraction above which "idle" plays the idle sound.
@@ -58,7 +55,6 @@ pub struct Model {
     idle_after_moving: bool,
     activity: ActivityCheck,
 
-    pub live_state: ConnState,
     pub relay_state: RelayState,
     pub now: f64,
     pub is_loading: bool,
@@ -67,10 +63,8 @@ pub struct Model {
     loading_started_at: f64,
     /// Every relay region delivered its rows.
     relay_loaded: bool,
-    connected_at: Option<f64>,
     /// The player's relay rows (`player_state`, `character_stats_state`, …).
     relay_player: Option<RelayPlayer>,
-    last_live_event_at: Option<f64>,
     last_alert_at: HashMap<String, f64>,
 
     commands: Vec<Command>,
@@ -100,16 +94,13 @@ impl Model {
             moved_at: None,
             idle_after_moving: false,
             activity: ActivityCheck::default(),
-            live_state: ConnState::Connecting,
             relay_state: RelayState::Off,
             now,
             is_loading: true,
             is_offline: false,
             loading_started_at: now,
             relay_loaded: false,
-            connected_at: None,
             relay_player: None,
-            last_live_event_at: None,
             last_alert_at: HashMap::new(),
             commands: Vec::new(),
             notifications: Vec::new(),
@@ -157,10 +148,7 @@ impl Model {
             self.idle_after_moving = false;
             self.monitor = StatusMonitor::default();
             self.relay_state = RelayState::Off;
-            self.live_state = ConnState::Connecting;
             self.relay_player = None;
-            self.last_live_event_at = None;
-            self.connected_at = None;
             self.is_offline = false;
             self.is_loading = true;
             self.loading_started_at = now();
@@ -179,22 +167,9 @@ impl Model {
         let now = now();
         self.now = now;
         match event {
-            NetEvent::Live(state) => {
-                self.live_state = state;
-                self.connected_at = (state == ConnState::Connected).then_some(now);
-            }
-            NetEvent::Experience(stacks) => {
-                self.last_live_event_at = Some(now);
-                self.experience.handle(&stacks, now);
-            }
-            NetEvent::Stamina(v) => {
-                self.last_live_event_at = Some(now);
-                self.stamina.handle(v, now);
-            }
-            NetEvent::Satiation(v) => {
-                self.last_live_event_at = Some(now);
-                self.satiation.satiation = Some(v);
-            }
+            NetEvent::Experience(stacks) => self.experience.handle(&stacks, now),
+            NetEvent::Stamina(v) => self.stamina.handle(v, now),
+            NetEvent::Satiation(v) => self.satiation.satiation = Some(v),
             NetEvent::RelayCrafts(list) => {
                 // The relay pushes progress live: record it as progress
                 // (sets "last progressed") before merging the list.
@@ -211,14 +186,13 @@ impl Model {
                 if let Some(position) = player.as_ref().and_then(|p| p.position) {
                     self.update_position(position, now);
                 }
-                self.relay_player = player;
-            }
-            NetEvent::Player(player) => {
-                if self.settings.username.as_deref() != Some(player.username.as_str()) {
-                    self.settings.username = Some(player.username.clone());
+                if let Some(name) = player.as_ref().and_then(|p| p.username.clone())
+                    && self.settings.username.as_ref() != Some(&name)
+                {
+                    self.settings.username = Some(name);
                     self.settings.save();
                 }
-                self.reconnect_if_feed_stale(now);
+                self.relay_player = player;
             }
             NetEvent::RelayPlants(plants) => self.plants.update(&plants),
             NetEvent::RelayPassiveCrafts(crafts) => self.passive.update(crafts, now),
@@ -281,24 +255,11 @@ impl Model {
         if !self.is_loading {
             return;
         }
-        let ready = self.relay_loaded && self.live_state == ConnState::Connected;
-        if ready || self.now - self.loading_started_at >= LOADING_TIMEOUT {
+        if self.relay_loaded || self.now - self.loading_started_at >= LOADING_TIMEOUT {
             self.is_loading = false;
             self.evaluate();
             // Startup states aren't news.
             self.monitor.take_changes();
-        }
-    }
-
-    /// BitJita can stop delivering events on a healthy-looking connection;
-    /// satiation updates ~1/s while signed in, so silence means stale.
-    /// Online status: relay `player_state.signed_in`.
-    fn reconnect_if_feed_stale(&mut self, now: f64) {
-        let (Some(true), Some(connected_at)) = (self.relay_player.as_ref().map(|p| p.signed_in), self.connected_at) else { return };
-        let last = self.last_live_event_at.unwrap_or(0.0).max(connected_at);
-        if now - last >= STALE_FEED_WINDOW {
-            eprintln!("Signed in but no live events for {}s; reconnecting", (now - last) as i64);
-            self.commands.push(Command::ReconnectLive);
         }
     }
 
@@ -317,18 +278,14 @@ impl Model {
             self.satiation.report_current(&mut self.monitor);
             self.report_food();
         }
-        match self.live_state {
-            ConnState::Connected => self.monitor.report(CONNECTION_SOURCE, HealthStatus::Healthy, "Connected"),
-            ConnState::Connecting => self.monitor.report(CONNECTION_SOURCE, HealthStatus::Warning, "Connecting…"),
-            ConnState::Disconnected => self.monitor.report(CONNECTION_SOURCE, HealthStatus::Alert, "Disconnected"),
-        }
-        // Single source for everything but XP/stamina/satiation: an outage
-        // means stale data, so it's always shown.
-        match self.relay_state {
-            RelayState::Live => self.monitor.report(RELAY_SOURCE, HealthStatus::Healthy, "Relay live"),
-            RelayState::Off | RelayState::Connecting => self.monitor.report(RELAY_SOURCE, HealthStatus::Warning, "Relay connecting…"),
-            RelayState::Unavailable(_) => self.monitor.report(RELAY_SOURCE, HealthStatus::Alert, "Relay unavailable"),
-        }
+        // The relay is the only source: an outage means stale data.
+        let (status, message) = match self.relay_state {
+            RelayState::Live => (HealthStatus::Healthy, "Connected"),
+            RelayState::Off | RelayState::Connecting => (HealthStatus::Warning, "Connecting…"),
+            RelayState::Disconnected => (HealthStatus::Alert, "Disconnected"),
+            RelayState::Unavailable(_) => (HealthStatus::Alert, "Relay unavailable"),
+        };
+        self.monitor.report(CONNECTION_SOURCE, status, message);
         self.collect_alert_notifications();
         self.check_idle_full();
     }

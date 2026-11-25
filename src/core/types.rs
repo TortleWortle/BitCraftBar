@@ -160,27 +160,24 @@ impl FoodState {
     }
 }
 
+/// A relay `/player?name=` search result.
 #[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
 pub struct PlayerSummary {
     pub entity_id: String,
     pub username: String,
     pub signed_in: Option<bool>,
-    pub region_id: Option<i64>,
-    /// Only in `players/<id>` (not in search results).
-    #[serde(default)]
-    pub claims: Vec<Claim>,
-}
-
-#[derive(Clone, Debug, Deserialize, PartialEq)]
-#[serde(rename_all = "camelCase")]
-pub struct Claim {
-    pub region_id: Option<i64>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_relay_player_search() {
+        let json = r#"[{"entity_id":"648518346633885895","last_active_timestamp":1795629491,"region":14,"signed_in":true,"username":"Tortle"}]"#;
+        let players: Vec<PlayerSummary> = serde_json::from_str(json).unwrap();
+        assert_eq!(players, vec![PlayerSummary { entity_id: "648518346633885895".into(), username: "Tortle".into(), signed_in: Some(true) }]);
+    }
 
     #[test]
     fn food_regen_and_label() {

@@ -1,9 +1,10 @@
 //! Networking on a background Tokio runtime. The UI sends [`Command`]s and
 //! receives [`Outgoing`] messages; per-character events carry the user id so
-//! stale ones (after switching character) can be dropped.
+//! stale ones (after switching character) can be dropped. Everything comes
+//! from the relay (`relay.bitcraftsync.app`): websocket feeds per region
+//! (`relay.rs`) and its HTTP API (`api.rs`: player search, region list).
 
 pub mod api;
-pub mod live;
 pub mod relay;
 
 use std::collections::{BTreeSet, HashMap};
@@ -15,38 +16,32 @@ use tokio::task::JoinHandle;
 use crate::core::types::{CraftInfo, FoodBuffDesc, PassiveCraft, Plant, PlayerSummary, Position, RawBuff};
 use serde_json::Value;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ConnState {
-    Disconnected,
-    Connecting,
-    Connected,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 pub enum RelayState {
     Off,
     Connecting,
     /// Initial subscription received; data is current.
     Live,
+    /// Connection dropped or failed; retrying with backoff.
+    Disconnected,
     /// Refused (still loading, or region not mirrored); retried.
     Unavailable(String),
 }
 
 #[derive(Debug)]
 pub enum NetEvent {
-    Live(ConnState),
+    /// The player's rows below are sent when they change (every region
+    /// update re-sends its data). The first XP list is a snapshot.
     Experience(Vec<(i64, i64)>),
     Stamina(f64),
     Satiation(f64),
-    /// BitJita `players/<id>` (username).
-    Player(PlayerSummary),
     Relay(RelayState),
     /// Every followed region delivered its rows (sent once per character).
     RelayLoaded,
     RelayCrafts(Vec<CraftInfo>),
     RelayPassiveCrafts(Vec<PassiveCraft>),
     RelayPlants(Vec<Plant>),
-    /// The player's started buffs (`active_buff_state`), sent on change.
+    /// The player's started buffs (`active_buff_state`).
     RelayBuffs(Vec<RawBuff>),
     /// Food buff types (`buff_desc`).
     FoodBuffDescs(HashMap<i64, FoodBuffDesc>),
@@ -83,6 +78,8 @@ pub fn parse_buffs(list: &Value) -> Option<Vec<RawBuff>> {
 #[derive(Clone, Debug, PartialEq)]
 pub struct RelayPlayer {
     pub signed_in: bool,
+    /// `player_username_state.username`.
+    pub username: Option<String>,
     /// `character_stats_state.values` (1 = max stamina, 19 = max satiation).
     pub stats: Option<Vec<f64>>,
     /// `health_state.health` (max = stats value 0).
@@ -101,11 +98,14 @@ pub enum Outgoing {
 pub enum Command {
     /// Start tracking a character (stops the previous one).
     Track(String),
-    ReconnectLive,
     Search(String),
 }
 
-pub const POLL_INTERVAL: Duration = Duration::from_secs(60);
+/// How often to re-read the relay's region list (`/health`); regions are
+/// only added, rarely change, and the relay asks not to poll tightly.
+const REGIONS_INTERVAL: Duration = Duration::from_secs(5 * 60);
+/// Retry after `/health` failed (nothing is followed until it answers).
+const REGIONS_RETRY: Duration = Duration::from_secs(15);
 /// How often to look for a new release (also once at startup).
 const UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(12 * 60 * 60);
 
@@ -126,27 +126,14 @@ pub fn start(out: async_channel::Sender<Outgoing>) -> mpsc::UnboundedSender<Comm
     tx
 }
 
-struct Tracking {
-    live: mpsc::UnboundedSender<live::LiveCommand>,
-    tasks: Vec<JoinHandle<()>>,
-}
-
 async fn manager(mut commands: mpsc::UnboundedReceiver<Command>, out: async_channel::Sender<Outgoing>) {
     tokio::spawn(check_updates(out.clone()));
-    let mut current: Option<Tracking> = None;
+    // Held so the tracked character's task runs until replaced.
+    let mut _current: Option<AbortOnDrop> = None;
     while let Some(command) = commands.recv().await {
         match command {
-            Command::Track(user) => {
-                if let Some(old) = current.take() {
-                    old.tasks.iter().for_each(JoinHandle::abort);
-                }
-                current = Some(track(user, out.clone()));
-            }
-            Command::ReconnectLive => {
-                if let Some(t) = &current {
-                    let _ = t.live.send(live::LiveCommand::Reconnect);
-                }
-            }
+            // Replacing the old one aborts it (and its relay feeds).
+            Command::Track(user) => _current = Some(AbortOnDrop(tokio::spawn(track(user, out.clone())))),
             Command::Search(query) => {
                 let out = out.clone();
                 tokio::spawn(async move {
@@ -177,64 +164,40 @@ async fn check_updates(out: async_channel::Sender<Outgoing>) {
     }
 }
 
-fn track(user: String, out: async_channel::Sender<Outgoing>) -> Tracking {
-    let emitter = {
+/// Follows one character: the relay hub, fed with the regions the relay
+/// mirrors (its `/health`). Every region is followed because placeables and
+/// crafting stations stay in their region while the player travels.
+async fn track(user: String, out: async_channel::Sender<Outgoing>) {
+    let emit = {
         let user = user.clone();
-        let out = out.clone();
         move |event: NetEvent| {
             let _ = out.try_send(Outgoing::Event { user: user.clone(), event });
         }
     };
-
-    let (live_tx, live_rx) = mpsc::unbounded_channel();
-    let channels = vec![
-        live::experience(&user),
-        live::stamina(&user),
-        live::satiation(&user),
-    ];
-    let live_task = tokio::spawn(live::run(channels, live_rx, emitter.clone()));
-
-    let poll_task = tokio::spawn(poll(user, emitter));
-    Tracking { live: live_tx, tasks: vec![live_task, poll_task] }
-}
-
-/// Starts the relay on the mirrored regions right away, then polls
-/// BitJita `players/<id>` every 60s for the username and any extra regions
-/// (the player's and their claims').
-async fn poll(user: String, emit: impl Fn(NetEvent) + Clone + Send + Sync + 'static) {
-    // Aborted with this task (character switch).
-    let (hub, hub_task) = start_relay_hub(user.clone(), emit.clone());
-    let _hub_task = AbortOnDrop(hub_task);
-    let mut regions: BTreeSet<i64> = MIRRORED_REGIONS.into_iter().collect();
-    let _ = hub.send(HubCommand::Regions { all: regions.clone() });
+    let (hub, rx) = mpsc::unbounded_channel();
+    let _hub_task = AbortOnDrop(tokio::spawn(relay_hub(user, rx, emit)));
+    let mut regions: BTreeSet<i64> = BTreeSet::new();
     loop {
-        match api::player(&user).await {
-            Ok(p) => {
-                // Placeables and crafting stations stay in their region while
-                // the player travels (buffs move with the player).
-                regions.extend(p.region_id);
-                regions.extend(p.claims.iter().filter_map(|c| c.region_id));
+        let wait = match api::relay_regions().await {
+            Ok(list) => {
+                // Only added: a region missing from one /health answer
+                // keeps its feed (and last rows).
+                regions.extend(list);
                 let _ = hub.send(HubCommand::Regions { all: regions.clone() });
-                emit(NetEvent::Player(p));
+                REGIONS_INTERVAL
             }
-            Err(e) => eprintln!("player: {e}"),
-        }
-        tokio::time::sleep(POLL_INTERVAL).await;
+            Err(e) => {
+                eprintln!("relay regions: {e}");
+                REGIONS_RETRY
+            }
+        };
+        tokio::time::sleep(wait).await;
     }
 }
-
-/// Regions the relay mirrors (its `/health`; others answer 502, retried every
-/// 5 min).
-const MIRRORED_REGIONS: [i64; 9] = [7, 8, 9, 12, 13, 14, 17, 18, 19];
 
 enum HubCommand {
     /// Regions to follow.
     Regions { all: BTreeSet<i64> },
-}
-
-fn start_relay_hub(user: String, emit: impl Fn(NetEvent) + Send + Sync + 'static) -> (mpsc::UnboundedSender<HubCommand>, JoinHandle<()>) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    (tx, tokio::spawn(relay_hub(user, rx, emit)))
 }
 
 /// One relay feed per region; merges their data. Lists are sent once every
@@ -251,6 +214,9 @@ async fn relay_hub(user: String, mut commands: mpsc::UnboundedReceiver<HubComman
     let mut last_player: Option<RelayPlayer> = None;
     let mut last_buffs: Option<Vec<RawBuff>> = None;
     let mut last_descs: HashMap<i64, FoodBuffDesc> = HashMap::new();
+    let mut last_xp: Option<Vec<(i64, i64)>> = None;
+    let mut last_stamina: Option<f64> = None;
+    let mut last_satiation: Option<f64> = None;
     let mut loaded = false;
     loop {
         let mut data_changed = false;
@@ -303,26 +269,45 @@ async fn relay_hub(user: String, mut commands: mpsc::UnboundedReceiver<HubComman
             emit(NetEvent::RelayPassiveCrafts(data.values().flat_map(|d| d.passive.clone()).collect()));
             emit(NetEvent::RelayPlants(data.values().flat_map(|d| d.plants.clone()).collect()));
         }
-        // The player's own rows (buffs, stats, online status) are in the
-        // region the player is in: the one that has `player_state`. After
-        // traveling, the old region can still hold a stale copy while it's
-        // reconnecting, so a live region wins.
+        // The player's own rows (XP, stamina, buffs, stats, online status)
+        // are in the region the player is in: the one that has
+        // `player_state`. After traveling, the old region can still hold a
+        // stale copy while it's reconnecting, so a live region wins.
         let player = data
             .iter()
             .filter(|(_, d)| d.signed_in.is_some())
             .max_by_key(|(r, _)| states.get(r) == Some(&RelayState::Live))
             .map(|(_, d)| d);
-        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone(), health: d.health, position: d.position }));
+        let player_info = player.and_then(|d| {
+            Some(RelayPlayer {
+                signed_in: d.signed_in?,
+                username: d.username.clone(),
+                stats: d.stats.clone(),
+                health: d.health,
+                position: d.position,
+            })
+        });
         if player_info != last_player {
             emit(NetEvent::RelayPlayer(player_info.clone()));
             last_player = player_info;
         }
-        // Only on change: every region update re-sends its data.
-        if let Some(d) = player
-            && last_buffs.as_ref() != Some(&d.buffs)
-        {
-            emit(NetEvent::RelayBuffs(d.buffs.clone()));
-            last_buffs = Some(d.buffs.clone());
+        if let Some(d) = player {
+            if d.experience.is_some() && d.experience != last_xp {
+                emit(NetEvent::Experience(d.experience.clone().unwrap_or_default()));
+                last_xp = d.experience.clone();
+            }
+            if let Some(v) = d.stamina.filter(|v| Some(*v) != last_stamina) {
+                emit(NetEvent::Stamina(v));
+                last_stamina = Some(v);
+            }
+            if let Some(v) = d.satiation.filter(|v| Some(*v) != last_satiation) {
+                emit(NetEvent::Satiation(v));
+                last_satiation = Some(v);
+            }
+            if last_buffs.as_ref() != Some(&d.buffs) {
+                emit(NetEvent::RelayBuffs(d.buffs.clone()));
+                last_buffs = Some(d.buffs.clone());
+            }
         }
         let descs: HashMap<i64, FoodBuffDesc> = data.values().flat_map(|d| d.food_descs.clone()).collect();
         if !descs.is_empty() && descs != last_descs {
@@ -336,6 +321,9 @@ async fn relay_hub(user: String, mut commands: mpsc::UnboundedReceiver<HubComman
     }
 }
 
+/// Worst of the followed regions, ignoring those that refuse for good:
+/// any disconnected → Disconnected, all live → Live, else Connecting
+/// (also "still loading" refusals).
 fn overall_state(feeds: &HashMap<i64, AbortOnDrop>, states: &HashMap<i64, RelayState>) -> RelayState {
     if feeds.is_empty() {
         return RelayState::Off;
@@ -347,6 +335,8 @@ fn overall_state(feeds: &HashMap<i64, AbortOnDrop>, states: &HashMap<i64, RelayS
         .collect();
     if relevant.is_empty() {
         RelayState::Unavailable("no mirrored region".into())
+    } else if relevant.iter().any(|s| *s == Some(&RelayState::Disconnected)) {
+        RelayState::Disconnected
     } else if relevant.iter().all(|s| *s == Some(&RelayState::Live)) {
         RelayState::Live
     } else {

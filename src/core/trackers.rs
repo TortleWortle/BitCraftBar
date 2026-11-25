@@ -24,8 +24,9 @@ impl ExperienceTracker {
         self.last_skill_id.map(Skill::name_for)
     }
 
-    /// `stacks`: (skill id, quantity). The live feed sends no snapshot on
-    /// subscribe, so the first update counts as a gain.
+    /// `stacks`: (skill id, quantity). The first list is the relay's
+    /// snapshot (baseline, not a gain); the skill is known from the first
+    /// gain on.
     pub fn handle(&mut self, stacks: &[(i64, i64)], now: f64) {
         let new: HashMap<i64, i64> = stacks.iter().copied().fold(HashMap::new(), |mut m, (k, v)| {
             let e = m.entry(k).or_insert(v);
@@ -33,8 +34,7 @@ impl ExperienceTracker {
             m
         });
         let gained: i64 = if self.stacks.is_empty() {
-            self.last_gain_amount = 0;
-            1
+            0
         } else {
             let per_skill: Vec<(i64, i64)> = new
                 .iter()
@@ -319,9 +319,8 @@ impl CraftTracker {
 
     pub fn handle_progress(&mut self, entity_id: &str, progress: i64, now: f64) {
         let Some(craft) = self.crafts.get_mut(entity_id) else { return };
-        // Progress only goes up. The relay and BitJita's live channel both
-        // report it, and the slower one would otherwise move it back (and
-        // count as "progressed" again): ignore anything not newer.
+        // Progress only goes up: ignore anything not newer (a list re-sent
+        // with the same value isn't progress).
         if progress <= craft.progress {
             return;
         }
@@ -737,6 +736,15 @@ mod tests {
     }
 
     #[test]
+    fn xp_snapshot_is_not_a_gain() {
+        let mut xp = ExperienceTracker::default();
+        xp.handle(&[(2, 10), (12, 5)], 0.0);
+        assert_eq!((xp.last_gain_at, xp.last_skill_id, xp.total), (None, None, Some(15)));
+        xp.handle(&[(2, 10), (12, 9)], 1.0);
+        assert_eq!((xp.last_gain_at, xp.last_skill_id, xp.last_gain_amount), (Some(1.0), Some(12), 4));
+    }
+
+    #[test]
     fn craft_progress_never_goes_back() {
         let mut crafts = CraftTracker::default();
         crafts.update(&[CraftInfo {
@@ -750,8 +758,9 @@ mod tests {
             tier: None,
         }]);
         crafts.handle_progress("1", 12, 5.0);
-        // The slower source still reports 11.
+        // An older value (or the same one again) isn't progress.
         crafts.handle_progress("1", 11, 6.0);
+        crafts.handle_progress("1", 12, 7.0);
         let craft = &crafts.sorted()[0];
         assert_eq!((craft.progress, craft.last_progress_at), (12, Some(5.0)));
     }
