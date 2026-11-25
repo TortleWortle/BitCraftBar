@@ -406,10 +406,11 @@ fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Th
         .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| cx.new(|_| Tooltip { text: tip.clone(), theme }).into()))
 }
 
-/// Hover text of a badge.
-struct Tooltip {
-    text: SharedString,
-    theme: Theme,
+/// Hover text (badges, info window food row).
+pub(crate) struct Tooltip {
+    /// One line per `\n`.
+    pub text: SharedString,
+    pub theme: Theme,
 }
 
 impl Render for Tooltip {
@@ -424,7 +425,9 @@ impl Render for Tooltip {
             .shadow_md()
             .text_xs()
             .text_color(self.theme.text)
-            .child(self.text.clone())
+            .flex()
+            .flex_col()
+            .children(self.text.split('\n').map(|line| div().child(line.to_string())))
     }
 }
 

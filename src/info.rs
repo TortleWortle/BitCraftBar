@@ -5,7 +5,7 @@
 use std::time::Duration;
 
 use gpui::{
-    AnyElement, App, Bounds, Context, Entity, FontWeight, MouseButton, Pixels, Render, Rgba, Subscription, Task,
+    AnyElement, App, Bounds, Context, Entity, FontWeight, MouseButton, Pixels, Render, Rgba, SharedString, Subscription, Task,
     Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowKind, WindowOptions, div, point,
     prelude::*, px, size,
 };
@@ -14,7 +14,7 @@ use crate::core::status::HealthStatus;
 use crate::core::trackers::ActivityCheck;
 use crate::model::Model;
 use crate::core::badges::{self, Badge};
-use crate::ui::{AppState, Theme, badge_wrap, bar, dot, duration_string, status_color};
+use crate::ui::{AppState, Theme, Tooltip, badge_wrap, bar, dot, duration_string, status_color};
 
 const WIDTH: f32 = 260.0;
 const INITIAL_HEIGHT: f32 = 240.0;
@@ -170,7 +170,10 @@ impl Render for InfoWindow {
             body.push(div().text_color(theme.secondary).child("Loading…").into_any_element());
         } else {
             body.push(status_line(m, theme).into_any_element());
-            body.push(bars(m, theme).into_any_element());
+            // Offline: stamina/health/food are stale and don't matter.
+            if !m.is_offline {
+                body.push(bars(m, theme).into_any_element());
+            }
             body.push(div().h(px(1.0)).w_full().bg(theme.border).into_any_element());
             body.push(summaries(m, theme).into_any_element());
         }
@@ -277,17 +280,24 @@ fn bars(m: &Model, theme: Theme) -> impl IntoElement {
             None => (0.0, alert, "None".into(), alert),
         },
     };
-    let food_summary = m.food.as_ref().map(|f| f.summary(m.now)).filter(|s| !s.is_empty());
+    // Hover text: the active food buffs, one per line with time left
+    // (user request: instead of a summary line under the bar).
+    let food_tip: Option<SharedString> = m.food.as_ref().map(|f| {
+        let mut buffs: Vec<_> = f.active(m.now).collect();
+        buffs.sort_by_key(|b| (!b.is_regen, b.name.clone()));
+        buffs.iter().map(|b| format!("{} · {}", b.short_name(), duration_string(b.ends_at - m.now))).collect::<Vec<_>>().join("\n").into()
+    }).filter(|t: &SharedString| !t.is_empty());
     div()
         .flex()
         .flex_col()
         .gap_1()
         .child(row("Stamina", m.stamina.fraction().unwrap_or(0.0), stamina_color, fmt(m.stamina.stamina, m.stamina.max), theme.text))
         .child(row("Health", health_fraction, health_color, fmt(m.health, m.max_health), theme.text))
-        .child(row("Food", food_fraction, food_color, food_text, food_text_color))
-        .children(food_summary.map(|s| {
-            div().pl(px(58.0)).text_xs().text_color(theme.secondary).child(s)
-        }))
+        .child(
+            row("Food", food_fraction, food_color, food_text, food_text_color)
+                .id("food")
+                .when_some(food_tip, |d, tip| d.tooltip(move |_, cx| cx.new(|_| Tooltip { text: tip.clone(), theme }).into())),
+        )
 }
 
 /// One row each for plants, passive crafts and crafts: "type + tier"

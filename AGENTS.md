@@ -138,7 +138,11 @@ the default. Never takes focus. Content:
   with the last skill; the current craft (active, else the last worked on)
   with percent and bar (hidden offline);
 - bars: stamina (`current / max`), **health** (relay `health_state`, max =
-  stats value 0; red under 30%), food (time left) + buff summary;
+  stats value 0; red under 30%), food (time left; **hover** lists the
+  active food buffs, one per line with time left, e.g. `Regen 3 · 41m`;
+  user request, instead of a summary line under the bar); hidden
+  while offline (user request; stale, and the status line says "Player
+  offline");
 - one row each for plants, passive crafts and crafts: **badges** (see
   below), with "next grown in 5m" / "next done in 4m" underneath.
 
