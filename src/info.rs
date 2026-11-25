@@ -10,7 +10,7 @@ use gpui::{
     prelude::*, px, size,
 };
 
-use crate::core::status::HealthStatus;
+use crate::core::status::{HealthStatus, food_rgb, health_rgb, stamina_rgb};
 use crate::core::trackers::ActivityCheck;
 use crate::model::Model;
 use crate::core::badges::{self, Badge};
@@ -302,17 +302,17 @@ fn bars(m: &Model, theme: Theme) -> impl IntoElement {
     };
     let healthy = status_color(HealthStatus::Healthy);
     let alert = status_color(HealthStatus::Alert);
-    let stamina_color = status_color(if m.is_offline { HealthStatus::Alert } else { m.monitor.overall() });
+    let stamina_color = gpui::rgb(stamina_rgb(m.stamina.fraction().unwrap_or(1.0)));
     let health_fraction = match (m.health, m.max_health) {
         (Some(h), Some(max)) if max > 0.0 => h / max,
         _ => 0.0,
     };
-    let health_color = if health_fraction > 0.0 && health_fraction < 0.3 { alert } else { gpui::rgb(0xff6482) };
+    let health_color = gpui::rgb(health_rgb(health_fraction));
     let (food_fraction, food_color, food_text, food_text_color) = match &m.food {
         None => (0.0, healthy, "–".to_string(), theme.secondary),
         Some(food) => match food.regen_ends_at(m.now) {
-            Some(end) => (food.regen_fraction(m.now).unwrap_or(0.0), healthy, duration_string(end - m.now), theme.text),
-            None => (0.0, alert, "None".into(), alert),
+            Some(end) => (food.regen_fraction(m.now).unwrap_or(0.0), gpui::rgb(food_rgb(end - m.now)), duration_string(end - m.now), theme.text),
+            None => (1.0, alert, "None".into(), alert),
         },
     };
     // Hover text: the active food buffs, one per line with time left

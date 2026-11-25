@@ -11,7 +11,7 @@ use gpui::{
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::core::badges::{self, Badge, BadgeState};
-use crate::core::status::HealthStatus;
+use crate::core::status::{HealthStatus, food_rgb, stamina_rgb};
 use crate::core::trackers::{Craft, TierSummary};
 use crate::core::types::PlayerSummary;
 use crate::model::Model;
@@ -721,19 +721,19 @@ impl Panel {
                 .child(div().flex_none().text_color(text_color).child(text))
                 .into_any_element()
         };
-        let overall = if m.is_offline { HealthStatus::Alert } else { m.monitor.overall() };
         // Food: bar of the regen buff's time left; buff summary below it.
-        // Only known via the relay ("–" until then), red "None" when out.
+        // Only known via the relay ("–" until then); orange under 5 min,
+        // full red bar + "None" when out.
         let food_bar = match &m.food {
             None => div().text_color(theme.secondary).child("–").into_any_element(),
             Some(food) => match food.regen_ends_at(m.now) {
                 Some(end) => with_bar(
                     food.regen_fraction(m.now).unwrap_or(0.0),
-                    status_color(HealthStatus::Healthy),
+                    rgb(food_rgb(end - m.now)),
                     duration_string(end - m.now),
                     theme.text,
                 ),
-                None => with_bar(0.0, status_color(HealthStatus::Alert), "None".into(), status_color(HealthStatus::Alert)),
+                None => with_bar(1.0, status_color(HealthStatus::Alert), "None".into(), status_color(HealthStatus::Alert)),
             },
         };
         let food_summary = m.food.as_ref().map(|f| f.summary(m.now)).filter(|s| !s.is_empty());
@@ -743,7 +743,7 @@ impl Panel {
             .gap_1()
             .child(row(
                 "Stamina",
-                with_bar(m.stamina.fraction().unwrap_or(0.0), status_color(overall), stamina_text, theme.text),
+                with_bar(m.stamina.fraction().unwrap_or(0.0), rgb(stamina_rgb(m.stamina.fraction().unwrap_or(1.0))), stamina_text, theme.text),
             ))
             .child(row("Food", food_bar))
             .children(food_summary.map(|summary| {

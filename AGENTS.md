@@ -69,8 +69,9 @@ online.
 
 **Popup panel** (`src/ui.rs`, `Panel`), opened by clicking the tray icon:
 header (status dot, connection state, `· relay` while the relay is live),
-per-source status reports, stats rows (stamina bar `current / max` in the
-overall status color; **food bar** right below it; **satiation bar**
+per-source status reports, stats rows (stamina bar `current / max`,
+**colored by stamina** (`status::stamina_rgb`, user request): green above
+30%, blending to orange at 20% and to red at 5% and below; **food bar** right below it; **satiation bar**
 `current / max`, green, red at/below the alert threshold; total XP; last
 skill; last gain), plants, passive crafts,
 crafts (progress bar, percent, Paused/Done), an **Update available**
@@ -90,8 +91,9 @@ row when GitHub has a newer release (see Releases), character picker,
   short summary of the active food buffs on the line below (`Regen 3 ·
   Deluxe Action Speed 2`; `FoodBuff::short_name` turns "Level 3 Food Regen"
   into "Regen 3"). Food *names* were shown first but dropped (user: too
-  long; several foods give the same buffs, so it was often "A / B"). Empty
-  bar + red "None" when no food regen is active; "–" until the relay
+  long; several foods give the same buffs, so it was often "A / B"). Orange
+  under 5 minutes left (`status::food_rgb`, user request); full red bar +
+  red "None" when no food regen is active (full so the red shows); "–" until the relay
   delivered buffs (relay only; REST buff data is unreliable).
 - **Badges** (`core::badges`, user request; under each section title in
   the popup and in the info window): one pill per *type + tier* and state,
@@ -143,8 +145,9 @@ the default. Never takes focus. Content:
   with the last skill; the current craft (active, else the last worked on)
   with percent and bar (hidden offline);
 - bars (16px, value centered **inside** the bar, user request;
-  `info::labeled_bar`): stamina (`current / max`), **health** (relay `health_state`, max =
-  stats value 0; red under 30%), food (time left; **hover** lists the
+  `info::labeled_bar`): stamina (`current / max`, popup colors),
+  **health** (relay `health_state`, max = stats value 0; pink, orange at
+  ≤ 50%, red at ≤ 15%, `status::health_rgb`), food (time left, popup colors; **hover** lists the
   active food buffs, one per line with time left, e.g. `Regen 3 · 41m`;
   user request, instead of a summary line under the bar); hidden
   while offline (user request; stale, and the status line says "Player
