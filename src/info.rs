@@ -162,7 +162,15 @@ impl Render for InfoWindow {
                     .child("✕")
                     // Don't start a window drag from the close button.
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                    .on_click(move |_, _, cx| toggle(&close_state, cx)),
+                    // Close through the handler's own window: `toggle` goes
+                    // through the window handle, which can't be updated
+                    // while this window is already being updated (the
+                    // close failed silently, the state said closed, and the
+                    // next click opened a second window).
+                    .on_click(move |_, window, cx| {
+                        window.remove_window();
+                        set_open(&close_state, false, cx);
+                    }),
             );
 
         let mut body: Vec<AnyElement> = vec![header.into_any_element()];
