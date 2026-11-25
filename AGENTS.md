@@ -179,6 +179,7 @@ Player, Connection).
 
 | Source | Condition | Status | Message |
 |---|---|---|---|
+| Activity | character moved in the last 10s (relay position changed) | healthy | Active |
 | Activity | last action was a craft and it completed | warning | Craft finished |
 | Activity | no counting XP, stamina "ready" (API max known) | warning | Idle: stamina full / Idle: stamina above N% (or Craft idle (N%) if the last action was an unfinished craft) |
 | Activity | stamina regenerating (immediately, even with recent XP) | warning | Resting |
@@ -192,6 +193,18 @@ Player, Connection).
 | Connection | connected / connecting / disconnected | healthy / warning / alert | Connected / Connecting… / Disconnected |
 
 Activity rows are checked top to bottom.
+
+- **Active** (user request): moving around means the player is at the
+  keyboard, so it overrides every other Activity rule. Movement = the
+  `mobile_entity_state` location changed (`Model::update_position` →
+  `moved_at`, window `ActivityCheck::move_window` = 10s). Source: BitJita
+  live channel (works without the relay; first version used the relay
+  only and did nothing while the relay was restarting) and the relay
+  when live. **Idle right after Active is quiet** (user request: the
+  player stopped the action by walking away, not worth an alert): when
+  Activity goes from "Active" to an idle message, neither the went-idle
+  notification nor the idle sound fires, until Activity is something other
+  than idle again (`Model::idle_after_moving`).
 
 - **Counting XP** = XP gained in the last 20s *and* after stamina last went
   up: XP while regenerating is improbable (user's rule), so once regen starts,
@@ -232,7 +245,7 @@ thread. Produced by `Model` (`collect_notifications`,
 | Event | Rule |
 |---|---|
 | Error state | A status source changes **to alert from a known non-alert status**. A source's *first* report doesn't count. **5 min cooldown per source** (e.g. flapping connection). Alert → alert (message change) is silent. |
-| Went idle | Activity changes to an idle message (`ActivityCheck::is_idle`: "Idle…", "Craft idle…") from a known non-idle one (e.g. Gaining experience / Resting → Idle: stamina full). Idle → idle (message change) is silent. Same 5 min cooldown. Idle used to be red and notified as an error state; it became orange, and this keeps the notification. |
+| Went idle | Not when it comes straight from "Active" (moving; see Status rules). Activity changes to an idle message (`ActivityCheck::is_idle`: "Idle…", "Craft idle…") from a known non-idle one (e.g. Gaining experience / Resting → Idle: stamina full). Idle → idle (message change) is silent. Same 5 min cooldown. Idle used to be red and notified as an error state; it became orange, and this keeps the notification. |
 | Craft finished | Once per craft, when live progress reaches the total, or when REST reports a tracked craft as `completed` (if the live event was missed). |
 | Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished on first load are silent, and so are those in the first list after **switching source** (REST ↔ relay): REST once listed no passive crafts while the relay had 3 finished ones, which notified as "finished" (`Model::switch_source`). |
 | Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first load or the first list after a source switch. |
@@ -246,6 +259,24 @@ disconnect is a transition and notifies.
 `mac-notification-sys` looks up an app named "use_default" via AppleScript,
 which pops up a "Where is use_default?" dialog that also steals focus (and
 closes the popup).
+
+## Sounds
+
+Settings section in the popup (*Settings* button next to Quit; user
+request): play a sound when an active **craft finishes**, when the
+character **runs out of food** (Food report turns red, same 5 min
+cooldown as the notification), and when **idle with stamina above 90%**
+(Activity idle message + stamina > `model::IDLE_SOUND_STAMINA`; once each
+time it becomes true). Each is a checkbox (all off by default), plus a
+**volume slider** (20 segments of 5%, click or drag; default 50%) and a
+*Test* button. Stored in `settings.json` (`sounds`).
+
+Sounds are synthesized chimes (`src/sound.rs`, sine notes with decay; no
+sound files): rising two notes = craft finished, falling twice = out of
+food, three pulses = idle. Played with **rodio** (no default features, so
+no decoders) on a short-lived thread. The model emits `Sound` events
+(`Model::take_sounds`, never while loading); `AppState::flush` plays the
+enabled ones.
 
 ## Architecture
 
@@ -273,6 +304,7 @@ src/net/           Background Tokio runtime ("network" thread):
   relay.rs         SpacetimeDB relay: passive crafts + plants, live
 src/tray.rs        Tray icon rendering/updates
 src/notifier.rs    Desktop notifications
+src/sound.rs       Alert sounds (synthesized chimes, rodio)
 src/settings.rs    settings.json (tracked character)
 ```
 
@@ -435,6 +467,10 @@ game token was rejected: account risk, and the relay has the same data.
   and duration are plain u64s; the unit is detected from start_time's
   magnitude (s / ms / µs) and applied to both. Taken from the player's
   region like the other player rows.
+- **Position** (`Feed::position`): `mobile_entity_state` = [entity_id,
+  chunk_index, timestamp, location_x, location_z, destination_x,
+  destination_z, dimension, is_walking, …]; location changes → "Active"
+  (see Status rules). Player region, like the other player rows.
 - **Active crafts** (`Feed::crafts`): `progressive_action_state` (owner
   filter) = [entity_id, building_entity_id, function_type, progress,
   recipe_id, craft_count, last_crit_outcome, owner, lock_expiration,
@@ -476,6 +512,7 @@ doesn't prove a channel exists). Events: `{"type":"event","channel":...,"data":{
 | `stamina_state:<player id>` | `stamina` | ~1/s while regenerating. **Stops sending when full.** |
 | `satiation_state:<player id>` | `satiation` | ~1/s while it changes (slowly decreasing). |
 | `character_stats_state:<player id>` | `values[1]` = max stamina, `values[19]` = max satiation | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe. Fallback for when the relay's `character_stats_state` isn't available. |
+| `mobile_entity_state:<player id>` | `location_x`, `location_z` (also `destination_*`, `is_walking`, `timestamp` ms, `region_id`) | **~16 events/s** (330 in 20s while playing), so `live::handle` sends a `Position` at most once per second and only when it changed. Movement → "Active". |
 | `progressive_action_state:<craft entity id>` | `progress`, `entity_id` | One event per craft action (+ a duplicate `preparation: true` event). |
 
 Channels probed that produced no events: `character_stats`, `player_state`,
@@ -504,7 +541,10 @@ agent: Python's default `urllib` agent got 403).
 
 - **Max stamina / satiation**: relay `character_stats_state` when
   available, else REST stats + BitJita live `character_stats_state`
-  (whichever came last); if current stamina exceeds it
+  (whichever came last). The last values are **cached** in
+  `settings.json` (`cached_stats`, per tracked character, cleared on
+  switching) and applied at startup: the relay restarts for 10+ minutes
+  at a time and `players/<id>/stats` has answered 404 meanwhile; if current stamina exceeds it
   (API lagging after a gear change), use current. Fallback without API: highest
   stamina seen in the last 10 minutes (current value always included, since
   updates stop at full).
@@ -564,7 +604,8 @@ agent: Python's default `urllib` agent got 403).
   `target/` around 2 GB (the dev machine had only a few GB of free disk).
 - **Platform requirements**: Windows needs the MSVC toolchain; Linux needs
   GPUI's libs (Vulkan, xkbcommon, wayland/X11, fontconfig), e.g.
-  `sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan1 libfontconfig-dev`.
+  `sudo apt install libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev libvulkan1 libfontconfig-dev libasound2-dev`
+  (`libasound2-dev`: ALSA, for rodio's sound output).
 - **Verified on macOS only** (live data, panel, notifications). Windows and
   Linux haven't been built or run yet; cross-checking Windows from macOS
   fails in `ring`'s build script (needs an MSVC C toolchain).

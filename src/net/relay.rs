@@ -151,6 +151,7 @@ impl Feed {
         q.push(format!("SELECT * FROM player_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM health_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM player_action_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM mobile_entity_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
@@ -247,6 +248,14 @@ impl Feed {
                 let scale = if start > 1e14 { 1e6 } else if start > 1e11 { 1e3 } else { 1.0 };
                 Some(PlayerAction { kind, start: start / scale, duration: r.get(4)?.as_f64()? / scale })
             })
+    }
+
+    /// `mobile_entity_state` = [entity_id, chunk_index, timestamp,
+    /// location_x, location_z, destination_x, destination_z, dimension,
+    /// is_walking, …]: current position, for movement detection.
+    fn position(&self) -> Option<(i64, i64)> {
+        let row = self.store.rows("mobile_entity_state").next()?;
+        Some((row.get(3).and_then(int)?, row.get(4).and_then(int)?))
     }
 
     fn food(&self) -> FoodState {
@@ -386,6 +395,7 @@ pub struct RegionData {
     pub stats: Option<Vec<f64>>,
     pub health: Option<f64>,
     pub action: Option<PlayerAction>,
+    pub position: Option<(i64, i64)>,
 }
 
 pub enum RegionUpdate {
@@ -498,6 +508,7 @@ async fn session(
                     stats: feed.stats(),
                     health: feed.health(),
                     action: feed.action(),
+                    position: feed.position(),
                 }));
                 if feed.add_missing_lookups() && sink.send(feed.subscribe_message()).await.is_err() {
                     return Ok(());

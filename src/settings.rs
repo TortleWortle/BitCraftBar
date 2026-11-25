@@ -18,11 +18,35 @@ pub struct Settings {
     /// when the user moves it.
     #[serde(default)]
     pub info_origin: Option<(f32, f32)>,
+    #[serde(default)]
+    pub sounds: SoundSettings,
+    /// Last known `character_stats` values of `user_id` (max stamina etc.),
+    /// used at startup until the relay or REST answers: both can be down
+    /// (relay restarting, `players/<id>/stats` 404).
+    #[serde(default)]
+    pub cached_stats: Option<Vec<f64>>,
+}
+
+/// Which events play a sound, and how loud (settings in the popup).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SoundSettings {
+    pub craft_finished: bool,
+    pub out_of_food: bool,
+    pub idle_full: bool,
+    /// 0–1.
+    pub volume: f32,
+}
+
+impl Default for SoundSettings {
+    fn default() -> Self {
+        Self { craft_finished: false, out_of_food: false, idle_full: false, volume: 0.5 }
+    }
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { user_id: DEFAULT_USER_ID.into(), username: None, info_window: false, info_origin: None }
+        Self { user_id: DEFAULT_USER_ID.into(), username: None, info_window: false, info_origin: None, sounds: SoundSettings::default(), cached_stats: None }
     }
 }
 

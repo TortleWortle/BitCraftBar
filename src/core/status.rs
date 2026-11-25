@@ -50,6 +50,10 @@ impl StatusMonitor {
         }
     }
 
+    pub fn get(&self, source: &str) -> Option<&Report> {
+        self.reports.get(source)
+    }
+
     pub fn clear(&mut self, source: &str) {
         self.reports.remove(source);
     }

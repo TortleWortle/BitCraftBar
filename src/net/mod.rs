@@ -42,6 +42,8 @@ pub enum NetEvent {
     Satiation(f64),
     /// `character_stats_state` values (same indices as REST stats).
     CharacterStats(Vec<f64>),
+    /// BitJita live `mobile_entity_state` location (x, z), throttled.
+    Position((i64, i64)),
     CraftProgress { id: String, progress: i64 },
     Crafts(Vec<CraftInfo>),
     Stats(Vec<f64>),
@@ -70,6 +72,8 @@ pub struct RelayPlayer {
     pub health: Option<f64>,
     /// Current action (`player_action_state`), for the action bar.
     pub action: Option<PlayerAction>,
+    /// `mobile_entity_state` location (x, z), for "moved recently".
+    pub position: Option<(i64, i64)>,
 }
 
 pub enum Outgoing {
@@ -160,7 +164,7 @@ fn track(user: String, out: async_channel::Sender<Outgoing>, caches: Arc<Mutex<C
     let relay_live = Arc::new(AtomicBool::new(false));
 
     let (live_tx, live_rx) = mpsc::unbounded_channel();
-    let channels = vec![live::experience(&user), live::stamina(&user), live::satiation(&user), live::character_stats(&user)];
+    let channels = vec![live::experience(&user), live::stamina(&user), live::satiation(&user), live::character_stats(&user), live::mobile(&user)];
     let live_task = tokio::spawn(live::run(channels, live_rx, emitter.clone()));
 
     let poll_task = tokio::spawn(poll(user, emitter, relay_live, caches));
@@ -396,7 +400,7 @@ async fn relay_hub(
             .iter()
             .find(|(r, d)| d.signed_in.is_some() && states.get(r) == Some(&RelayState::Live))
             .map(|(_, d)| d);
-        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone(), health: d.health, action: d.action.clone() }));
+        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone(), health: d.health, action: d.action.clone(), position: d.position }));
         if player_info != last_player {
             emit(NetEvent::RelayPlayer(player_info.clone()));
             last_player = player_info;

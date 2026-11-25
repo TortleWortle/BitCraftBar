@@ -30,6 +30,7 @@ raw-window-handle = "0.6"
 tiny-skia = "0.11"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rodio = { version = "0.20", default-features = false }
 
 # Tray icon: the D-Bus StatusNotifierItem backend on Linux (no GTK needed;
 # works on KDE, and on GNOME with the AppIndicator extension).

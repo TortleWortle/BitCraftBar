@@ -9,6 +9,7 @@ mod net;
 mod notifier;
 mod platform;
 mod settings;
+mod sound;
 mod tray;
 mod ui;
 

@@ -33,7 +33,14 @@ pub fn satiation(user: &str) -> String {
 pub fn character_stats(user: &str) -> String {
     format!("character_stats_state:{user}")
 }
+/// Position (~16 events/s while moving; throttled to 1/s in `handle`).
+pub fn mobile(user: &str) -> String {
+    format!("mobile_entity_state:{user}")
+}
 pub const CRAFT_PREFIX: &str = "progressive_action_state:";
+
+/// Last position event sent on (when, where), for throttling.
+static LAST_POSITION: std::sync::Mutex<Option<(std::time::Instant, (i64, i64))>> = std::sync::Mutex::new(None);
 
 /// Runs until the command channel closes. Sends events via `emit`.
 pub async fn run(
@@ -164,6 +171,16 @@ fn handle(text: &str, emit: &impl Fn(NetEvent)) {
         "character_stats_state" => NetEvent::CharacterStats(
             data["values"].as_array().map(|v| v.iter().filter_map(Value::as_f64).collect()).unwrap_or_default(),
         ),
+        "mobile_entity_state" => {
+            let (Some(x), Some(z)) = (data["location_x"].as_i64(), data["location_z"].as_i64()) else { return };
+            // Movement only needs ~1s resolution; don't re-render 16×/s.
+            let mut last = LAST_POSITION.lock().unwrap();
+            if last.is_some_and(|(at, pos)| pos == (x, z) || at.elapsed().as_secs_f64() < 1.0) {
+                return;
+            }
+            *last = Some((std::time::Instant::now(), (x, z)));
+            NetEvent::Position((x, z))
+        }
         "progressive_action_state" => {
             let id = match &data["entity_id"] {
                 Value::String(s) => s.clone(),

@@ -10,6 +10,7 @@ use crate::core::trackers::{
     StaminaTracker,
 };
 use crate::core::types::{FoodState, PlayerAction, PlayerSummary, now};
+use crate::sound::Sound;
 use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState, live};
 use crate::settings::Settings;
 
@@ -22,6 +23,9 @@ pub const ALERT_COOLDOWN: f64 = 5.0 * 60.0;
 const PLAYER_SOURCE: &str = "Player";
 const CONNECTION_SOURCE: &str = "Connection";
 const FOOD_SOURCE: &str = "Food";
+
+/// Stamina fraction above which "idle" plays the idle sound.
+pub const IDLE_SOUND_STAMINA: f64 = 0.9;
 
 pub struct Notification {
     pub title: String,
@@ -45,6 +49,13 @@ pub struct Model {
     pub max_health: Option<f64>,
     /// Relay only (`player_action_state`).
     pub action: Option<PlayerAction>,
+    sounds: Vec<Sound>,
+    was_idle_full: bool,
+    /// Relay position and when it last changed ("Active" while moving).
+    position: Option<(i64, i64)>,
+    pub moved_at: Option<f64>,
+    /// Activity went idle straight from "Active" (moving): no idle alerts.
+    idle_after_moving: bool,
     activity: ActivityCheck,
 
     pub live_state: ConnState,
@@ -92,6 +103,11 @@ impl Model {
             health: None,
             max_health: None,
             action: None,
+            sounds: Vec::new(),
+            was_idle_full: false,
+            position: None,
+            moved_at: None,
+            idle_after_moving: false,
             activity: ActivityCheck::default(),
             live_state: ConnState::Connecting,
             relay_state: RelayState::Off,
@@ -110,6 +126,10 @@ impl Model {
             plants_from_relay: None,
             passive_from_relay: None,
         };
+        // Last known stats until a live source answers.
+        if let Some(values) = model.settings.cached_stats.clone() {
+            model.apply_stats(&values);
+        }
         model.commands.push(Command::Track(model.settings.user_id.clone()));
         model.evaluate();
         model
@@ -117,6 +137,12 @@ impl Model {
 
     pub fn take_commands(&mut self) -> Vec<Command> {
         std::mem::take(&mut self.commands)
+    }
+
+    /// Sound events since the last call (played by `AppState::flush` if
+    /// enabled in the settings).
+    pub fn take_sounds(&mut self) -> Vec<Sound> {
+        std::mem::take(&mut self.sounds)
     }
 
     pub fn take_notifications(&mut self) -> Vec<Notification> {
@@ -132,6 +158,7 @@ impl Model {
         self.settings.username = Some(player.username.clone());
         if player.entity_id != self.settings.user_id {
             self.settings.user_id = player.entity_id.clone();
+            self.settings.cached_stats = None;
             self.experience = ExperienceTracker::default();
             self.stamina = StaminaTracker::default();
             self.satiation = SatiationTracker::default();
@@ -142,6 +169,9 @@ impl Model {
             self.health = None;
             self.max_health = None;
             self.action = None;
+            self.position = None;
+            self.moved_at = None;
+            self.idle_after_moving = false;
             self.monitor = StatusMonitor::default();
             self.relay_state = RelayState::Off;
             self.live_state = ConnState::Connecting;
@@ -218,6 +248,9 @@ impl Model {
                 }
                 self.health = player.as_ref().and_then(|p| p.health);
                 self.action = player.as_ref().and_then(|p| p.action.clone());
+                if let Some(position) = player.as_ref().and_then(|p| p.position) {
+                    self.update_position(position, now);
+                }
                 self.relay_player = player;
             }
             NetEvent::Player(player) => {
@@ -246,6 +279,7 @@ impl Model {
                 let baseline = self.switch_source(true, Feed::Passive);
                 self.passive.update(crafts, now, baseline);
             }
+            NetEvent::Position(position) => self.update_position(position, now),
             NetEvent::InitialRestDone => self.initial_rest_done = true,
             NetEvent::Relay(state) => self.relay_state = state,
             NetEvent::RelayFood(food) => self.food = Some(food),
@@ -290,6 +324,13 @@ impl Model {
     }
 
     fn apply_stats(&mut self, values: &[f64]) {
+        if values.is_empty() {
+            return;
+        }
+        if self.settings.cached_stats.as_deref() != Some(values) {
+            self.settings.cached_stats = Some(values.to_vec());
+            self.settings.save();
+        }
         self.stamina.set_reported_max(values.get(1).copied(), self.now);
         self.satiation.set_reported_max(values.get(19).copied());
         self.max_health = values.first().copied().filter(|v| *v > 0.0);
@@ -342,7 +383,7 @@ impl Model {
             self.monitor.report(PLAYER_SOURCE, HealthStatus::Alert, "Player offline");
         } else {
             self.monitor.report(PLAYER_SOURCE, HealthStatus::Healthy, "Online");
-            self.activity.evaluate(&self.experience, &self.stamina, self.crafts.last_worked.as_ref(), &mut self.monitor, self.now);
+            self.activity.evaluate(&self.experience, &self.stamina, self.crafts.last_worked.as_ref(), self.moved_at, &mut self.monitor, self.now);
             self.satiation.report_current(&mut self.monitor);
             self.report_food();
         }
@@ -352,6 +393,27 @@ impl Model {
             ConnState::Disconnected => self.monitor.report(CONNECTION_SOURCE, HealthStatus::Alert, "Disconnected"),
         }
         self.collect_alert_notifications();
+        self.check_idle_full();
+    }
+
+    /// Position from the relay or BitJita live; a change = moved ("Active").
+    fn update_position(&mut self, position: (i64, i64), now: f64) {
+        if self.position.is_some_and(|p| p != position) {
+            self.moved_at = Some(now);
+        }
+        self.position = Some(position);
+    }
+
+    /// Idle (orange idle message) with stamina above 90%: once per time it
+    /// becomes true (resets when working again or stamina drops).
+    fn check_idle_full(&mut self) {
+        let idle = self.monitor.get(ActivityCheck::SOURCE).is_some_and(|r| ActivityCheck::is_idle(&r.message));
+        let full = self.stamina.fraction().is_some_and(|f| f > IDLE_SOUND_STAMINA);
+        let now_idle_full = idle && full && !self.is_offline && !self.is_loading;
+        if now_idle_full && !self.was_idle_full && !self.idle_after_moving {
+            self.sounds.push(Sound::IdleFull);
+        }
+        self.was_idle_full = now_idle_full;
     }
 
     /// A source turning red from a known non-red state, or the activity
@@ -363,10 +425,23 @@ impl Model {
         }
         for (previous, report) in changes {
             let Some(previous) = previous else { continue };
+            // Idle right after moving: the player stopped the action by
+            // walking away (user request: not alert-worthy). Stays quiet
+            // until the activity is something other than idle again.
+            if report.source == ActivityCheck::SOURCE {
+                if ActivityCheck::is_idle(&report.message) {
+                    if previous.message == ActivityCheck::ACTIVE {
+                        self.idle_after_moving = true;
+                    }
+                } else {
+                    self.idle_after_moving = false;
+                }
+            }
             let turned_red = report.status == HealthStatus::Alert && previous.status != HealthStatus::Alert;
             let went_idle = report.source == ActivityCheck::SOURCE
                 && ActivityCheck::is_idle(&report.message)
-                && !ActivityCheck::is_idle(&previous.message);
+                && !ActivityCheck::is_idle(&previous.message)
+                && !self.idle_after_moving;
             if !turned_red && !went_idle {
                 continue;
             }
@@ -374,13 +449,20 @@ impl Model {
                 continue;
             }
             self.last_alert_at.insert(report.source.clone(), self.now);
+            if turned_red && report.source == FOOD_SOURCE {
+                self.sounds.push(Sound::OutOfFood);
+            }
             let who = self.settings.username.clone().unwrap_or_else(|| "BitCraft".into());
             self.notifications.push(Notification { title: format!("{who}: {}", report.source), body: report.message });
         }
     }
 
     fn collect_notifications(&mut self) {
-        for craft in self.crafts.take_completed() {
+        let completed = self.crafts.take_completed();
+        if !completed.is_empty() && !self.is_loading {
+            self.sounds.push(Sound::CraftFinished);
+        }
+        for craft in completed {
             self.notifications.push(Notification {
                 title: "Craft finished".into(),
                 body: format!("{} at {} is done", craft.name, craft.building.as_deref().unwrap_or("station")),

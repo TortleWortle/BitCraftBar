@@ -549,16 +549,20 @@ pub struct ActivityCheck {
     pub experience_window: f64,
     pub regen_window: f64,
     pub craft_xp_tolerance: f64,
+    /// Moved this recently → "Active".
+    pub move_window: f64,
 }
 
 impl Default for ActivityCheck {
     fn default() -> Self {
-        Self { experience_window: 20.0, regen_window: 10.0, craft_xp_tolerance: 5.0 }
+        Self { experience_window: 20.0, regen_window: 10.0, craft_xp_tolerance: 5.0, move_window: 10.0 }
     }
 }
 
 impl ActivityCheck {
     pub const SOURCE: &'static str = "Activity";
+    /// Message while the character is moving around.
+    pub const ACTIVE: &'static str = "Active";
 
     /// Idle messages (warning, orange; user: red is for food/satiation/
     /// connection problems). Going idle still notifies, see `Model`.
@@ -579,6 +583,7 @@ impl ActivityCheck {
         xp: &ExperienceTracker,
         stamina: &StaminaTracker,
         last_craft: Option<&Craft>,
+        moved_at: Option<f64>,
         monitor: &mut StatusMonitor,
         now: f64,
     ) {
@@ -596,7 +601,11 @@ impl ActivityCheck {
         let idle_craft = craft.map(|c| format!("Craft idle ({})", c.percent_string()));
         let src = Self::SOURCE;
 
-        if craft.is_some_and(|c| c.is_complete()) {
+        // Moving around (relay position changed in the last 10s): the
+        // player is at the keyboard, so nothing else matters (user request).
+        if moved_at.is_some_and(|t| now - t <= self.move_window) {
+            monitor.report(src, HealthStatus::Healthy, Self::ACTIVE);
+        } else if craft.is_some_and(|c| c.is_complete()) {
             monitor.report(src, HealthStatus::Warning, "Craft finished");
         } else if !gained && stamina.is_at_least(ready) {
             let msg = idle_craft.unwrap_or_else(|| {
@@ -635,10 +644,24 @@ mod tests {
         xp.handle(&[(2, 20)], 1.0);
         stamina.handle(50.0, 1.0);
         stamina.handle(51.0, 2.0);
-        ActivityCheck::default().evaluate(&xp, &stamina, None, &mut monitor, 2.0);
+        ActivityCheck::default().evaluate(&xp, &stamina, None, None, &mut monitor, 2.0);
         assert_eq!(monitor.sorted_reports()[0].message, "Resting");
         stamina.handle(100.0, 3.0);
-        ActivityCheck::default().evaluate(&xp, &stamina, None, &mut monitor, 3.0);
+        ActivityCheck::default().evaluate(&xp, &stamina, None, None, &mut monitor, 3.0);
+        assert_eq!(monitor.sorted_reports()[0].message, "Idle: stamina full");
+    }
+
+    #[test]
+    fn moving_is_active() {
+        let xp = ExperienceTracker::default();
+        let mut stamina = StaminaTracker::default();
+        let mut monitor = StatusMonitor::default();
+        stamina.set_reported_max(Some(100.0), 0.0);
+        stamina.handle(100.0, 0.0);
+        let check = ActivityCheck::default();
+        check.evaluate(&xp, &stamina, None, Some(5.0), &mut monitor, 12.0);
+        assert_eq!(monitor.sorted_reports()[0].message, "Active");
+        check.evaluate(&xp, &stamina, None, Some(5.0), &mut monitor, 16.0);
         assert_eq!(monitor.sorted_reports()[0].message, "Idle: stamina full");
     }
 
@@ -651,7 +674,7 @@ mod tests {
         xp.handle(&[(12, 10)], 0.0);
         xp.handle(&[(12, 42)], 1.0);
         stamina.handle(30.0, 1.0);
-        ActivityCheck::default().evaluate(&xp, &stamina, None, &mut monitor, 40.0);
+        ActivityCheck::default().evaluate(&xp, &stamina, None, None, &mut monitor, 40.0);
         let report = &monitor.sorted_reports()[0];
         assert_eq!((report.status, report.message.as_str()), (HealthStatus::Warning, "Idle: stamina above 20%"));
     }
@@ -671,7 +694,7 @@ mod tests {
             kind: None,
             tier: None,
         };
-        ActivityCheck::default().evaluate(&xp, &stamina, Some(&craft), &mut monitor, 6.0);
+        ActivityCheck::default().evaluate(&xp, &stamina, Some(&craft), None, &mut monitor, 6.0);
         let report = &monitor.sorted_reports()[0];
         assert_eq!((report.status, report.message.as_str()), (HealthStatus::Warning, "Craft finished"));
     }

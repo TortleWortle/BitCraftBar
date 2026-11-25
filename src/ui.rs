@@ -17,6 +17,8 @@ use crate::core::types::PlayerSummary;
 use crate::model::Model;
 use crate::net::{Command, ConnState, Outgoing, RelayState};
 use crate::notifier;
+use crate::settings::SoundSettings;
+use crate::sound::Sound;
 use crate::tray::Tray;
 
 pub const PANEL_WIDTH: f32 = 320.0;
@@ -67,6 +69,8 @@ pub struct AppState {
     pub info: Option<WindowHandle<crate::info::InfoWindow>>,
     pub info_height: Option<Pixels>,
     pub picking: bool,
+    /// Settings section open in the popup.
+    pub settings_open: bool,
     pub query: String,
     pub results: Vec<PlayerSummary>,
     pub searching: bool,
@@ -88,6 +92,7 @@ impl AppState {
             info: None,
             info_height: None,
             picking: false,
+            settings_open: false,
             query: String::new(),
             results: Vec::new(),
             searching: false,
@@ -132,6 +137,17 @@ impl AppState {
         }
         for n in self.model.take_notifications() {
             notifier::notify(n.title, n.body);
+        }
+        let prefs = self.model.settings.sounds.clone();
+        for sound in self.model.take_sounds() {
+            let enabled = match sound {
+                Sound::CraftFinished => prefs.craft_finished,
+                Sound::OutOfFood => prefs.out_of_food,
+                Sound::IdleFull => prefs.idle_full,
+            };
+            if enabled {
+                crate::sound::play(sound, prefs.volume);
+            }
         }
         if let Some(tray) = &mut self.tray {
             let m = &self.model;
@@ -526,6 +542,10 @@ impl Render for Panel {
             }
         }
 
+        if state.settings_open {
+            body.push(divider(theme).into_any_element());
+            body.push(self.settings(&state.model.settings.sounds, theme).into_any_element());
+        }
         body.push(divider(theme).into_any_element());
         body.push(self.picker(state, theme, cx).into_any_element());
         body.push(
@@ -537,6 +557,17 @@ impl Render for Panel {
                     let open = state.info.is_some();
                     button("info", if open { "Hide info window" } else { "Show info window" }, theme)
                         .on_click(move |_, _, cx: &mut App| crate::info::toggle(&st, cx))
+                })
+                .child({
+                    let st = self.state.clone();
+                    button("settings", if state.settings_open { "Close settings" } else { "Settings" }, theme).on_click(
+                        move |_, _, cx: &mut App| {
+                            st.update(cx, |s, cx| {
+                                s.settings_open = !s.settings_open;
+                                cx.notify();
+                            })
+                        },
+                    )
                 })
                 .child(div().flex_1())
                 .child(
@@ -714,6 +745,97 @@ impl Panel {
                 div().child(m.experience.last_skill_name().unwrap_or_else(|| "–".into())).into_any_element(),
             ))
             .child(row("Last gain", div().child(last_gain).into_any_element()))
+    }
+
+    /// Sound settings: which events play a sound, volume slider, test.
+    fn settings(&self, prefs: &SoundSettings, theme: Theme) -> impl IntoElement {
+        let state = self.state.clone();
+        let toggle = |id: &'static str, label: &str, on: bool, set: fn(&mut SoundSettings, bool)| {
+            let state = state.clone();
+            div()
+                .id(id)
+                .flex()
+                .items_center()
+                .gap_2()
+                .cursor_pointer()
+                .child(
+                    div()
+                        .size(px(14.0))
+                        .flex_none()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(if on { status_color(HealthStatus::Healthy) } else { theme.border })
+                        .when(on, |d| d.bg(status_color(HealthStatus::Healthy)))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(10.0))
+                        .text_color(rgb(0xffffff))
+                        .child(if on { "✓" } else { "" }),
+                )
+                .child(label.to_string())
+                .on_click(move |_, _, cx: &mut App| {
+                    state.update(cx, |s, cx| {
+                        set(&mut s.model.settings.sounds, !on);
+                        s.model.settings.save();
+                        cx.notify();
+                    })
+                })
+        };
+        // Volume: 20 segments (5% steps); click or drag across them.
+        const STEPS: usize = 20;
+        let volume = prefs.volume;
+        let filled = (volume * STEPS as f32).round() as usize;
+        let slider = div().flex_1().flex().h(px(16.0)).items_center().children((1..=STEPS).map(|i| {
+            let set_to = i as f32 / STEPS as f32;
+            let (down, moved) = (state.clone(), state.clone());
+            let set = move |state: &Entity<AppState>, cx: &mut App| {
+                state.update(cx, |s, cx| {
+                    if (s.model.settings.sounds.volume - set_to).abs() > f32::EPSILON {
+                        s.model.settings.sounds.volume = set_to;
+                        s.model.settings.save();
+                        cx.notify();
+                    }
+                })
+            };
+            div()
+                .flex_1()
+                .h_full()
+                .flex()
+                .items_center()
+                .child(
+                    div()
+                        .w_full()
+                        .h(px(6.0))
+                        .when(i == 1, |d| d.rounded_l_full())
+                        .when(i == STEPS, |d| d.rounded_r_full())
+                        .bg(if i <= filled { status_color(HealthStatus::Healthy) } else { theme.track }),
+                )
+                .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| set(&down, cx))
+                .on_mouse_move(move |e: &gpui::MouseMoveEvent, _, cx| {
+                    if e.pressed_button == Some(gpui::MouseButton::Left) {
+                        set(&moved, cx);
+                    }
+                })
+        }));
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(section_title("Sounds"))
+            .child(toggle("snd-craft", "Craft finished", prefs.craft_finished, |p, v| p.craft_finished = v))
+            .child(toggle("snd-food", "Out of food", prefs.out_of_food, |p, v| p.out_of_food = v))
+            .child(toggle("snd-idle", "Idle with stamina above 90%", prefs.idle_full, |p, v| p.idle_full = v))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().w(px(50.0)).flex_none().text_color(theme.secondary).child("Volume"))
+                    .child(slider)
+                    .child(div().w(px(34.0)).flex_none().flex().justify_end().child(format!("{}%", (volume * 100.0).round() as i64)))
+                    .child(button("snd-test", "Test", theme).on_click(move |_, _, _| crate::sound::play(Sound::CraftFinished, volume))),
+            )
     }
 
     fn plants(&self, m: &Model, theme: Theme) -> impl IntoElement {
