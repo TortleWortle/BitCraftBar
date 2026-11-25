@@ -24,7 +24,7 @@ const FOOD_BUFFS_TYPE: i64 = 861783812;
 /// Refused for another reason than "still loading" (e.g. region not mirrored).
 const REFUSED_RETRY: Duration = Duration::from_secs(5 * 60);
 
-/// Rows per table keyed by primary key (column 0), ref-counted because join
+/// Rows per table keyed by primary key (`pk_column`), ref-counted because join
 /// queries can deliver the same row once per match.
 #[derive(Default)]
 struct Store {
@@ -49,8 +49,9 @@ impl Store {
             let Some(name) = change["table_name"].as_str() else { continue };
             let table = self.tables.entry(name.to_string()).or_default();
             for update in change["updates"].as_array().into_iter().flatten() {
+                let pk = pk_column(name);
                 for row in rows(&update["deletes"]) {
-                    let key = key(&row[0]);
+                    let key = key(&row[pk]);
                     if let Some((_, count)) = table.get_mut(&key) {
                         if *count > 1 {
                             *count -= 1;
@@ -60,13 +61,19 @@ impl Store {
                     }
                 }
                 for row in rows(&update["inserts"]) {
-                    let key = key(&row[0]);
+                    let key = key(&row[pk]);
                     let count = table.get(&key).map_or(0, |(_, c)| *c);
                     table.insert(key, (row, count + 1));
                 }
             }
         }
     }
+}
+
+/// Primary key column per table (from the schema; 0 for all used tables
+/// except `player_state`, whose column 0 is the teleport location).
+fn pk_column(table: &str) -> usize {
+    if table == "player_state" { 1 } else { 0 }
 }
 
 /// Rows are JSON strings of arrays (or arrays).
@@ -138,6 +145,10 @@ impl Feed {
         // Food buffs: the character's active buffs + the food buff types'
         // descriptions (names).
         q.push(format!("SELECT * FROM active_buff_state WHERE entity_id = {u}"));
+        // Character rows (move with the player, like buffs): stats (max
+        // stamina/satiation) and online status.
+        q.push(format!("SELECT * FROM character_stats_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM player_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
@@ -195,6 +206,22 @@ impl Feed {
                 })
             })
             .collect()
+    }
+
+    /// `player_state` = [teleport_location, entity_id, time_played,
+    /// session_start_timestamp, time_signed_in, sign_in_timestamp,
+    /// signed_in, traveler_tasks_expiration] (pk is column 1, but the
+    /// filtered query returns at most one row). None: the player isn't in
+    /// this region.
+    fn signed_in(&self) -> Option<bool> {
+        self.store.rows("player_state").next()?.get(6)?.as_bool()
+    }
+
+    /// `character_stats_state` = [entity_id, values]; same `values` as REST
+    /// `players/<id>/stats` (1 = max stamina, 19 = max satiation).
+    fn stats(&self) -> Option<Vec<f64>> {
+        let values = self.store.rows("character_stats_state").next()?.get(1)?.as_array()?;
+        Some(values.iter().filter_map(Value::as_f64).collect())
     }
 
     fn food(&self) -> FoodState {
@@ -309,6 +336,9 @@ pub struct RegionData {
     pub passive: Vec<PassiveCraft>,
     pub plants: Vec<Plant>,
     pub food: FoodState,
+    /// Character rows; Some only in the region the player is in.
+    pub signed_in: Option<bool>,
+    pub stats: Option<Vec<f64>>,
 }
 
 pub enum RegionUpdate {
@@ -417,6 +447,8 @@ async fn session(
                     passive: feed.passive_crafts(),
                     plants: feed.plants(initial),
                     food: feed.food(),
+                    signed_in: feed.signed_in(),
+                    stats: feed.stats(),
                 }));
                 if feed.add_missing_lookups() && sink.send(feed.subscribe_message()).await.is_err() {
                     return Ok(());

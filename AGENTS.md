@@ -51,15 +51,21 @@ trays can't show text, so it's the **tooltip** there.
    first, separated by `·`.
 
 **Offline**: when the character is signed out of BitCraft, a `Player`
-report goes **alert / "Offline"** (red ring; user asked for red). The label
-then shows **only the issues**: no skill, craft or plant summary (user asked
-to hide plants while offline). Going offline is an error-state notification
-(the report is `healthy / Online` while online, so it's a transition).
-Activity and Satiation reports are **cleared** while offline (idling offline
-isn't a problem, and clearing means coming back online is a "first report",
-so it never notifies). Detection: BitJita's `players/<id>` `signedIn` (polled
-every 60s), overridden to *online* by any live websocket event in the last
-30s, since `signedIn` can lag. Unknown `signedIn` counts as online.
+report goes **alert / "Player offline"** (red ring; user asked for red, and
+for "Player offline" rather than just "Offline"). The label then shows the
+**plant summary + the issues** (`T2 needs fertilizer · Player offline`): no
+skill or craft (stale while offline), but plants keep growing, so the user
+asked to keep their status (an earlier request had hidden it). Going offline
+is an error-state notification (the report is `healthy / Online` while
+online, so it's a transition). Activity, Satiation and Food reports are
+**cleared** while offline (idling offline isn't a problem, and clearing
+means coming back online is a "first report", so it never notifies).
+
+Detection (`Model::evaluate`): the relay's `player_state.signed_in` when
+available (the game's own value; changes instantly). Without the relay:
+BitJita's `players/<id>` `signedIn` (polled every 60s, can lag), overridden
+to *online* by any live websocket event in the last 30s. Unknown counts as
+online.
 
 **Popup panel** (`src/ui.rs`, `Panel`), opened by clicking the tray icon:
 header (status dot, connection state, `· relay` while the relay is live),
@@ -111,7 +117,7 @@ Player, Connection).
 | Activity | nothing received yet | warning | No XP or regen yet |
 | Satiation | satiation ≤ 15 | alert | Low satiation (N) |
 | Food | food regen buff active / none (relay data only) | healthy / alert | Nm Ss left / No food |
-| Player | signed out / signed in | alert / healthy | Offline / Online |
+| Player | signed out / signed in | alert / healthy | Player offline / Online |
 | Connection | connected / connecting / disconnected | healthy / warning / alert | Connected / Connecting… / Disconnected |
 
 Activity rows are checked top to bottom.
@@ -320,6 +326,16 @@ game token was rejected: account risk, and the relay has the same data.
   share 223 buff sets (often ambiguous) and the names were too long. `buff_desc.online_timestamp` is true for food buffs; whether
   that pauses the timer while signed out is unverified (it doesn't matter
   while playing).
+- **Player rows** (`Feed::signed_in`, `Feed::stats`): `player_state` (pk is
+  **column 1**, entity_id; column 0 is the teleport location, hence
+  `pk_column`) column 6 = `signed_in` (`sign_in_timestamp` resets to 0 on
+  sign-out); `character_stats_state` = [entity_id, values] (same indices as
+  REST stats: 1 = max stamina 262, 19 = max satiation 100, verified equal).
+  Like buffs, these rows **move with the player** (present in region 13 and
+  absent in 14 after traveling), so the hub takes the player's rows (food,
+  stats, online status) from the live region that has `player_state` and
+  sends `NetEvent::RelayPlayer` (None when no live region has it → REST
+  fallback).
 - **Active crafts** (`Feed::crafts`): `progressive_action_state` (owner
   filter) = [entity_id, building_entity_id, function_type, progress,
   recipe_id, craft_count, last_crit_outcome, owner, lock_expiration,
@@ -360,7 +376,7 @@ doesn't prove a channel exists). Events: `{"type":"event","channel":...,"data":{
 | `experience_state:<player id>` | `experience_stacks[{skill_id, quantity}]` | **No snapshot on subscribe**, only updates. First update counts as a gain (no baseline); skill is known from the second update on. |
 | `stamina_state:<player id>` | `stamina` | ~1/s while regenerating. **Stops sending when full.** |
 | `satiation_state:<player id>` | `satiation` | ~1/s while it changes (slowly decreasing). |
-| `character_stats_state:<player id>` | `values[1]` = max stamina, `values[19]` = max satiation | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe, so the REST poll provides the initial value. |
+| `character_stats_state:<player id>` | `values[1]` = max stamina, `values[19]` = max satiation | Same `values` array as REST `players/<id>/stats` (format from BitJita's own frontend). **Only sent when a stat changes** (gear/buff), no snapshot on subscribe. Fallback for when the relay's `character_stats_state` isn't available. |
 | `progressive_action_state:<craft entity id>` | `progress`, `entity_id` | One event per craft action (+ a duplicate `preparation: true` event). |
 
 Channels probed that produced no events: `character_stats`, `player_state`,
@@ -379,16 +395,17 @@ agent: Python's default `urllib` agent got 403).
 | `players/<id>/crafts` | Craft list: `entityId`, `progress`, `totalActionsRequired`, `completed`, `craftedItem[].item_id` → `items[].name`, `buildingName`. Polled every 60s to discover new crafts (then followed live). |
 | `players/<id>/passive-crafts` | Passive crafts (fallback when the relay isn't live). Same envelope as crafts (`craftResults`, `items`) but each result only has `entityId`, `buildingName`, `recipeId`, `recipeName` (e.g. `"Weave {0}"`, `{0}` = item), `status`, start `timestamp`, `craftedItem`, `slot`. **No progress or end time.** Only `status: "complete"` observed; anything else = running. Completed crafts stay listed until collected. Can lag behind the game considerably (reason for the relay). |
 | `items/<itemId>` | `craftingRecipes[]` with `id`, `timeRequirement` (seconds). A passive recipe's **duration** (e.g. Weave Rough Cloth Strip = 180s); end = start `timestamp` + duration. Cached per recipe. |
-| `players/<id>/stats` | `stats.values[1]` = **max stamina**, `stats.values[19]` = **max satiation** (index order from BitJita's frontend stat list: maxHealth, maxStamina, …, satiationRegenRate (18), maxSatiation (19), …). Polled every 60s. Inferred mapping, not documented. |
+| `players/<id>/stats` | `stats.values[1]` = **max stamina**, `stats.values[19]` = **max satiation** (index order from BitJita's frontend stat list: maxHealth, maxStamina, …, satiationRegenRate (18), maxSatiation (19), …). Polled every 60s; ignored while the relay provides the stats (REST lags behind gear/buff changes). Inferred mapping, not documented. |
 | `players/<id>/placeables` | Plants fallback. `instances[]`: `placeable{name, tag, tier}`, `placeableId`, `availableInteractions[].verbPhrase`, `updatedAt`, `nextStateAt`, `growthEndTimestamp`. Crops have tag `Farmed Crop`; others (e.g. sift collectors, `Sift`) are ignored. `urgency` is not useful for crops. |
 | `placeables/<placeableId>` | Catalog entry; `growth[].time` = `[min, max]` seconds for timed stages (e.g. Growing Basic Starbulb: 300s). Cached per type; only fetched for growing plants with a start time and no reported end. |
 | `players?q=<text>` | Player search: case-insensitive substring on username, **≥ 2 chars**, **max 50 results, alphabetical, no paging**. Re-ranked client-side: exact, then prefix, then rest. UI hints to type more when 50 come back. |
-| `players/<id>` | `username`, `signedIn` (offline state), `regionId` (relay database). Polled every 60s. `skillMap` was the source for `skill.rs` (hardcoded). |
+| `players/<id>` | `username`, `signedIn` (offline state; fallback when the relay has no `player_state`), `regionId` + `claims[].regionId` (extra relay regions to follow). Polled every 60s. `skillMap` was the source for `skill.rs` (hardcoded). |
 
 ### Data decisions
 
-- **Max stamina**: API value when available (REST poll + live
-  `character_stats_state`, whichever came last); if current stamina exceeds it
+- **Max stamina / satiation**: relay `character_stats_state` when
+  available, else REST stats + BitJita live `character_stats_state`
+  (whichever came last); if current stamina exceeds it
   (API lagging after a gear change), use current. Fallback without API: highest
   stamina seen in the last 10 minutes (current value always included, since
   updates stop at full).

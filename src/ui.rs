@@ -140,9 +140,11 @@ impl AppState {
         if std::env::var_os("BITCRAFT_DEBUG").is_some() {
             let m = &self.model;
             let line = format!(
-                "[{:?}] {} | stamina {:?}/{:?} | relay {:?} | plants {} | passive {} | crafts {} | food {}",
+                "[{:?}] {} | offline {} sat_max {} | stamina {:?}/{:?} | relay {:?} | plants {} | passive {} | crafts {} | food {}",
                 m.monitor.overall(),
                 m.label_text(),
+                m.is_offline,
+                m.satiation.max,
                 m.stamina.stamina,
                 m.stamina.max,
                 m.relay_state,

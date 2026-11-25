@@ -56,6 +56,16 @@ pub enum NetEvent {
     RelayPlants(Vec<Plant>),
     RelayFood(FoodState),
     RelayCrafts(Vec<CraftInfo>),
+    /// The player's own rows (region the player is in). None: not found in
+    /// a live region (relay down / still loading) → use REST.
+    RelayPlayer(Option<RelayPlayer>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct RelayPlayer {
+    pub signed_in: bool,
+    /// `character_stats_state.values` (1 = max stamina, 19 = max satiation).
+    pub stats: Option<Vec<f64>>,
 }
 
 pub enum Outgoing {
@@ -190,7 +200,7 @@ async fn poll(user: String, emit: impl Fn(NetEvent) + Clone + Send + Sync + 'sta
                 let mut regions: BTreeSet<i64> = MIRRORED_REGIONS.into_iter().collect();
                 regions.extend(p.region_id);
                 regions.extend(p.claims.iter().filter_map(|c| c.region_id));
-                let _ = hub.send(HubCommand::Regions { all: regions, player: p.region_id });
+                let _ = hub.send(HubCommand::Regions { all: regions });
                 emit(NetEvent::Player(p));
             }
             Err(e) => eprintln!("player: {e}"),
@@ -289,8 +299,8 @@ async fn with_growth_durations(mut plants: Vec<Plant>, caches: &Arc<Mutex<Caches
 const MIRRORED_REGIONS: [i64; 9] = [7, 8, 9, 12, 13, 14, 17, 18, 19];
 
 enum HubCommand {
-    /// Regions to follow; the player's current one (food buffs are there).
-    Regions { all: BTreeSet<i64>, player: Option<i64> },
+    /// Regions to follow.
+    Regions { all: BTreeSet<i64> },
 }
 
 fn start_relay_hub(
@@ -318,15 +328,14 @@ async fn relay_hub(
     let mut feeds: HashMap<i64, AbortOnDrop> = HashMap::new();
     let mut states: HashMap<i64, RelayState> = HashMap::new();
     let mut data: HashMap<i64, relay::RegionData> = HashMap::new();
-    let mut player_region: Option<i64> = None;
     let mut last_state: Option<RelayState> = None;
+    let mut last_player: Option<RelayPlayer> = None;
     loop {
         let mut data_changed = false;
         tokio::select! {
             command = commands.recv() => match command {
                 None => return,
-                Some(HubCommand::Regions { all, player }) => {
-                    player_region = player;
+                Some(HubCommand::Regions { all }) => {
                     feeds.retain(|r, _| all.contains(r));
                     states.retain(|r, _| all.contains(r));
                     data.retain(|r, _| all.contains(r));
@@ -374,12 +383,18 @@ async fn relay_hub(
             let plants = data.values().flat_map(|d| d.plants.clone()).collect();
             emit(NetEvent::RelayPlants(with_growth_durations(plants, &caches).await));
         }
-        // Food buffs live in the player's current region.
-        if data_changed
-            && let Some(region) = player_region
-            && states.get(&region) == Some(&RelayState::Live)
-            && let Some(d) = data.get(&region)
-        {
+        // The player's own rows (buffs, stats, online status) are in the
+        // region the player is in: the live region that has `player_state`.
+        let player = data
+            .iter()
+            .find(|(r, d)| d.signed_in.is_some() && states.get(r) == Some(&RelayState::Live))
+            .map(|(_, d)| d);
+        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone() }));
+        if player_info != last_player {
+            emit(NetEvent::RelayPlayer(player_info.clone()));
+            last_player = player_info;
+        }
+        if data_changed && let Some(d) = player {
             emit(NetEvent::RelayFood(d.food.clone()));
         }
     }

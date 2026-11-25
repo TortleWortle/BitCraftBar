@@ -10,7 +10,7 @@ use crate::core::trackers::{
     StaminaTracker,
 };
 use crate::core::types::{FoodState, PlayerSummary, now};
-use crate::net::{Command, ConnState, NetEvent, RelayState, live};
+use crate::net::{Command, ConnState, NetEvent, RelayPlayer, RelayState, live};
 use crate::settings::Settings;
 
 pub const LOADING_TIMEOUT: f64 = 20.0;
@@ -52,6 +52,9 @@ pub struct Model {
     initial_rest_done: bool,
     connected_at: Option<f64>,
     reported_signed_in: Option<bool>,
+    /// From the relay (`player_state` / `character_stats_state`); while
+    /// Some, it replaces REST `signedIn` and REST stats (both lag).
+    relay_player: Option<RelayPlayer>,
     last_live_event_at: Option<f64>,
     last_alert_at: HashMap<String, f64>,
 
@@ -91,6 +94,7 @@ impl Model {
             initial_rest_done: false,
             connected_at: None,
             reported_signed_in: None,
+            relay_player: None,
             last_live_event_at: None,
             last_alert_at: HashMap::new(),
             commands: Vec::new(),
@@ -131,6 +135,7 @@ impl Model {
             self.relay_state = RelayState::Off;
             self.live_state = ConnState::Connecting;
             self.reported_signed_in = None;
+            self.relay_player = None;
             self.last_live_event_at = None;
             self.connected_at = None;
             self.is_offline = false;
@@ -191,7 +196,17 @@ impl Model {
                 // Keep the BitJita live channels too (fallback if the relay drops).
                 self.commands.push(Command::Subscribe(ids.iter().map(|id| format!("{}{id}", live::CRAFT_PREFIX)).collect()));
             }
-            NetEvent::Stats(values) => self.apply_stats(&values),
+            // REST stats lag behind gear/buff changes; the relay's are live.
+            NetEvent::Stats(values) if self.relay_player.as_ref().is_none_or(|p| p.stats.is_none()) => {
+                self.apply_stats(&values)
+            }
+            NetEvent::Stats(_) => {}
+            NetEvent::RelayPlayer(player) => {
+                if let Some(values) = player.as_ref().and_then(|p| p.stats.as_ref()) {
+                    self.apply_stats(values);
+                }
+                self.relay_player = player;
+            }
             NetEvent::Player(player) => {
                 self.reported_signed_in = player.signed_in;
                 if self.settings.username.as_deref() != Some(player.username.as_str()) {
@@ -281,8 +296,13 @@ impl Model {
 
     /// BitJita can stop delivering events on a healthy-looking connection;
     /// satiation updates ~1/s while signed in, so silence means stale.
+    /// Relay `player_state.signed_in` when available, else REST `signedIn`.
+    fn signed_in(&self) -> Option<bool> {
+        self.relay_player.as_ref().map(|p| p.signed_in).or(self.reported_signed_in)
+    }
+
     fn reconnect_if_feed_stale(&mut self, now: f64) {
-        let (Some(true), Some(connected_at)) = (self.reported_signed_in, self.connected_at) else { return };
+        let (Some(true), Some(connected_at)) = (self.signed_in(), self.connected_at) else { return };
         let last = self.last_live_event_at.unwrap_or(0.0).max(connected_at);
         if now - last >= STALE_FEED_WINDOW {
             eprintln!("Signed in but no live events for {}s; reconnecting", (now - last) as i64);
@@ -291,14 +311,21 @@ impl Model {
     }
 
     fn evaluate(&mut self) {
-        let live_recently = self.last_live_event_at.is_some_and(|t| self.now - t <= LIVE_EVENT_WINDOW);
-        self.is_offline = !live_recently && self.reported_signed_in == Some(false);
+        self.is_offline = match &self.relay_player {
+            // The game's own `signed_in`: live and authoritative.
+            Some(player) => !player.signed_in,
+            // REST `signedIn` lags: any live event in the last 30s wins.
+            None => {
+                let live_recently = self.last_live_event_at.is_some_and(|t| self.now - t <= LIVE_EVENT_WINDOW);
+                !live_recently && self.reported_signed_in == Some(false)
+            }
+        };
         if self.is_offline {
             // Cleared: coming back online is a first report → no notification.
             self.monitor.clear(ActivityCheck::SOURCE);
             self.monitor.clear(SatiationTracker::SOURCE);
             self.monitor.clear(FOOD_SOURCE);
-            self.monitor.report(PLAYER_SOURCE, HealthStatus::Alert, "Offline");
+            self.monitor.report(PLAYER_SOURCE, HealthStatus::Alert, "Player offline");
         } else {
             self.monitor.report(PLAYER_SOURCE, HealthStatus::Healthy, "Online");
             self.activity.evaluate(&self.experience, &self.stamina, self.crafts.last_worked.as_ref(), &mut self.monitor, self.now);
@@ -369,14 +396,16 @@ impl Model {
         }
     }
 
-    /// Menu bar / tooltip text: "Fishing 22% · Resting", "Offline", "Loading…".
+    /// Menu bar / tooltip text: "Fishing 22% · Resting",
+    /// "T2 grown · Player offline", "Loading…".
     pub fn label_text(&self) -> String {
         if self.is_loading {
             return "Loading…".into();
         }
         let issues = self.monitor.active_issues().into_iter().map(|r| r.message);
         if self.is_offline {
-            return issues.collect::<Vec<_>>().join(" · ");
+            // No skill/craft (stale), but plants keep growing offline.
+            return self.plants.summary().into_iter().chain(issues).collect::<Vec<_>>().join(" · ");
         }
         let mut head = self.experience.last_skill_name().unwrap_or_default();
         if let Some(craft) = self.active_craft() {
