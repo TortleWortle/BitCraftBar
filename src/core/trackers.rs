@@ -313,20 +313,15 @@ impl CraftTracker {
         }
     }
 
-    /// Full craft list (relay). Returns ids of incomplete crafts.
-    pub fn update(&mut self, list: &[CraftInfo]) -> Vec<String> {
-        for info in list.iter().filter(|c| c.completed) {
-            if let Some(mut craft) = self.crafts.get(&info.id).cloned() {
-                craft.progress = craft.progress.max(craft.total);
-                self.report_completion(&craft);
-                if self.last_worked.as_ref().is_some_and(|l| l.id == craft.id) {
-                    self.last_worked = Some(craft);
-                }
-            }
-        }
+    /// Full craft list (relay). Finished crafts stay listed until
+    /// collected (the relay keeps their row; BitJita's REST used to drop
+    /// them, so they used to be dropped here too). A craft already
+    /// finished when first seen isn't news (no "Craft finished").
+    pub fn update(&mut self, list: &[CraftInfo]) {
         let mut seen = HashSet::new();
-        for info in list.iter().filter(|c| !c.completed) {
+        for info in list {
             seen.insert(info.id.clone());
+            let is_new = !self.crafts.contains_key(&info.id);
             let entry = self.crafts.entry(info.id.clone()).or_insert_with(|| Craft {
                 id: info.id.clone(),
                 name: info.name.clone(),
@@ -347,12 +342,28 @@ impl CraftTracker {
             entry.total = info.total;
             // Live updates are fresher; never move backwards.
             entry.progress = entry.progress.max(info.progress);
+            if info.completed {
+                entry.progress = entry.progress.max(entry.total);
+            }
+            let craft = entry.clone();
+            if !craft.is_complete() {
+                continue;
+            }
+            if is_new {
+                self.completion_reported.insert(craft.id.clone());
+            } else {
+                self.report_completion(&craft);
+            }
+            if self.last_worked.as_ref().is_some_and(|l| l.id == craft.id) {
+                self.last_worked = Some(craft);
+            }
         }
+        // Gone: collected (or cancelled).
         self.crafts.retain(|id, _| seen.contains(id));
+        self.completion_reported.retain(|id| seen.contains(id));
         if self.last_worked.as_ref().is_some_and(|l| !l.is_complete() && !seen.contains(&l.id)) {
             self.last_worked = None;
         }
-        seen.into_iter().collect()
     }
 
     pub fn handle_progress(&mut self, entity_id: &str, progress: i64, now: f64) {
@@ -786,6 +797,35 @@ mod tests {
         assert_eq!((xp.last_gain_at, xp.last_skill_id, xp.total), (None, None, Some(15)));
         xp.handle(&[(2, 10), (12, 9)], 1.0);
         assert_eq!((xp.last_gain_at, xp.last_skill_id, xp.last_gain_amount), (Some(1.0), Some(12), 4));
+    }
+
+    #[test]
+    fn finished_crafts_stay_until_collected() {
+        let info = |id: &str, progress| CraftInfo {
+            id: id.into(),
+            name: "Thread".into(),
+            building: None,
+            progress,
+            total: 100,
+            completed: progress >= 100,
+            kind: None,
+            tier: None,
+            skill: None,
+        };
+        let mut crafts = CraftTracker::default();
+        // Already finished when first seen: listed, but not news.
+        crafts.update(&[info("1", 100), info("2", 40)]);
+        assert_eq!(crafts.sorted().len(), 2);
+        assert!(crafts.take_completed().is_empty());
+        // Finishing while tracked: news once, and still listed.
+        crafts.update(&[info("1", 100), info("2", 100)]);
+        assert_eq!(crafts.take_completed().len(), 1);
+        crafts.update(&[info("1", 100), info("2", 100)]);
+        assert!(crafts.take_completed().is_empty());
+        assert!(crafts.sorted().iter().all(|c| c.is_complete()));
+        // Collected: gone.
+        crafts.update(&[info("2", 100)]);
+        assert_eq!(crafts.sorted().len(), 1);
     }
 
     #[test]

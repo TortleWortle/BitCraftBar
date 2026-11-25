@@ -678,6 +678,13 @@ connection. Replaced by the relay (user request).
 - **Craft time remaining was removed** (rate-based ETA was too inaccurate).
   Show percent done instead, rounded down so it never shows 100% early.
 - A craft is **active** if it progressed in the last 30s; otherwise "Paused".
+- **Finished crafts stay listed until collected** (user report: they
+  didn't show). The relay keeps a finished craft's
+  `progressive_action_state` row until it's collected; `CraftTracker::update`
+  used to drop completed crafts (a leftover from BitJita's REST, which
+  stopped listing them). Now they show as "Done" (green badge) until the
+  row disappears. One already finished when first seen (app start) isn't
+  a "Craft finished" notification.
 - **Own progress** (user report: a thread craft showed as the current
   activity while they were chopping a tree; others can work on your
   craft). `progressive_action_state` has no "who" column, so progress
