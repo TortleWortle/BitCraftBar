@@ -73,6 +73,10 @@ struct CraftedItem {
 struct Item {
     id: i64,
     name: String,
+    #[serde(default)]
+    tag: Option<String>,
+    #[serde(default)]
+    tier: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -97,18 +101,18 @@ pub async fn crafts(user: &str) -> Result<Vec<CraftInfo>> {
     let r: CraftsResponse = get(&format!("players/{user}/crafts")).await?;
     Ok(r.craft_results
         .into_iter()
-        .map(|c| CraftInfo {
-            name: c
-                .crafted_item
-                .first()
-                .and_then(|i| r.items.iter().find(|it| it.id == i.item_id))
-                .map(|it| it.name.clone())
-                .unwrap_or_else(|| "Craft".into()),
+        .map(|c| {
+            let item = c.crafted_item.first().and_then(|i| r.items.iter().find(|it| it.id == i.item_id));
+            CraftInfo {
+            name: item.map(|it| it.name.clone()).unwrap_or_else(|| "Craft".into()),
+            kind: item.and_then(|it| it.tag.clone()),
+            tier: item.and_then(|it| it.tier),
             id: c.entity_id,
             building: c.building_name,
             progress: c.progress,
             total: c.total_actions_required,
             completed: c.completed,
+            }
         })
         .collect())
 }
@@ -272,6 +276,11 @@ pub struct PassiveCraftsResponse {
 impl PassiveCraftsResponse {
     pub fn item_name(&self, id: i64) -> Option<&str> {
         self.items.iter().find(|i| i.id == id).map(|i| i.name.as_str())
+    }
+
+    /// Item tag and tier.
+    pub fn item_kind(&self, id: i64) -> (Option<String>, Option<i64>) {
+        self.items.iter().find(|i| i.id == id).map_or((None, None), |i| (i.tag.clone(), i.tier))
     }
 }
 

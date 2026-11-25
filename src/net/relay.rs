@@ -149,6 +149,7 @@ impl Feed {
         // stamina/satiation) and online status.
         q.push(format!("SELECT * FROM character_stats_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM player_state WHERE entity_id = {u}"));
+        q.push(format!("SELECT * FROM health_state WHERE entity_id = {u}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_REGEN_TYPE}"));
         q.push(format!("SELECT * FROM buff_desc WHERE buff_type_id = {FOOD_BUFFS_TYPE}"));
         q.extend(self.item_ids.iter().map(|id| format!("SELECT * FROM item_desc WHERE id = {id}")));
@@ -224,6 +225,12 @@ impl Feed {
         Some(values.iter().filter_map(Value::as_f64).collect())
     }
 
+    /// `health_state` = [entity_id, last_health_decrease_timestamp, health,
+    /// died_timestamp]; max health is stats value 0.
+    fn health(&self) -> Option<f64> {
+        self.store.rows("health_state").next()?.get(2)?.as_f64()
+    }
+
     fn food(&self) -> FoodState {
         FoodState { buffs: self.food_buffs().into_iter().map(|(_, b)| b).collect() }
     }
@@ -247,10 +254,11 @@ impl Feed {
             .rows("progressive_action_state")
             .map(|row| {
                 let recipe = self.store.get("crafting_recipe_desc", &key(&row[4]));
-                let item_name = recipe
+                let item = recipe
                     .and_then(|r| crafted_item_id(r))
-                    .and_then(|id| self.store.get("item_desc", &id.to_string()))
-                    .and_then(|r| r.get(1)?.as_str());
+                    .and_then(|id| self.store.get("item_desc", &id.to_string()));
+                let item_name = item.and_then(|r| r.get(1)?.as_str());
+                let (kind, tier) = item_kind(item);
                 let progress = row.get(3).and_then(int).unwrap_or(0);
                 let count = row.get(5).and_then(int).unwrap_or(1);
                 let per_item = recipe.and_then(|r| r.get(14).and_then(int)).unwrap_or(0);
@@ -262,6 +270,8 @@ impl Feed {
                     progress,
                     total,
                     completed: progress >= total,
+                    kind,
+                    tier,
                 }
             })
             // Recipe not loaded yet: total unknown (0 would look finished).
@@ -275,9 +285,9 @@ impl Feed {
             .map(|row| {
                 let recipe = self.store.get("crafting_recipe_desc", &key(&row[2]));
                 let item_id = recipe.and_then(|r| crafted_item_id(r));
-                let item_name = item_id
-                    .and_then(|id| self.store.get("item_desc", &id.to_string()))
-                    .and_then(|r| r.get(1)?.as_str());
+                let item = item_id.and_then(|id| self.store.get("item_desc", &id.to_string()));
+                let item_name = item.and_then(|r| r.get(1)?.as_str());
+                let (kind, tier) = item_kind(item);
                 let building = self.building_name(&row[3]);
                 // status: 0 Queued, 1 Processing, 2 Complete.
                 let status = row.get(5).and_then(tag);
@@ -289,6 +299,8 @@ impl Feed {
                     started_at: if status == Some(0) { None } else { row.get(4).and_then(date) },
                     reported_complete: status == Some(2),
                     duration: recipe.and_then(|r| r.get(2)?.as_f64()),
+                    kind,
+                    tier,
                 }
             })
             .collect()
@@ -328,6 +340,12 @@ impl Feed {
     }
 }
 
+/// `item_desc` tag (column 10, "Ingot") and tier (column 9).
+fn item_kind(item: Option<&Vec<Value>>) -> (Option<String>, Option<i64>) {
+    let Some(item) = item else { return (None, None) };
+    (item.get(10).and_then(Value::as_str).map(str::to_string), item.get(9).and_then(int))
+}
+
 /// Follows `user`'s passive crafts and plants in `region` until cancelled.
 /// Everything one region's database has for the character, after an update.
 #[derive(Default)]
@@ -339,6 +357,7 @@ pub struct RegionData {
     /// Character rows; Some only in the region the player is in.
     pub signed_in: Option<bool>,
     pub stats: Option<Vec<f64>>,
+    pub health: Option<f64>,
 }
 
 pub enum RegionUpdate {
@@ -449,6 +468,7 @@ async fn session(
                     food: feed.food(),
                     signed_in: feed.signed_in(),
                     stats: feed.stats(),
+                    health: feed.health(),
                 }));
                 if feed.add_missing_lookups() && sink.send(feed.subscribe_message()).await.is_err() {
                     return Ok(());

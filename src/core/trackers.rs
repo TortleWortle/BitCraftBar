@@ -196,6 +196,8 @@ pub struct Craft {
     pub progress: i64,
     pub total: i64,
     pub last_progress_at: Option<f64>,
+    pub kind: Option<String>,
+    pub tier: Option<i64>,
 }
 
 impl Craft {
@@ -286,8 +288,12 @@ impl CraftTracker {
                 progress: info.progress,
                 total: info.total,
                 last_progress_at: None,
+                kind: info.kind.clone(),
+                tier: info.tier,
             });
             entry.name = info.name.clone();
+            entry.kind = info.kind.clone();
+            entry.tier = info.tier;
             entry.building = info.building.clone();
             entry.total = info.total;
             // Live updates are fresher; never move backwards.
@@ -348,6 +354,8 @@ impl TierSummary {
 #[derive(Default)]
 pub struct PlantTracker {
     pub tiers: Vec<TierSummary>,
+    /// Last list (for badges).
+    pub plants: Vec<Plant>,
     has_loaded: bool,
     finished: Vec<TierSummary>,
 }
@@ -404,6 +412,7 @@ impl PlantTracker {
 
     /// `baseline`: first list from a different source; no notifications.
     pub fn update(&mut self, plants: &[Plant], baseline: bool) {
+        self.plants = plants.to_vec();
         if baseline {
             self.has_loaded = false;
         }
@@ -659,6 +668,8 @@ mod tests {
             progress: 10,
             total: 10,
             last_progress_at: Some(5.0),
+            kind: None,
+            tier: None,
         };
         ActivityCheck::default().evaluate(&xp, &stamina, Some(&craft), &mut monitor, 6.0);
         let report = &monitor.sorted_reports()[0];

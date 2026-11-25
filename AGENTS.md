@@ -73,7 +73,8 @@ per-source status reports, stats rows (stamina bar `current / max` in the
 overall status color; **food bar** right below it; **satiation bar**
 `current / max`, green, red at/below the alert threshold; total XP; last
 skill; last gain), plants, passive crafts,
-crafts (progress bar, percent, Paused/Done), character picker, Quit.
+crafts (progress bar, percent, Paused/Done), character picker,
+*Show/Hide info window*, Quit.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
   currently growing** (count + time until the whole tier is grown, `~` when
@@ -91,10 +92,65 @@ crafts (progress bar, percent, Paused/Done), character picker, Quit.
   long; several foods give the same buffs, so it was often "A / B"). Empty
   bar + red "None" when no food regen is active; "–" until the relay
   delivered buffs (relay only; REST buff data is unreliable).
-- **Timers** (plants, passive crafts, food, last gain; `ui::duration_string`):
+- **Badges** (`core::badges`, user request; under each section title in
+  the popup and in the info window): one pill per *type + tier* and state,
+  with a count, e.g. `Grain T1 ×6`, `Ingot T2`, `Rope T5`. Colors: **red**
+  = action needed (plant needs fertilizer/water), **orange** = processing
+  (growing, passive craft running, craft worked on in the last 30s),
+  **gray** = idle (paused craft, queued passive craft), **green** =
+  finished (grown, ready to collect, craft complete). Most urgent first.
+  Crafts and passive crafts use the crafted item's **tag** + tier (relay
+  `item_desc` columns 10 / 9; REST `items[].tag` / `.tier`), falling back
+  to the item name. Plants use the crop from the placeable name
+  (`<stage> <quality> <crop>`; quality = tier): Embergrain → Grain,
+  Starbulb → Bulbs, Wispweave → Fiber (the only three crops in the
+  catalog; the user's examples were "Grain" and "Bulbs").
+  **Hover text** (`Badge::tooltip`, user request) by state: gray → percent
+  done (`8% done`; queued passive crafts: `Queued`), red → what's needed
+  (`Needs fertilizer`, `3 need fertilizer · 1 needs water`), orange → time
+  left (`4m left`, `next ~4m · all 14m`, `~` = estimate, `Time left
+  unknown` for plants already growing at launch), green → `Ready to
+  harvest` / `Ready to collect` / `Done`. Active crafts have no time left
+  (the rate-based ETA was removed), so orange crafts show percent too.
+  **Tier rows** (`badges::by_tier`, user request): when a section has
+  more than one tier, its badges are split into one row per tier with a
+  `T2` heading (ascending; untiered last) and the badges drop the tier
+  (`Grain ×6`). With a single tier it's one row with `Grain T1 ×6`. In
+  the info window the tier headings sit (left-aligned, flush with the label) in the label column under
+  "Plants"/"Passive"/"Crafts" (user request, so all badges line up); in
+  the popup they're a narrow column left of the badges, under the section
+  title.
+- **Timers** (plants, passive crafts, food, last gain; `core::types::duration_string`):
   `1h 05m`, `4m` (minutes rounded up, so never `0m` with time left), and
   seconds only under a minute, `42s` (user preference; was `4m 12s`).
 - Light/dark colors follow the window appearance (`Theme`).
+
+**Info window** (`src/info.rs`, user request): a small (260px) always-on-top
+card, toggled from the popup, for keeping an eye on the character while
+playing. Top-right corner of the main display by default; **movable** by
+dragging (anywhere on macOS/Linux, the header on Windows). Position and
+open state are saved in `settings.json` (`info_origin`, `info_window`) and
+restored at launch; a saved position on a display that's gone falls back to
+the default. Never takes focus. Content:
+
+- header: overall status dot, character name, ✕ (closes it);
+- status line: the worst issue, or the Activity message when all is well,
+  with the last skill; the current craft (active, else the last worked on)
+  with percent and bar (hidden offline);
+- bars: stamina (`current / max`), **health** (relay `health_state`, max =
+  stats value 0; red under 30%), food (time left) + buff summary;
+- one row each for plants, passive crafts and crafts: **badges** (see
+  below), with "next grown in 5m" / "next done in 4m" underneath.
+
+Same data and timer format as the popup; it re-renders on every model
+change and the 1s tick, and is sized to its content like the popup.
+Staying on top: macOS uses GPUI's `PopUp` kind (popup window level, all
+Spaces, next to fullscreen apps; `Floating` is normal level there).
+Windows: `HWND_TOPMOST` + `WS_EX_NOACTIVATE` (`platform::make_overlay`).
+Dragging: macOS `performWindowDragWithEvent` from the mouse-down (GPUI's
+`start_window_move` is a no-op there), Linux `start_window_move`, Windows
+`WindowControlArea::Drag`. Linux/Windows behavior is untested (on X11 a
+PopUp is a "notification" window; the WM may not let it move).
 
 ## Status rules
 
@@ -181,10 +237,12 @@ closes the popup).
 ```
 src/main.rs        GPUI app; tray click → popup placement; keepalive window
 src/ui.rs          AppState (model + tray + popup + search) and the Panel view
+src/info.rs        Floating info window (toggle, drag, saved position)
 src/model.rs       Routes network events into trackers; loading/offline;
                    status evaluation; notifications; label text
 src/platform.rs    Native bits GPUI lacks: tray DPI scale, hide Dock icon,
-                   set popup window frame (macOS AppKit / Win32)
+                   set window frame, global mouse state, no-activate /
+                   topmost, window drag (macOS AppKit / Win32)
 src/core/          No GPUI, no I/O (unit-tested):
   status.rs        HealthStatus (healthy < warning < alert) + StatusMonitor
   trackers.rs      Experience/Stamina/Satiation/Craft/Plant/PassiveCraft
@@ -257,8 +315,22 @@ character that's no longer tracked are dropped.
   original user's character.
 - **Popup window**: a borderless `WindowKind::PopUp` window under the tray
   icon (above it when the tray is in the bottom half of the screen, e.g. the
-  Windows taskbar); closes when it loses focus. A click that just closed it
-  (focus loss happens before the tray click) doesn't reopen it (400ms).
+  Windows taskbar). **It doesn't take focus** on macOS/Windows (user
+  request: the game keeps keyboard focus): macOS PopUp windows are
+  non-activating panels (opened with `focus: false`, no app activation);
+  on Windows GPUI activates on show, so `WS_EX_NOACTIVATE` is set
+  (`platform::set_no_activate`). Without focus there's no focus-loss
+  event, so `main::watch_outside_clicks` polls the global mouse buttons
+  every 25ms (`platform::pressed_mouse_location`: `NSEvent
+  pressedMouseButtons` / `GetAsyncKeyState`) and closes it on a press
+  outside it. Focus-loss closing is off there (AppKit briefly made the
+  panel key and then resigned it, which closed it right after opening).
+  *Change* (character search) takes focus for typing (`activate_window`;
+  a non-activating panel becomes key without activating the app). Escape
+  closes it while it has focus. Linux has no global mouse query: there it
+  takes focus and closes on focus loss, as before. A press that just
+  closed it (e.g. on the tray icon) doesn't reopen it with the click that
+  follows (400ms).
   **Sized to content**: GPUI has no size-to-content or move API, so the panel
   is measured after layout (`on_children_prepainted` → `fit_window`) and the
   native window frame is set (`platform::set_window_frame`: AppKit `setFrame`
@@ -335,7 +407,10 @@ game token was rejected: account risk, and the relay has the same data.
   absent in 14 after traveling), so the hub takes the player's rows (food,
   stats, online status) from the live region that has `player_state` and
   sends `NetEvent::RelayPlayer` (None when no live region has it → REST
-  fallback).
+  fallback). `health_state` = [entity_id, last_health_decrease_timestamp,
+  health, died_timestamp] is subscribed the same way (info window; no
+  REST fallback, BitJita's live `health_state` channel sent nothing when
+  probed).
 - **Active crafts** (`Feed::crafts`): `progressive_action_state` (owner
   filter) = [entity_id, building_entity_id, function_type, progress,
   recipe_id, craft_count, last_crit_outcome, owner, lock_expiration,
@@ -443,7 +518,8 @@ agent: Python's default `urllib` agent got 403).
   notifications to stderr; the only way to observe the app without a
   screen), `BITCRAFT_NO_NOTIFY=1` (suppress notifications). `cargo test` for
   the core rules and date parsing.
-- **Settings file**: `<config dir>/bitcraft-tracker/settings.json` (macOS
+- **Settings file** (tracked character, info window state/position):
+  `<config dir>/bitcraft-tracker/settings.json` (macOS
   `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`).
 - **GPUI** 0.2.2 with `runtime_shaders`: Metal shaders compile at runtime,
   so building on macOS doesn't need Xcode's Metal toolchain (it wasn't

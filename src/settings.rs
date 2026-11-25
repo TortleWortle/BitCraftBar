@@ -11,11 +11,18 @@ pub struct Settings {
     pub user_id: String,
     /// Display only; looked up from `players/<id>`.
     pub username: Option<String>,
+    /// Info window open (reopened at launch).
+    #[serde(default)]
+    pub info_window: bool,
+    /// Info window position (top-left, logical screen coordinates), kept
+    /// when the user moves it.
+    #[serde(default)]
+    pub info_origin: Option<(f32, f32)>,
 }
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { user_id: DEFAULT_USER_ID.into(), username: None }
+        Self { user_id: DEFAULT_USER_ID.into(), username: None, info_window: false, info_origin: None }
     }
 }
 

@@ -3,6 +3,7 @@
 //! `../AGENTS.md` for behavior and data sources, `README.md` for this port).
 
 mod core;
+mod info;
 mod model;
 mod net;
 mod notifier;
@@ -76,6 +77,10 @@ fn main() {
 
         spawn_loops(state.clone(), out_rx, click_rx, cx);
 
+        if state.read(cx).model.settings.info_window {
+            info::open(&state, cx);
+        }
+
         // `--open`: show the panel at launch (also the fallback without a tray).
         if !has_tray || std::env::args().any(|a| a == "--open") {
             toggle_popup(&state, None, cx);
@@ -125,7 +130,7 @@ fn toggle_popup(state: &Entity<AppState>, anchor: Option<Anchor>, cx: &mut App) 
     };
     if let Some(handle) = open {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
-        state.update(cx, |s, _| s.popup = None);
+        state.update(cx, |s, _| s.popup_closed());
         return;
     }
     // This click already closed it (the popup lost focus first).
@@ -139,7 +144,9 @@ fn toggle_popup(state: &Entity<AppState>, anchor: Option<Anchor>, cx: &mut App) 
     let options = WindowOptions {
         window_bounds: Some(WindowBounds::Windowed(frame)),
         titlebar: None,
-        focus: true,
+        // Don't steal focus from the game (macOS / Windows); it takes focus
+        // when clicked, e.g. to type in the character search.
+        focus: !platform::NON_ACTIVATING_POPUP,
         show: true,
         kind: WindowKind::PopUp,
         is_movable: false,
@@ -151,16 +158,54 @@ fn toggle_popup(state: &Entity<AppState>, anchor: Option<Anchor>, cx: &mut App) 
     };
     state.update(cx, |s, _| s.popup_place = Some(place));
     let st = state.clone();
-    match cx.open_window(options, move |window, cx| cx.new(|cx| Panel::new(st, window, cx))) {
+    match cx.open_window(options, move |window, cx| {
+        if platform::NON_ACTIVATING_POPUP {
+            platform::set_no_activate(window, true);
+        }
+        cx.new(|cx| Panel::new(st, window, cx))
+    }) {
         Ok(handle) => {
             state.update(cx, |s, _| s.popup = Some(handle));
-            cx.activate(true);
+            if platform::NON_ACTIVATING_POPUP {
+                watch_outside_clicks(state.clone(), handle, cx);
+            } else {
+                cx.activate(true);
+            }
         }
         Err(e) => eprintln!("failed to open panel: {e}"),
     }
 }
 
 const INITIAL_HEIGHT: f32 = 420.0;
+
+/// A popup that never got focus doesn't hear about clicks elsewhere (they
+/// go to an app that's already active), so poll the mouse buttons while
+/// it's open and close it on a press outside it. A press on the tray icon
+/// closes it here too; the click that follows is then ignored (400ms).
+fn watch_outside_clicks(state: Entity<AppState>, handle: gpui::WindowHandle<Panel>, cx: &mut App) {
+    cx.spawn(async move |cx: &mut AsyncApp| {
+        let mut was_down = true;
+        loop {
+            cx.background_executor().timer(Duration::from_millis(25)).await;
+            let Ok(Some(bounds)) = cx.update(|cx| {
+                (state.read(cx).popup == Some(handle)).then(|| handle.update(cx, |_, w, _| w.bounds()).ok()).flatten()
+            }) else {
+                break;
+            };
+            let pressed = platform::pressed_mouse_location();
+            let outside = pressed.is_some_and(|p| !bounds.contains(&p));
+            if outside && !was_down {
+                let _ = cx.update(|cx| {
+                    let _ = handle.update(cx, |_, window, _| window.remove_window());
+                    state.update(cx, |s, _| s.popup_closed());
+                });
+                break;
+            }
+            was_down = pressed.is_some();
+        }
+    })
+    .detach();
+}
 
 /// Below the icon when the tray is at the top of the screen (macOS, most
 /// Linux panels): the top edge is fixed and the panel grows down. Above it

@@ -40,6 +40,9 @@ pub struct Model {
     /// Food buffs from the relay; None until the relay delivered them (no
     /// "Food" report then: REST buff data is unreliable).
     pub food: Option<FoodState>,
+    /// Relay only (`health_state`, max = stats value 0).
+    pub health: Option<f64>,
+    pub max_health: Option<f64>,
     activity: ActivityCheck,
 
     pub live_state: ConnState,
@@ -84,6 +87,8 @@ impl Model {
             plants: PlantTracker::default(),
             passive: PassiveCraftTracker::default(),
             food: None,
+            health: None,
+            max_health: None,
             activity: ActivityCheck::default(),
             live_state: ConnState::Connecting,
             relay_state: RelayState::Off,
@@ -131,6 +136,8 @@ impl Model {
             self.plants = PlantTracker::default();
             self.passive = PassiveCraftTracker::default();
             self.food = None;
+            self.health = None;
+            self.max_health = None;
             self.monitor = StatusMonitor::default();
             self.relay_state = RelayState::Off;
             self.live_state = ConnState::Connecting;
@@ -205,6 +212,7 @@ impl Model {
                 if let Some(values) = player.as_ref().and_then(|p| p.stats.as_ref()) {
                     self.apply_stats(values);
                 }
+                self.health = player.as_ref().and_then(|p| p.health);
                 self.relay_player = player;
             }
             NetEvent::Player(player) => {
@@ -279,6 +287,7 @@ impl Model {
     fn apply_stats(&mut self, values: &[f64]) {
         self.stamina.set_reported_max(values.get(1).copied(), self.now);
         self.satiation.set_reported_max(values.get(19).copied());
+        self.max_health = values.first().copied().filter(|v| *v > 0.0);
     }
 
     fn update_loading(&mut self) {

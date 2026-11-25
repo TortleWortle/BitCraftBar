@@ -10,8 +10,9 @@ use gpui::{
 };
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::core::badges::{self, Badge, BadgeState};
 use crate::core::status::HealthStatus;
-use crate::core::trackers::{Craft, PassiveGroup, TierSummary};
+use crate::core::trackers::{Craft, TierSummary};
 use crate::core::types::PlayerSummary;
 use crate::model::Model;
 use crate::net::{Command, ConnState, Outgoing, RelayState};
@@ -62,6 +63,9 @@ pub struct AppState {
     /// Clicking the tray while the popup is open first deactivates (closes)
     /// it; don't reopen it from that same click.
     pub popup_closed_at: Option<Instant>,
+    /// The floating info window (`crate::info`).
+    pub info: Option<WindowHandle<crate::info::InfoWindow>>,
+    pub info_height: Option<Pixels>,
     pub picking: bool,
     pub query: String,
     pub results: Vec<PlayerSummary>,
@@ -81,6 +85,8 @@ impl AppState {
             popup_place: None,
             popup_height: None,
             popup_closed_at: None,
+            info: None,
+            info_height: None,
             picking: false,
             query: String::new(),
             results: Vec::new(),
@@ -157,11 +163,26 @@ impl AppState {
                     f.regen_ends_at(m.now).map(|e| (e - m.now) as i64)
                 )),
             );
+            let texts = |list: Vec<Badge>| list.iter().map(|b| format!("{}:{:?} ({})", b.text(), b.state, b.tooltip(m.now))).collect::<Vec<_>>().join(", ");
+            let line = format!(
+                "{line} | badges plants [{}] passive [{}] crafts [{}]",
+                texts(badges::plants(&m.plants.plants)),
+                texts(badges::passive(&m.passive.crafts, m.now)),
+                texts(badges::crafts(&m.crafts.sorted(), m.now, m.crafts.active_window)),
+            );
             if self.last_debug_line.as_deref() != Some(line.as_str()) {
                 eprintln!("{line}");
                 self.last_debug_line = Some(line);
             }
         }
+    }
+
+    /// Forget the popup (its window is being removed).
+    pub fn popup_closed(&mut self) {
+        self.popup = None;
+        self.popup_height = None;
+        self.popup_closed_at = Some(Instant::now());
+        self.picking = false;
     }
 
     pub fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -213,14 +234,13 @@ impl Panel {
         let subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),
             // Close when clicking elsewhere (like a menu bar popover).
+            // Linux only: on macOS/Windows the popup doesn't take focus
+            // (and AppKit gives a non-activating panel key status briefly
+            // on its own), so clicks elsewhere are detected by
+            // `main::watch_outside_clicks` instead.
             cx.observe_window_activation(window, |this, window, cx| {
-                if !window.is_window_active() {
-                    this.state.update(cx, |s, _| {
-                        s.popup = None;
-                        s.popup_height = None;
-                        s.popup_closed_at = Some(Instant::now());
-                        s.picking = false;
-                    });
+                if !crate::platform::NON_ACTIVATING_POPUP && !window.is_window_active() {
+                    this.state.update(cx, |s, _| s.popup_closed());
                     window.remove_window();
                 }
             }),
@@ -228,16 +248,23 @@ impl Panel {
         Self { state, focus, _subscriptions: subscriptions }
     }
 
-    fn on_key(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let keystroke = &event.keystroke;
         let state = self.state.clone();
         if keystroke.key == "escape" {
+            // Cancel the search, else close the popup.
+            let picking = state.read(cx).picking;
             state.update(cx, |s, cx| {
-                if s.picking {
+                if picking {
                     s.picking = false;
-                    cx.notify();
+                } else {
+                    s.popup_closed();
                 }
+                cx.notify();
             });
+            if !picking {
+                window.remove_window();
+            }
             return;
         }
         if !state.read(cx).picking || keystroke.modifiers.platform || keystroke.modifiers.control {
@@ -264,17 +291,17 @@ impl Panel {
 }
 
 #[derive(Clone, Copy)]
-struct Theme {
-    bg: Rgba,
-    text: Rgba,
-    secondary: Rgba,
-    border: Rgba,
-    track: Rgba,
-    hover: Rgba,
+pub(crate) struct Theme {
+    pub bg: Rgba,
+    pub text: Rgba,
+    pub secondary: Rgba,
+    pub border: Rgba,
+    pub track: Rgba,
+    pub hover: Rgba,
 }
 
 impl Theme {
-    fn for_appearance(appearance: WindowAppearance) -> Self {
+    pub fn for_appearance(appearance: WindowAppearance) -> Self {
         match appearance {
             WindowAppearance::Dark | WindowAppearance::VibrantDark => Self {
                 bg: rgb(0x242426),
@@ -296,33 +323,17 @@ impl Theme {
     }
 }
 
-fn status_color(status: HealthStatus) -> Rgba {
+pub(crate) fn status_color(status: HealthStatus) -> Rgba {
     rgb(status.rgb())
 }
 
-/// All timers: "1h 05m", "4m", or "42s" (seconds only under a minute;
-/// user preference).
-pub fn duration_string(seconds: f64) -> String {
-    let total = seconds.max(0.0).ceil() as i64;
-    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
-    if h > 0 {
-        format!("{h}h {m:02}m")
-    } else if m > 0 {
-        // Round up so it never shows "0m" with time left.
-        match m + (s > 0) as i64 {
-            60 => "1h 00m".to_string(),
-            rounded => format!("{rounded}m"),
-        }
-    } else {
-        format!("{s}s")
-    }
-}
+pub use crate::core::types::duration_string;
 
-fn dot(color: impl Into<Hsla>, size: f32) -> impl IntoElement {
+pub(crate) fn dot(color: impl Into<Hsla>, size: f32) -> impl IntoElement {
     div().size(px(size)).flex_none().rounded_full().bg(color.into())
 }
 
-fn bar(fraction: f64, color: Rgba, theme: Theme) -> impl IntoElement {
+pub(crate) fn bar(fraction: f64, color: Rgba, theme: Theme) -> impl IntoElement {
     div()
         .flex_1()
         .min_w(px(40.0))
@@ -330,6 +341,91 @@ fn bar(fraction: f64, color: Rgba, theme: Theme) -> impl IntoElement {
         .rounded_full()
         .bg(theme.track)
         .child(div().h_full().rounded_full().bg(color).w(relative(fraction.clamp(0.0, 1.0) as f32)))
+}
+
+/// Colored "type + tier" pills (see `core::badges`), wrapping.
+pub(crate) fn badges(id: &'static str, list: &[Badge], now: f64, theme: Theme) -> impl IntoElement {
+    // More than one tier: a row per tier with a "T2" heading, and the
+    // badges without the tier.
+    let rows = badges::by_tier(list);
+    div().flex().flex_col().gap_1().children(rows.into_iter().enumerate().map(move |(r, (heading, items))| {
+        let grouped = heading.is_some();
+        div()
+            .flex()
+            .items_start()
+            .gap_1p5()
+            .children(heading.map(|tier| {
+                div()
+                    .w(px(22.0))
+                    .flex_none()
+                    .pt_0p5()
+                    .text_xs()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme.secondary)
+                    .child(tier.map_or("–".to_string(), |t| format!("T{t}")))
+            }))
+            .child(badge_wrap(id, r, &items, grouped, now, theme))
+    }))
+}
+
+/// One wrapping row of badges. `grouped`: under a tier heading, so the
+/// badges leave out the tier. `row` keeps element ids unique.
+pub(crate) fn badge_wrap(id: &'static str, row: usize, items: &[Badge], grouped: bool, now: f64, theme: Theme) -> impl IntoElement {
+    div()
+        .flex_1()
+        .flex()
+        .flex_wrap()
+        .gap_1()
+        .children(items.iter().enumerate().map(|(i, b)| pill(b, (id, row * 1000 + i), grouped, now, theme)))
+}
+
+fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Theme) -> impl IntoElement {
+    let tip: SharedString = b.tooltip(now).into();
+    let color = match b.state {
+        BadgeState::Action => status_color(HealthStatus::Alert),
+        BadgeState::Processing => status_color(HealthStatus::Warning),
+        BadgeState::Idle => rgb(0x8e8e93),
+        BadgeState::Finished => status_color(HealthStatus::Healthy),
+    };
+    let mut tint = color;
+    tint.a = 0.18;
+    div()
+        .flex()
+        .items_center()
+        .gap_1()
+        .px_1p5()
+        .rounded_md()
+        .bg(tint)
+        .border_1()
+        .border_color(color)
+        .text_xs()
+        .text_color(theme.text)
+        .child(dot(color, 6.0))
+        .child(if grouped { b.short_text() } else { b.text() })
+        .id(id)
+        .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| cx.new(|_| Tooltip { text: tip.clone(), theme }).into()))
+}
+
+/// Hover text of a badge.
+struct Tooltip {
+    text: SharedString,
+    theme: Theme,
+}
+
+impl Render for Tooltip {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .bg(self.theme.bg)
+            .border_1()
+            .border_color(self.theme.border)
+            .shadow_md()
+            .text_xs()
+            .text_color(self.theme.text)
+            .child(self.text.clone())
+    }
 }
 
 fn section_title(title: &str) -> impl IntoElement {
@@ -404,7 +500,7 @@ impl Render for Panel {
                 );
             } else if !m.passive.crafts.is_empty() {
                 body.push(divider(theme).into_any_element());
-                body.push(self.passive(m.passive.groups(m.now), m.now, theme).into_any_element());
+                body.push(self.passive(m, theme).into_any_element());
             }
             let crafts = m.crafts.sorted();
             if !crafts.is_empty() {
@@ -418,6 +514,13 @@ impl Render for Panel {
         body.push(
             div()
                 .flex()
+                .gap_2()
+                .child({
+                    let st = self.state.clone();
+                    let open = state.info.is_some();
+                    button("info", if open { "Hide info window" } else { "Show info window" }, theme)
+                        .on_click(move |_, _, cx: &mut App| crate::info::toggle(&st, cx))
+                })
                 .child(div().flex_1())
                 .child(
                     button("quit", "Quit", theme).on_click(|_, _, cx: &mut App| cx.quit()),
@@ -627,6 +730,7 @@ impl Panel {
             .flex_col()
             .gap_1p5()
             .child(section_title("Plants"))
+            .child(badges("plant-badge", &badges::plants(&m.plants.plants), m.now, theme))
             .children(m.plants.growing_tiers().into_iter().map(move |tier| {
                 div()
                     .flex()
@@ -641,8 +745,15 @@ impl Panel {
             .children(need_row("Ready to harvest", 0x34c759, |t| t.grown))
     }
 
-    fn passive(&self, groups: Vec<PassiveGroup>, now: f64, theme: Theme) -> impl IntoElement {
-        div().flex().flex_col().gap_1p5().child(section_title("Passive crafts")).children(groups.into_iter().map(
+    fn passive(&self, m: &Model, theme: Theme) -> impl IntoElement {
+        let now = m.now;
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(section_title("Passive crafts"))
+            .child(badges("passive-badge", &badges::passive(&m.passive.crafts, now), now, theme))
+            .children(m.passive.groups(now).into_iter().map(
             move |g| {
                 let status = if g.running == 0 {
                     "Ready".to_string()
@@ -682,7 +793,13 @@ impl Panel {
     fn crafts(&self, crafts: &[Craft], m: &Model, theme: Theme) -> impl IntoElement {
         let now = m.now;
         let window = m.crafts.active_window;
-        div().flex().flex_col().gap_2().child(section_title("Crafts")).children(crafts.iter().cloned().map(move |c| {
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(section_title("Crafts"))
+            .child(badges("craft-badge", &badges::crafts(crafts, now, window), now, theme))
+            .children(crafts.iter().cloned().map(move |c| {
             let status = if c.is_complete() {
                 Some("Done")
             } else if c.last_progress_at.is_none_or(|t| now - t > window) {
@@ -724,6 +841,9 @@ impl Panel {
                 .child(div().font_weight(FontWeight::MEDIUM).child(name))
                 .child(div().flex_1())
                 .child(button("change", "Change", theme).on_click(cx.listener(|this, _, window, cx| {
+                    // Non-activating popup: take the keyboard for typing.
+                    crate::platform::set_no_activate(window, false);
+                    window.activate_window();
                     this.focus.focus(window);
                     this.state.update(cx, |s, cx| {
                         s.picking = true;
@@ -813,7 +933,7 @@ impl Panel {
     }
 }
 
-fn group_thousands(n: i64) -> String {
+pub(crate) fn group_thousands(n: i64) -> String {
     let digits = n.abs().to_string();
     let mut out = String::new();
     for (i, ch) in digits.chars().enumerate() {

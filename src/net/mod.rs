@@ -66,6 +66,8 @@ pub struct RelayPlayer {
     pub signed_in: bool,
     /// `character_stats_state.values` (1 = max stamina, 19 = max satiation).
     pub stats: Option<Vec<f64>>,
+    /// `health_state.health` (max = stats value 0).
+    pub health: Option<f64>,
 }
 
 pub enum Outgoing {
@@ -257,7 +259,10 @@ async fn poll_passive(user: String, emit: impl Fn(NetEvent), relay_live: Arc<Ato
             }
             (None, None) => None,
         };
+        let (kind, tier) = c.item_id().map_or((None, None), |i| response.item_kind(i));
         crafts.push(PassiveCraft {
+            kind,
+            tier,
             id: c.entity_id.clone(),
             name: PassiveCraftTracker::display_name(
                 c.recipe_name.as_deref(),
@@ -389,7 +394,7 @@ async fn relay_hub(
             .iter()
             .find(|(r, d)| d.signed_in.is_some() && states.get(r) == Some(&RelayState::Live))
             .map(|(_, d)| d);
-        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone() }));
+        let player_info = player.and_then(|d| Some(RelayPlayer { signed_in: d.signed_in?, stats: d.stats.clone(), health: d.health }));
         if player_info != last_player {
             emit(NetEvent::RelayPlayer(player_info.clone()));
             last_player = player_info;

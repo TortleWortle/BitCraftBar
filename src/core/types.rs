@@ -19,6 +19,9 @@ pub struct CraftInfo {
     pub progress: i64,
     pub total: i64,
     pub completed: bool,
+    /// Crafted item's tag ("Ingot", "Rope") and tier, for badges.
+    pub kind: Option<String>,
+    pub tier: Option<i64>,
 }
 
 /// One passive craft (relay or REST).
@@ -32,6 +35,9 @@ pub struct PassiveCraft {
     pub reported_complete: bool,
     /// Recipe duration in seconds, if known.
     pub duration: Option<f64>,
+    /// Crafted item's tag and tier, for badges.
+    pub kind: Option<String>,
+    pub tier: Option<i64>,
 }
 
 impl PassiveCraft {
@@ -153,5 +159,23 @@ mod tests {
         // The extra buffs alone don't count as food regen.
         assert_eq!(food.regen_ends_at(150.0), None);
         assert_eq!(food.summary(150.0), "Deluxe Action Speed 2 · Mining Pie");
+    }
+}
+
+/// All timers: "1h 05m", "4m", or "42s" (seconds only under a minute;
+/// user preference).
+pub fn duration_string(seconds: f64) -> String {
+    let total = seconds.max(0.0).ceil() as i64;
+    let (h, m, s) = (total / 3600, (total % 3600) / 60, total % 60);
+    if h > 0 {
+        format!("{h}h {m:02}m")
+    } else if m > 0 {
+        // Round up so it never shows "0m" with time left.
+        match m + (s > 0) as i64 {
+            60 => "1h 00m".to_string(),
+            rounded => format!("{rounded}m"),
+        }
+    } else {
+        format!("{s}s")
     }
 }
