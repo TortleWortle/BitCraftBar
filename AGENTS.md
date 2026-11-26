@@ -241,6 +241,16 @@ Dragging: macOS `performWindowDragWithEvent` from the mouse-down (GPUI's
 `start_window_move` is a no-op there), Linux `start_window_move`, Windows
 `WindowControlArea::Drag`. Linux/Windows behavior is untested (on X11 a
 PopUp is a "notification" window; the WM may not let it move).
+**Wayland**: windows are opened at origin 0,0 (`platform::open_bounds`,
+all three windows). GPUI 0.2.2 keeps the requested origin as the window's
+bounds origin on Wayland and its `resize` sends it as the xdg
+window-geometry offset, so after every fit-to-content the compositor
+showed the card shifted up-left by the requested position (100,100: GPUI
+has no primary display there), clipped, in an oversized frame, until a
+configure (e.g. clicking it) reset it (user report, KDE, after switching
+to a game and back). Its `resize` also sends the geometry size in device
+pixels, so with a scale above 1 the frame may still be too big until the
+next configure; that one needs a GPUI fix.
 
 ## Status rules
 

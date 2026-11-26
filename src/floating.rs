@@ -72,7 +72,10 @@ pub fn open(state: &Entity<AppState>, user_id: &str, cx: &mut App) {
         },
     };
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds { origin, size: size(px(WIDTH), px(INITIAL_HEIGHT)) })),
+        window_bounds: Some(WindowBounds::Windowed(crate::platform::open_bounds(Bounds {
+            origin,
+            size: size(px(WIDTH), px(INITIAL_HEIGHT)),
+        }))),
         titlebar: None,
         // Never take focus from the game.
         focus: false,

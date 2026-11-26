@@ -576,7 +576,7 @@ checksum = "cb2907cc03d08cdb1c6724ad0670ce67c4a71e1c45a6d7635224011714cfc4b1"
 
 [[package]]
 name = "bitcraft-tracker"
-version = "0.0.9"
+version = "0.0.10"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",

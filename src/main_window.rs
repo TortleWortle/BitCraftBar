@@ -41,7 +41,11 @@ pub fn show(state: &Entity<AppState>, cx: &mut App) {
 
 pub fn open(state: &Entity<AppState>, cx: &mut App) {
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(Bounds::centered(None, size(px(WIDTH), px(HEIGHT)), cx))),
+        window_bounds: Some(WindowBounds::Windowed(crate::platform::open_bounds(Bounds::centered(
+            None,
+            size(px(WIDTH), px(HEIGHT)),
+            cx,
+        )))),
         titlebar: Some(TitlebarOptions { title: Some("BitCraft Tracker".into()), ..Default::default() }),
         focus: true,
         show: true,

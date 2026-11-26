@@ -193,3 +193,26 @@ pub fn set_window_frame(window: &mut Window, frame: Bounds<Pixels>, cx: &App) {
 pub fn set_window_frame(window: &mut Window, frame: Bounds<Pixels>, _cx: &App) {
     window.resize(frame.size);
 }
+
+/// The window frame to request when opening a window. On Wayland, windows
+/// can't choose their position, and GPUI 0.2.2 keeps the requested origin
+/// as the window's bounds origin there: its `resize` then sends that
+/// origin as the xdg window-geometry offset, so after `set_window_frame`
+/// the compositor showed the surface shifted up-left by the requested
+/// position (e.g. 100,100), clipped, in an oversized frame, until the next
+/// configure (e.g. a click) reset it. Requesting origin 0,0 keeps the
+/// offset at 0.
+pub fn open_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    if is_wayland() { Bounds { origin: point(px(0.0), px(0.0)), ..bounds } } else { bounds }
+}
+
+/// GPUI picks Wayland whenever `WAYLAND_DISPLAY` is set.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub fn is_wayland() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty())
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub fn is_wayland() -> bool {
+    false
+}

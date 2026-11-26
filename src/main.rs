@@ -167,7 +167,7 @@ fn toggle_popup(state: &Entity<AppState>, anchor: Option<Anchor>, cx: &mut App) 
     // First guess; the panel resizes the window to its content once laid out.
     let frame = place.frame(px(INITIAL_HEIGHT));
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(frame)),
+        window_bounds: Some(WindowBounds::Windowed(platform::open_bounds(frame))),
         titlebar: None,
         // Don't steal focus from the game (macOS / Windows); it takes focus
         // when clicked, e.g. to type in the character search.
