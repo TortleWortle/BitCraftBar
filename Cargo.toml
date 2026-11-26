@@ -42,7 +42,7 @@ tray-icon = { version = "0.26", default-features = false, features = ["ksni"] }
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 tray-icon = { version = "0.26", default-features = false }
 
-# macOS: run as a menu bar app (no Dock icon).
+# macOS: native window/screen bits GPUI lacks (platform.rs).
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", features = ["NSApplication", "NSEvent", "NSRunningApplication", "NSResponder", "NSScreen", "NSView", "NSWindow", "objc2-core-foundation"] }

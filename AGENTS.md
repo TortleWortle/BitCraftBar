@@ -15,8 +15,10 @@ one place**, the community read-only SpacetimeDB relay
 [relay.bitcraftsync.app](https://relay.bitcraftsync.app): its websocket
 mirrors for everything about the character, its HTTP API for player
 search and the region list (user request: "one source of truth, a half
-functioning app is unpredictable"; see Data sources). There is no main window or Dock
-icon; everything lives in the tray icon and its popup panel.
+functioning app is unpredictable"; see Data sources). The
+status lives in the tray icon and its popup panel, the configuration in a
+small **main window** (see Main window), and an optional always-on-top
+**floating window** shows an overview while playing.
 
 The goal is a quick "is my character still doing something useful?" check
 while the user is AFK-crafting/gathering, without tabbing into the game.
@@ -77,8 +79,10 @@ per-source status reports, stats rows (stamina bar `current / max`,
 `current / max`, green, red at/below the alert threshold; total XP; last
 skill; last gain), plants, passive crafts,
 crafts (progress bar, percent, Paused/Done), an **Update available**
-row when GitHub has a newer release (see Releases), character picker,
-*Show/Hide info window*, Quit.
+row when GitHub has a newer release (see Releases), and a bottom row with
+the tracked character's name, *Settings* (brings up the main window and
+closes the popup) and Quit. The character picker, floating window toggle
+and sound settings used to be in the popup; they moved to the main window.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
   currently growing** (count + time until the whole tier is grown, `~` when
@@ -115,7 +119,7 @@ row when GitHub has a newer release (see Releases), character picker,
   red "None" when no food regen is active (full so the red shows); "–" until the relay
   delivered buffs.
 - **Badges** (`core::badges`, user request; under each section title in
-  the popup and in the info window): one pill per *type + tier* and state,
+  the popup and in the floating window): one pill per *type + tier* and state,
   with a count, e.g. `Grain T1 ×6`, `Ingot T2`, `Rope T5`. Colors: **red**
   = action needed (plant needs fertilizer/water), **orange** = processing
   (growing, passive craft running, craft worked on in the last 30s),
@@ -141,7 +145,7 @@ row when GitHub has a newer release (see Releases), character picker,
   more than one tier, its badges are split into one row per tier with a
   `T2` heading (ascending; untiered last) and the badges drop the tier
   (`Grain ×6`). With a single tier it's one row with `Grain T1 ×6`. In
-  the info window the tier headings sit (left-aligned, flush with the label) in the label column under
+  the floating window the tier headings sit (left-aligned, flush with the label) in the label column under
   "Plants"/"Passive"/"Crafts" (user request, so all badges line up); in
   the popup they're a narrow column left of the badges, under the section
   title.
@@ -150,12 +154,33 @@ row when GitHub has a newer release (see Releases), character picker,
   seconds only under a minute, `42s` (user preference; was `4m 12s`).
 - Light/dark colors follow the window appearance (`Theme`).
 
-**Info window** (`src/info.rs`, user request): a small (260px) always-on-top
-card, toggled from the popup, for keeping an eye on the character while
+**Main window** (`src/main_window.rs`, user request: replaced the
+invisible keepalive window): a normal titled window (380×520, resizable,
+scrolls) with the **character** (name + *Change* search), the **floating
+window** checkbox, the **sound settings**, the *Update available* row and
+Quit. Opened at launch (centered, activates the app) on every platform.
+**Closing it quits the app** (user request; `on_window_should_close` →
+`cx.quit()`, which GPUI defers, so it's safe from that callback). Since
+it's open for the app's whole life, it also does the keepalive window's
+old job (GPUI quits on Windows/Linux when the last window closes). The
+popup's *Settings* button brings it to the front (`main_window::show`:
+GPUI's `activate_window`, which defers the native call and restores a
+minimized window on Windows). An earlier version hid the window on close
+and showed it with a direct `makeKeyAndOrderFront`; calling that AppKit
+method from inside a GPUI click handler re-entered GPUI and crashed. Use
+GPUI's deferred window calls (or defer native ones like
+`platform::set_window_frame` does). It takes focus normally
+(unlike the popup), so the character search types straight into it.
+Windows/Linux behavior is untested.
+
+**Floating window** (`src/floating.rs`, user request; was called the
+"info window", renamed by user request): a small (260px) always-on-top
+card, toggled from the main window, for keeping an eye on the character while
 playing. Top-right corner of the main display by default; **movable** by
 dragging (anywhere on macOS/Linux, the header on Windows). Position and
-open state are saved in `settings.json` (`info_origin`, `info_window`) and
-restored at launch; a saved position on a display that's gone falls back to
+open state are saved in `settings.json` (`floating_origin`,
+`floating_window`; the old `info_origin` / `info_window` keys are still
+read) and restored at launch; a saved position on a display that's gone falls back to
 the default. Never takes focus. Content:
 
 - header: overall status dot, character name, ✕ (closes it);
@@ -298,7 +323,7 @@ closes the popup).
 
 ## Sounds
 
-Settings section in the popup (*Settings* button next to Quit; user
+In the main window (was a Settings section in the popup; user
 request): play a sound when an active **craft finishes**, when the
 character **runs out of food** (Food report turns red, same 5 min
 cooldown as the notification), and when **idle with stamina above 90%**
@@ -323,12 +348,13 @@ enabled ones.
 ## Architecture
 
 ```
-src/main.rs        GPUI app; tray click → popup placement; keepalive window
+src/main.rs        GPUI app; tray click → popup placement; opens the main window
 src/ui.rs          AppState (model + tray + popup + search) and the Panel view
-src/info.rs        Floating info window (toggle, drag, saved position)
+src/main_window.rs Main window: character search, floating toggle, sounds
+src/floating.rs    Floating window (toggle, drag, saved position)
 src/model.rs       Routes network events into trackers; loading/offline;
                    status evaluation; notifications; label text
-src/platform.rs    Native bits GPUI lacks: tray DPI scale, hide Dock icon,
+src/platform.rs    Native bits GPUI lacks: tray DPI scale,
                    set window frame, global mouse state, no-activate /
                    topmost, window drag (macOS AppKit / Win32)
 src/core/          No GPUI, no I/O (unit-tested):
@@ -350,7 +376,7 @@ src/net/           Background Tokio runtime ("network" thread):
 src/tray.rs        Tray icon rendering/updates
 src/notifier.rs    Desktop notifications
 src/sound.rs       Alert sounds (synthesized chimes, rodio)
-src/settings.rs    settings.json (tracked character, info window, sounds)
+src/settings.rs    settings.json (tracked character, floating window, sounds)
 ```
 
 **Data flow is one way**: the network thread sends `net::Outgoing` messages
@@ -388,7 +414,7 @@ character that's no longer tracked are dropped.
   until the first answer), for the region list. The panel shows a
   "Passive crafts — Loading…" placeholder until the first relay list
   arrives.
-- **Character selection** is by username search in the panel: the
+- **Character selection** is by username search in the main window: the
   tracked character's name with a *Change* button that opens a search field
   (typed via key events; GPUI has no text input widget), debounced 300ms,
   results clickable, Enter picks the first, Escape cancels. `settings.json`
@@ -407,9 +433,8 @@ character that's no longer tracked are dropped.
   pressedMouseButtons` / `GetAsyncKeyState`) and closes it on a press
   outside it. Focus-loss closing is off there (AppKit briefly made the
   panel key and then resigned it, which closed it right after opening).
-  *Change* (character search) takes focus for typing (`activate_window`;
-  a non-activating panel becomes key without activating the app). Escape
-  closes it while it has focus. Linux has no global mouse query: there it
+  Escape closes it while it has focus. (The character search used to be
+  here and had to take focus for typing; it's in the main window now.) Linux has no global mouse query: there it
   takes focus and closes on focus loss, as before. A press that just
   closed it (e.g. on the tray icon) doesn't reopen it with the click that
   follows (400ms).
@@ -420,13 +445,18 @@ character that's no longer tracked are dropped.
   edge next to the tray fixed (GPUI's own `resize` on macOS keeps the bottom
   edge, so the popup would slide under the menu bar). Taller than the screen
   → scrolls. On Wayland the compositor positions windows.
-- **Keepalive window**: GPUI quits on Linux/Windows when the last window
-  closes, so an invisible 1×1 window stays open (not needed on macOS).
+- **No keepalive window**: GPUI quits on Linux/Windows when the last window
+  closes. An invisible 1×1 window used to stay open for that; the main
+  window does it now (it's open until the app quits, see Main window).
 - **No tray available** (e.g. GNOME without the AppIndicator extension): the
   panel opens as a window at startup instead. `--open` opens it at launch
   regardless.
-- **macOS**: activation policy set to Accessory at startup (no Dock icon;
-  GPUI starts as a regular app).
+- **macOS**: a regular app with a **Dock icon** (user request: "stop
+  hiding in the dock"; it used to set the Accessory activation policy at
+  startup and `LSUIElement` in the bundle's `Info.plist`). It has a
+  minimal app menu with *Quit BitCraft Tracker* / ⌘Q (`main.rs`, a GPUI
+  `Quit` action); without it the menu bar was empty. No app icon in the
+  bundle yet (the Dock shows the generic one).
 
 ## Data sources
 
@@ -562,7 +592,7 @@ game token was rejected: account risk, and the relay has the same data.
   (preferring a live one: a reconnecting old region can still hold a
   stale copy) and sends `NetEvent::RelayPlayer` (None when no region has
   it: unknown). Subscribed the same way: `health_state` = [entity_id,
-  last_health_decrease_timestamp, health, died_timestamp] (info window),
+  last_health_decrease_timestamp, health, died_timestamp] (floating window),
   `player_username_state` = [entity_id, username] (display name).
 - **XP, stamina, satiation** (player region): `experience_state` =
   [entity_id, [[skill_id, quantity], …]], `stamina_state` = [entity_id,
@@ -694,7 +724,7 @@ connection. Replaced by the relay (user request).
   `Model::attribute_crafts`, run after craft and after XP updates, since
   either can arrive first). Own progress (`Craft::worked_at`,
   `CraftTracker::mark_worked`) drives everything "current activity": the
-  label's craft percent, the info window's craft line, the Activity craft
+  label's craft percent, the floating window's craft line, the Activity craft
   rules (`last_worked`) and gather-vs-craft. Any progress
   (`last_progress_at`) still shows in the crafts list and badges (it is
   progressing). Limit: someone else's progress while the player gains XP
@@ -722,7 +752,7 @@ connection. Replaced by the relay (user request).
   notifications to stderr; the only way to observe the app without a
   screen), `BITCRAFT_NO_NOTIFY=1` (suppress notifications). `cargo test` for
   the core rules and date parsing.
-- **Settings file** (tracked character, info window state/position,
+- **Settings file** (tracked character, floating window state/position,
   sounds; old `cached_stats` / `food_buff_descs` keys are ignored):
   `<config dir>/bitcraft-tracker/settings.json` (macOS
   `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`).
@@ -756,7 +786,7 @@ connection. Replaced by the relay (user request).
     (`main.rs`), so there's no console window. Unsigned: SmartScreen
     warns (*More info → Run anyway*).
   - macOS: zipped **`.app` bundle**, universal (arm64 + x86_64 via
-    `lipo`), `Info.plist` from `packaging/macos/` (`LSUIElement`, bundle
+    `lipo`), `Info.plist` from `packaging/macos/` (bundle
     id `com.github.tortlewortle.bitcraft-tracker`). A bundle rather than a
     bare binary so notifications come from our app, not Terminal (see
     Notifications). Ad-hoc signed only (no Apple Developer account), so

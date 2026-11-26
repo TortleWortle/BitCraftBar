@@ -4,21 +4,21 @@
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationExt, AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight, Hsla, KeyDownEvent, Pixels, Render, Rgba,
-    SharedString, Subscription, Task, Window, WindowAppearance, WindowHandle, div, point, prelude::*, px, relative,
-    rgb, size, pulsating_between,
+    Animation, AnimationExt, AnyElement, App, Bounds, Context, Entity, FocusHandle, FontWeight,
+    Hsla, KeyDownEvent, Pixels, Render, Rgba, SharedString, Subscription, Task, Window,
+    WindowAppearance, WindowHandle, div, point, prelude::*, pulsating_between, px, relative, rgb,
+    size,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::core::badges::{self, Badge, BadgeState};
+use crate::core::skill::Skill;
 use crate::core::status::{HealthStatus, food_rgb, stamina_rgb};
 use crate::core::trackers::{Craft, TierSummary};
-use crate::core::skill::Skill;
 use crate::core::types::{Gather, PlayerSummary};
 use crate::model::Model;
 use crate::net::{Command, Outgoing, RelayState};
 use crate::notifier;
-use crate::settings::SoundSettings;
 use crate::sound::Sound;
 use crate::tray::Tray;
 
@@ -49,11 +49,14 @@ impl Placement {
             Edge::Top(top) => top,
             Edge::Bottom(bottom) => bottom - height,
         };
-        Bounds { origin: point(self.x, y), size: size(px(PANEL_WIDTH), height) }
+        Bounds {
+            origin: point(self.x, y),
+            size: size(px(PANEL_WIDTH), height),
+        }
     }
 }
 const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
-const MAX_RESULTS_SHOWN: usize = 10;
+pub(crate) const MAX_RESULTS_SHOWN: usize = 10;
 
 pub struct AppState {
     pub model: Model,
@@ -66,12 +69,14 @@ pub struct AppState {
     /// Clicking the tray while the popup is open first deactivates (closes)
     /// it; don't reopen it from that same click.
     pub popup_closed_at: Option<Instant>,
-    /// The floating info window (`crate::info`).
-    pub info: Option<WindowHandle<crate::info::InfoWindow>>,
-    pub info_height: Option<Pixels>,
+    /// The main window (`crate::main_window`): always exists once
+    /// opened at launch; closing it hides it.
+    pub main: Option<WindowHandle<crate::main_window::MainWindow>>,
+    /// The floating window (`crate::floating`).
+    pub floating: Option<WindowHandle<crate::floating::FloatingWindow>>,
+    pub floating_height: Option<Pixels>,
+    /// Character search open in the main window.
     pub picking: bool,
-    /// Settings section open in the popup.
-    pub settings_open: bool,
     pub query: String,
     pub results: Vec<PlayerSummary>,
     pub searching: bool,
@@ -92,10 +97,10 @@ impl AppState {
             popup_place: None,
             popup_height: None,
             popup_closed_at: None,
-            info: None,
-            info_height: None,
+            main: None,
+            floating: None,
+            floating_height: None,
             picking: false,
-            settings_open: false,
             query: String::new(),
             results: Vec::new(),
             searching: false,
@@ -186,15 +191,31 @@ impl AppState {
                     f.regen_ends_at(m.now).map(|e| (e - m.now) as i64)
                 )),
             );
-            let texts = |list: Vec<Badge>| list.iter().map(|b| format!("{}:{:?} ({})", b.text(), b.state, b.tooltip(m.now))).collect::<Vec<_>>().join(", ");
+            let texts = |list: Vec<Badge>| {
+                list.iter()
+                    .map(|b| format!("{}:{:?} ({})", b.text(), b.state, b.tooltip(m.now)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
             let gather = m.active_gather().map_or("-".to_string(), |g| {
-                format!("{} skill {:?} {:?} {:?}/{:?}", g.name, g.skill, g.bar(m.now).map(|b| b.1), g.health, g.max_health)
+                format!(
+                    "{} skill {:?} {:?} {:?}/{:?}",
+                    g.name,
+                    g.skill,
+                    g.bar(m.now).map(|b| b.1),
+                    g.health,
+                    g.max_health
+                )
             });
             let line = format!(
                 "{line} | gather {gather} | badges plants [{}] passive [{}] crafts [{}]",
                 texts(badges::plants(&m.plants.plants)),
                 texts(badges::passive(&m.passive.crafts, m.now)),
-                texts(badges::crafts(&m.crafts.sorted(), m.now, m.crafts.active_window)),
+                texts(badges::crafts(
+                    &m.crafts.sorted(),
+                    m.now,
+                    m.crafts.active_window
+                )),
             );
             if self.last_debug_line.as_deref() != Some(line.as_str()) {
                 eprintln!("{line}");
@@ -208,7 +229,6 @@ impl AppState {
         self.popup = None;
         self.popup_height = None;
         self.popup_closed_at = Some(Instant::now());
-        self.picking = false;
     }
 
     pub fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -271,48 +291,23 @@ impl Panel {
                 }
             }),
         ];
-        Self { state, focus, _subscriptions: subscriptions }
+        Self {
+            state,
+            focus,
+            _subscriptions: subscriptions,
+        }
     }
 
+    /// Escape closes the popup (while it has focus: Linux, or after a
+    /// click on it).
     fn on_key(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let keystroke = &event.keystroke;
-        let state = self.state.clone();
-        if keystroke.key == "escape" {
-            // Cancel the search, else close the popup.
-            let picking = state.read(cx).picking;
-            state.update(cx, |s, cx| {
-                if picking {
-                    s.picking = false;
-                } else {
-                    s.popup_closed();
-                }
+        if event.keystroke.key == "escape" {
+            self.state.update(cx, |s, cx| {
+                s.popup_closed();
                 cx.notify();
             });
-            if !picking {
-                window.remove_window();
-            }
-            return;
+            window.remove_window();
         }
-        if !state.read(cx).picking || keystroke.modifiers.platform || keystroke.modifiers.control {
-            return;
-        }
-        let mut query = state.read(cx).query.clone();
-        match keystroke.key.as_str() {
-            "backspace" => {
-                query.pop();
-            }
-            "enter" => {
-                if let Some(first) = state.read(cx).results.first().cloned() {
-                    state.update(cx, |s, cx| s.select(first, cx));
-                }
-                return;
-            }
-            _ => match &keystroke.key_char {
-                Some(text) if !text.chars().any(char::is_control) => query.push_str(text),
-                _ => return,
-            },
-        }
-        state.update(cx, |s, cx| s.set_query(query, cx));
     }
 }
 
@@ -356,7 +351,11 @@ pub(crate) fn status_color(status: HealthStatus) -> Rgba {
 pub use crate::core::types::duration_string;
 
 pub(crate) fn dot(color: impl Into<Hsla>, size: f32) -> impl IntoElement {
-    div().size(px(size)).flex_none().rounded_full().bg(color.into())
+    div()
+        .size(px(size))
+        .flex_none()
+        .rounded_full()
+        .bg(color.into())
 }
 
 /// Gather bar (resource health / fishing spot time): green, so it reads
@@ -370,7 +369,13 @@ pub(crate) fn bar(fraction: f64, color: Rgba, theme: Theme) -> impl IntoElement 
         .h(px(6.0))
         .rounded_full()
         .bg(theme.track)
-        .child(div().h_full().rounded_full().bg(color).w(relative(fraction.clamp(0.0, 1.0) as f32)))
+        .child(
+            div()
+                .h_full()
+                .rounded_full()
+                .bg(color)
+                .w(relative(fraction.clamp(0.0, 1.0) as f32)),
+        )
 }
 
 /// Colored "type + tier" pills (see `core::badges`), wrapping.
@@ -378,39 +383,54 @@ pub(crate) fn badges(id: &'static str, list: &[Badge], now: f64, theme: Theme) -
     // More than one tier: a row per tier with a "T2" heading, and the
     // badges without the tier.
     let rows = badges::by_tier(list);
-    div().flex().flex_col().gap_1().children(rows.into_iter().enumerate().map(move |(r, (heading, items))| {
-        let grouped = heading.is_some();
-        div()
-            .flex()
-            .items_start()
-            .gap_1p5()
-            .children(heading.map(|tier| {
-                div()
-                    .w(px(22.0))
-                    .flex_none()
-                    .pt_0p5()
-                    .text_xs()
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme.secondary)
-                    .child(tier.map_or("–".to_string(), |t| format!("T{t}")))
-            }))
-            .child(badge_wrap(id, r, &items, grouped, now, theme))
-    }))
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .children(
+            rows.into_iter()
+                .enumerate()
+                .map(move |(r, (heading, items))| {
+                    let grouped = heading.is_some();
+                    div()
+                        .flex()
+                        .items_start()
+                        .gap_1p5()
+                        .children(heading.map(|tier| {
+                            div()
+                                .w(px(22.0))
+                                .flex_none()
+                                .pt_0p5()
+                                .text_xs()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme.secondary)
+                                .child(tier.map_or("–".to_string(), |t| format!("T{t}")))
+                        }))
+                        .child(badge_wrap(id, r, &items, grouped, now, theme))
+                }),
+        )
 }
 
 /// One wrapping row of badges. `grouped`: under a tier heading, so the
 /// badges leave out the tier. `row` keeps element ids unique.
-pub(crate) fn badge_wrap(id: &'static str, row: usize, items: &[Badge], grouped: bool, now: f64, theme: Theme) -> impl IntoElement {
-    div()
-        .flex_1()
-        .flex()
-        .flex_wrap()
-        .gap_1()
-        .children(items.iter().enumerate().map(|(i, b)| pill(b, (id, row * 1000 + i), grouped, now, theme)))
+pub(crate) fn badge_wrap(
+    id: &'static str,
+    row: usize,
+    items: &[Badge],
+    grouped: bool,
+    now: f64,
+    theme: Theme,
+) -> impl IntoElement {
+    div().flex_1().flex().flex_wrap().gap_1().children(
+        items
+            .iter()
+            .enumerate()
+            .map(|(i, b)| pill(b, (id, row * 1000 + i), grouped, now, theme)),
+    )
 }
 
 /// Badges of things finishing within this many seconds pulse (user request).
-const PULSE_WITHIN: f64 = 30.0;
+const PULSE_WITHIN: f64 = 10.0;
 
 fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Theme) -> AnyElement {
     let pulse = b.ends_soon(now, PULSE_WITHIN);
@@ -437,11 +457,21 @@ fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Th
         .child(dot(color, 6.0))
         .child(if grouped { b.short_text() } else { b.text() })
         .id(id.clone())
-        .when(!tip.is_empty(), |d| d.tooltip(move |_, cx| cx.new(|_| Tooltip { text: tip.clone(), theme }).into()));
+        .when(!tip.is_empty(), |d| {
+            d.tooltip(move |_, cx| {
+                cx.new(|_| Tooltip {
+                    text: tip.clone(),
+                    theme,
+                })
+                .into()
+            })
+        });
     if pulse {
         pill.with_animation(
             (SharedString::from(format!("pulse-{}", id.0)), id.1),
-            Animation::new(Duration::from_millis(1400)).repeat().with_easing(pulsating_between(0.35, 1.0)),
+            Animation::new(Duration::from_millis(1400))
+                .repeat()
+                .with_easing(pulsating_between(0.35, 1.0)),
             |el, t| el.opacity(t),
         )
         .into_any_element()
@@ -450,7 +480,7 @@ fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Th
     }
 }
 
-/// Hover text (badges, info window food row).
+/// Hover text (badges, floating window food row).
 pub(crate) struct Tooltip {
     /// One line per `\n`.
     pub text: SharedString,
@@ -471,15 +501,21 @@ impl Render for Tooltip {
             .text_color(self.theme.text)
             .flex()
             .flex_col()
-            .children(self.text.split('\n').map(|line| div().child(line.to_string())))
+            .children(
+                self.text
+                    .split('\n')
+                    .map(|line| div().child(line.to_string())),
+            )
     }
 }
 
-fn section_title(title: &str) -> impl IntoElement {
-    div().font_weight(FontWeight::SEMIBOLD).child(title.to_string())
+pub(crate) fn section_title(title: &str) -> impl IntoElement {
+    div()
+        .font_weight(FontWeight::SEMIBOLD)
+        .child(title.to_string())
 }
 
-fn divider(theme: Theme) -> impl IntoElement {
+pub(crate) fn divider(theme: Theme) -> impl IntoElement {
     div().h(px(1.0)).w_full().bg(theme.border)
 }
 
@@ -489,7 +525,11 @@ impl Render for Panel {
         let state = self.state.read(cx);
         let m = &state.model;
 
-        let header_color = if m.is_loading { status_color(HealthStatus::Warning) } else { status_color(m.monitor.overall()) };
+        let header_color = if m.is_loading {
+            status_color(HealthStatus::Warning)
+        } else {
+            status_color(m.monitor.overall())
+        };
         let live = match m.relay_state {
             RelayState::Live => "Connected",
             RelayState::Off | RelayState::Connecting => "Connecting…",
@@ -504,14 +544,23 @@ impl Render for Panel {
                 .items_center()
                 .gap_2()
                 .child(dot(header_color, 12.0))
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(14.0)).child("BitCraft Tracker"))
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_size(px(14.0))
+                        .child("BitCraft Tracker"),
+                )
                 .child(div().flex_1())
                 .child(div().text_xs().text_color(theme.secondary).child(live))
                 .into_any_element(),
         );
 
         if m.is_loading {
-            let name = m.settings.username.clone().unwrap_or_else(|| "character".into());
+            let name = m
+                .settings
+                .username
+                .clone()
+                .unwrap_or_else(|| "character".into());
             body.push(
                 div()
                     .h(px(60.0))
@@ -538,7 +587,12 @@ impl Render for Panel {
                         .items_center()
                         .child(section_title("Passive crafts"))
                         .child(div().flex_1())
-                        .child(div().text_xs().text_color(theme.secondary).child("Loading…"))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.secondary)
+                                .child("Loading…"),
+                        )
                         .into_any_element(),
                 );
             } else if !m.passive.crafts.is_empty() {
@@ -556,41 +610,37 @@ impl Render for Panel {
             }
         }
 
-        if state.settings_open {
-            body.push(divider(theme).into_any_element());
-            body.push(self.settings(&state.model.settings.sounds, theme).into_any_element());
-        }
         if let Some(release) = &state.update {
             body.push(divider(theme).into_any_element());
-            body.push(self.update(release, theme).into_any_element());
+            body.push(update_row(release, theme).into_any_element());
         }
         body.push(divider(theme).into_any_element());
-        body.push(self.picker(state, theme, cx).into_any_element());
+        let name = m.settings.username.clone().unwrap_or_else(|| "Unknown".into());
         body.push(
             div()
                 .flex()
+                .items_center()
                 .gap_2()
-                .child({
-                    let st = self.state.clone();
-                    let open = state.info.is_some();
-                    button("info", if open { "Hide info window" } else { "Show info window" }, theme)
-                        .on_click(move |_, _, cx: &mut App| crate::info::toggle(&st, cx))
-                })
-                .child({
-                    let st = self.state.clone();
-                    button("settings", if state.settings_open { "Close settings" } else { "Settings" }, theme).on_click(
-                        move |_, _, cx: &mut App| {
-                            st.update(cx, |s, cx| {
-                                s.settings_open = !s.settings_open;
-                                cx.notify();
-                            })
-                        },
-                    )
-                })
-                .child(div().flex_1())
                 .child(
-                    button("quit", "Quit", theme).on_click(|_, _, cx: &mut App| cx.quit()),
+                    div()
+                        .flex_1()
+                        .overflow_hidden()
+                        .whitespace_nowrap()
+                        .text_ellipsis()
+                        .text_color(theme.secondary)
+                        .child(name),
                 )
+                // Character, floating window and sounds live in the main
+                // window; this brings it up.
+                .child({
+                    let st = self.state.clone();
+                    button("settings", "Settings", theme).on_click(move |_, window, cx: &mut App| {
+                        crate::main_window::show(&st, cx);
+                        st.update(cx, |s, _| s.popup_closed());
+                        window.remove_window();
+                    })
+                })
+                .child(button("quit", "Quit", theme).on_click(|_, _, cx: &mut App| cx.quit()))
                 .into_any_element(),
         );
 
@@ -604,7 +654,10 @@ impl Render for Panel {
             .flex()
             .flex_col()
             // Anchored at the bottom: keep the panel at the window's bottom.
-            .when(matches!(place.map(|p| p.edge), Some(Edge::Bottom(_))), |d| d.justify_end())
+            .when(
+                matches!(place.map(|p| p.edge), Some(Edge::Bottom(_))),
+                |d| d.justify_end(),
+            )
             // Size the window to the panel once laid out (content changes,
             // e.g. opening the character search, refit it).
             .on_children_prepainted(move |bounds, window, cx| {
@@ -639,7 +692,10 @@ impl Render for Panel {
 fn fit_window(state: &Entity<AppState>, height: Pixels, window: &mut Window, cx: &mut App) {
     let (place, current) = {
         let s = state.read(cx);
-        (s.popup_place, s.popup_height.unwrap_or(window.bounds().size.height))
+        (
+            s.popup_place,
+            s.popup_height.unwrap_or(window.bounds().size.height),
+        )
     };
     let Some(place) = place else { return };
     let height = height.min(place.max_height).ceil();
@@ -651,7 +707,7 @@ fn fit_window(state: &Entity<AppState>, height: Pixels, window: &mut Window, cx:
     crate::platform::set_window_frame(window, place.frame(height), cx);
 }
 
-fn button(id: &'static str, label: &str, theme: Theme) -> gpui::Stateful<gpui::Div> {
+pub(crate) fn button(id: &'static str, label: &str, theme: Theme) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .px_2()
@@ -664,36 +720,55 @@ fn button(id: &'static str, label: &str, theme: Theme) -> gpui::Stateful<gpui::D
         .child(label.to_string())
 }
 
-impl Panel {
-    /// "Update available" row; Download opens the release page.
-    fn update(&self, release: &crate::net::api::Release, theme: Theme) -> impl IntoElement {
+/// "Update available" row; Download opens the release page.
+pub(crate) fn update_row(release: &crate::net::api::Release, theme: Theme) -> impl IntoElement {
         let url = release.html_url.clone();
         div()
             .flex()
             .items_center()
             .gap_2()
             .child(dot(status_color(HealthStatus::Healthy), 8.0))
-            .child(div().font_weight(FontWeight::MEDIUM).child("Update available"))
-            .child(div().text_color(theme.secondary).child(release.tag_name.clone()))
+            .child(
+                div()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child("Update available"),
+            )
+            .child(
+                div()
+                    .text_color(theme.secondary)
+                    .child(release.tag_name.clone()),
+            )
             .child(div().flex_1())
-            .child(button("update", "Download", theme).on_click(move |_, _, cx: &mut App| cx.open_url(&url)))
-    }
+            .child(
+                button("update", "Download", theme)
+                    .on_click(move |_, _, cx: &mut App| cx.open_url(&url)),
+            )
+}
 
+impl Panel {
     fn reports(&self, m: &Model, theme: Theme) -> impl IntoElement {
-        div().flex().flex_col().gap_1p5().children(m.monitor.sorted_reports().into_iter().map(move |r| {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(dot(status_color(r.status), 8.0))
-                .child(div().font_weight(FontWeight::MEDIUM).child(r.source))
-                .child(div().text_color(theme.secondary).child(r.message))
-        }))
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .children(m.monitor.sorted_reports().into_iter().map(move |r| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(dot(status_color(r.status), 8.0))
+                    .child(div().font_weight(FontWeight::MEDIUM).child(r.source))
+                    .child(div().text_color(theme.secondary).child(r.message))
+            }))
     }
 
     fn stats(&self, m: &Model, theme: Theme) -> impl IntoElement {
         let stamina_text = match m.stamina.stamina {
-            Some(s) => format!("{} / {}", s as i64, m.stamina.max.map_or("?".into(), |x| (x as i64).to_string())),
+            Some(s) => format!(
+                "{} / {}",
+                s as i64,
+                m.stamina.max.map_or("?".into(), |x| (x as i64).to_string())
+            ),
             None => "–".into(),
         };
         let satiation_text = match m.satiation.satiation {
@@ -701,7 +776,11 @@ impl Panel {
             None => "–".into(),
         };
         let low = m.satiation.is_low();
-        let satiation_color = status_color(if low { HealthStatus::Alert } else { HealthStatus::Healthy });
+        let satiation_color = status_color(if low {
+            HealthStatus::Alert
+        } else {
+            HealthStatus::Healthy
+        });
         let last_gain = match m.experience.last_gain_at {
             Some(t) => {
                 let ago = duration_string(m.now - t);
@@ -718,7 +797,13 @@ impl Panel {
                 .flex()
                 .items_center()
                 .gap_3()
-                .child(div().w(px(72.0)).flex_none().text_color(theme.secondary).child(label.to_string()))
+                .child(
+                    div()
+                        .w(px(72.0))
+                        .flex_none()
+                        .text_color(theme.secondary)
+                        .child(label.to_string()),
+                )
                 .child(div().flex_1().flex().items_center().gap_2().child(value))
         };
         let with_bar = |fraction: f64, color: Rgba, text: String, text_color: Rgba| {
@@ -735,7 +820,10 @@ impl Panel {
         // Only known via the relay ("–" until then); orange under 5 min,
         // full red bar + "None" when out.
         let food_bar = match &m.food {
-            None => div().text_color(theme.secondary).child("–").into_any_element(),
+            None => div()
+                .text_color(theme.secondary)
+                .child("–")
+                .into_any_element(),
             Some(food) => match food.regen_ends_at(m.now) {
                 Some(end) => with_bar(
                     food.regen_fraction(m.now).unwrap_or(0.0),
@@ -743,21 +831,42 @@ impl Panel {
                     duration_string(end - m.now),
                     theme.text,
                 ),
-                None => with_bar(1.0, status_color(HealthStatus::Alert), "None".into(), status_color(HealthStatus::Alert)),
+                None => with_bar(
+                    1.0,
+                    status_color(HealthStatus::Alert),
+                    "None".into(),
+                    status_color(HealthStatus::Alert),
+                ),
             },
         };
-        let food_summary = m.food.as_ref().map(|f| f.summary(m.now)).filter(|s| !s.is_empty());
+        let food_summary = m
+            .food
+            .as_ref()
+            .map(|f| f.summary(m.now))
+            .filter(|s| !s.is_empty());
         div()
             .flex()
             .flex_col()
             .gap_1()
             .child(row(
                 "Stamina",
-                with_bar(m.stamina.fraction().unwrap_or(0.0), rgb(stamina_rgb(m.stamina.fraction().unwrap_or(1.0))), stamina_text, theme.text),
+                with_bar(
+                    m.stamina.fraction().unwrap_or(0.0),
+                    rgb(stamina_rgb(m.stamina.fraction().unwrap_or(1.0))),
+                    stamina_text,
+                    theme.text,
+                ),
             ))
             .child(row("Food", food_bar))
             .children(food_summary.map(|summary| {
-                row("", div().text_xs().text_color(theme.secondary).child(summary).into_any_element())
+                row(
+                    "",
+                    div()
+                        .text_xs()
+                        .text_color(theme.secondary)
+                        .child(summary)
+                        .into_any_element(),
+                )
             }))
             .child(row(
                 "Satiation",
@@ -765,111 +874,26 @@ impl Panel {
                     m.satiation.fraction().unwrap_or(0.0),
                     satiation_color,
                     satiation_text,
-                    if low { status_color(HealthStatus::Alert) } else { theme.text },
+                    if low {
+                        status_color(HealthStatus::Alert)
+                    } else {
+                        theme.text
+                    },
                 ),
             ))
             .child(row(
                 "Total XP",
-                div().child(m.experience.total.map_or("–".into(), group_thousands)).into_any_element(),
+                div()
+                    .child(m.experience.total.map_or("–".into(), group_thousands))
+                    .into_any_element(),
             ))
             .child(row(
                 "Last skill",
-                div().child(m.experience.last_skill_name().unwrap_or_else(|| "–".into())).into_any_element(),
+                div()
+                    .child(m.experience.last_skill_name().unwrap_or_else(|| "–".into()))
+                    .into_any_element(),
             ))
             .child(row("Last gain", div().child(last_gain).into_any_element()))
-    }
-
-    /// Sound settings: which events play a sound, volume slider, test.
-    fn settings(&self, prefs: &SoundSettings, theme: Theme) -> impl IntoElement {
-        let state = self.state.clone();
-        let toggle = |id: &'static str, label: &str, on: bool, set: fn(&mut SoundSettings, bool)| {
-            let state = state.clone();
-            div()
-                .id(id)
-                .flex()
-                .items_center()
-                .gap_2()
-                .cursor_pointer()
-                .child(
-                    div()
-                        .size(px(14.0))
-                        .flex_none()
-                        .rounded_sm()
-                        .border_1()
-                        .border_color(if on { status_color(HealthStatus::Healthy) } else { theme.border })
-                        .when(on, |d| d.bg(status_color(HealthStatus::Healthy)))
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_size(px(10.0))
-                        .text_color(rgb(0xffffff))
-                        .child(if on { "✓" } else { "" }),
-                )
-                .child(label.to_string())
-                .on_click(move |_, _, cx: &mut App| {
-                    state.update(cx, |s, cx| {
-                        set(&mut s.model.settings.sounds, !on);
-                        s.model.settings.save();
-                        cx.notify();
-                    })
-                })
-        };
-        // Volume: 20 segments (5% steps); click or drag across them.
-        const STEPS: usize = 20;
-        let volume = prefs.volume;
-        let filled = (volume * STEPS as f32).round() as usize;
-        let slider = div().flex_1().flex().h(px(16.0)).items_center().children((1..=STEPS).map(|i| {
-            let set_to = i as f32 / STEPS as f32;
-            let (down, moved) = (state.clone(), state.clone());
-            let set = move |state: &Entity<AppState>, cx: &mut App| {
-                state.update(cx, |s, cx| {
-                    if (s.model.settings.sounds.volume - set_to).abs() > f32::EPSILON {
-                        s.model.settings.sounds.volume = set_to;
-                        s.model.settings.save();
-                        cx.notify();
-                    }
-                })
-            };
-            div()
-                .flex_1()
-                .h_full()
-                .flex()
-                .items_center()
-                .child(
-                    div()
-                        .w_full()
-                        .h(px(6.0))
-                        .when(i == 1, |d| d.rounded_l_full())
-                        .when(i == STEPS, |d| d.rounded_r_full())
-                        .bg(if i <= filled { status_color(HealthStatus::Healthy) } else { theme.track }),
-                )
-                .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| set(&down, cx))
-                .on_mouse_move(move |e: &gpui::MouseMoveEvent, _, cx| {
-                    if e.pressed_button == Some(gpui::MouseButton::Left) {
-                        set(&moved, cx);
-                    }
-                })
-        }));
-        div()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(section_title("Sounds"))
-            .child(toggle("snd-craft", "Craft finished", prefs.craft_finished, |p, v| p.craft_finished = v))
-            .child(toggle("snd-food", "Out of food", prefs.out_of_food, |p, v| p.out_of_food = v))
-            .child(toggle("snd-idle", "Idle with stamina above 90%", prefs.idle_full, |p, v| p.idle_full = v))
-            .child(toggle("snd-depleted", "Resource depleted", prefs.resource_depleted, |p, v| p.resource_depleted = v))
-            .child(toggle("snd-trade", "Trade request", prefs.trade_request, |p, v| p.trade_request = v))
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().w(px(50.0)).flex_none().text_color(theme.secondary).child("Volume"))
-                    .child(slider)
-                    .child(div().w(px(34.0)).flex_none().flex().justify_end().child(format!("{}%", (volume * 100.0).round() as i64)))
-                    .child(button("snd-test", "Test", theme).on_click(move |_, _, _| crate::sound::play(Sound::CraftFinished, volume))),
-            )
     }
 
     fn plants(&self, m: &Model, theme: Theme) -> impl IntoElement {
@@ -877,7 +901,11 @@ impl Panel {
         let time_left = move |tier: &TierSummary| match tier.all_grown_at() {
             None => "–".to_string(),
             Some(end) if end <= now => "any moment".into(),
-            Some(end) => format!("{}{} left", if tier.is_estimate { "~" } else { "" }, duration_string(end - now)),
+            Some(end) => format!(
+                "{}{} left",
+                if tier.is_estimate { "~" } else { "" },
+                duration_string(end - now)
+            ),
         };
         let need_row = |label: &str, color: u32, count: fn(&TierSummary) -> usize| {
             let tiers: Vec<String> = m
@@ -903,17 +931,32 @@ impl Panel {
             .flex_col()
             .gap_1p5()
             .child(section_title("Plants"))
-            .child(badges("plant-badge", &badges::plants(&m.plants.plants), m.now, theme))
+            .child(badges(
+                "plant-badge",
+                &badges::plants(&m.plants.plants),
+                m.now,
+                theme,
+            ))
             .children(m.plants.growing_tiers().into_iter().map(move |tier| {
                 div()
                     .flex()
                     .gap_2()
-                    .child(div().font_weight(FontWeight::MEDIUM).child(format!("T{}", tier.tier)))
-                    .child(div().text_color(theme.secondary).child(format!("{} growing", tier.growing)))
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(format!("T{}", tier.tier)),
+                    )
+                    .child(
+                        div()
+                            .text_color(theme.secondary)
+                            .child(format!("{} growing", tier.growing)),
+                    )
                     .child(div().flex_1())
                     .child(time_left(&tier))
             }))
-            .children(need_row("Needs fertilizer", 0xff9500, |t| t.needs_fertilizer))
+            .children(need_row("Needs fertilizer", 0xff9500, |t| {
+                t.needs_fertilizer
+            }))
             .children(need_row("Needs water", 0x0a84ff, |t| t.needs_water))
             .children(need_row("Ready to harvest", 0x34c759, |t| t.grown))
     }
@@ -925,9 +968,13 @@ impl Panel {
             .flex_col()
             .gap_1p5()
             .child(section_title("Passive crafts"))
-            .child(badges("passive-badge", &badges::passive(&m.passive.crafts, now), now, theme))
-            .children(m.passive.groups(now).into_iter().map(
-            move |g| {
+            .child(badges(
+                "passive-badge",
+                &badges::passive(&m.passive.crafts, now),
+                now,
+                theme,
+            ))
+            .children(m.passive.groups(now).into_iter().map(move |g| {
                 let status = if g.running == 0 {
                     "Ready".to_string()
                 } else {
@@ -954,13 +1001,21 @@ impl Panel {
                             .child(div().flex_1())
                             .child(
                                 div()
-                                    .text_color(if g.running == 0 { status_color(HealthStatus::Healthy) } else { theme.secondary })
+                                    .text_color(if g.running == 0 {
+                                        status_color(HealthStatus::Healthy)
+                                    } else {
+                                        theme.secondary
+                                    })
                                     .child(status),
                             ),
                     )
-                    .child(div().text_xs().text_color(theme.secondary).child(detail.join(" · ")))
-            },
-        ))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.secondary)
+                            .child(detail.join(" · ")),
+                    )
+            }))
     }
 
     /// The resource being gathered, like a craft row: name, value (health
@@ -975,7 +1030,11 @@ impl Panel {
             details.push(format!("T{t}"));
         }
         if let (Some(h), Some(max)) = (g.health, g.max_health) {
-            details.push(format!("{} / {}", group_thousands(h as i64), group_thousands(max as i64)));
+            details.push(format!(
+                "{} / {}",
+                group_thousands(h as i64),
+                group_thousands(max as i64)
+            ));
         }
         div()
             .flex()
@@ -996,7 +1055,12 @@ impl Panel {
                             .child(text),
                     )
                     .child(div().flex().child(bar(fraction, rgb(GATHER_RGB), theme)))
-                    .child(div().text_xs().text_color(theme.secondary).child(details.join(" · "))),
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.secondary)
+                            .child(details.join(" · ")),
+                    ),
             )
     }
 
@@ -1008,138 +1072,41 @@ impl Panel {
             .flex_col()
             .gap_2()
             .child(section_title("Crafts"))
-            .child(badges("craft-badge", &badges::crafts(crafts, now, window), now, theme))
+            .child(badges(
+                "craft-badge",
+                &badges::crafts(crafts, now, window),
+                now,
+                theme,
+            ))
             .children(crafts.iter().cloned().map(move |c| {
-            let status = if c.is_complete() {
-                Some("Done")
-            } else if c.last_progress_at.is_none_or(|t| now - t > window) {
-                Some("Paused")
-            } else {
-                None
-            };
-            div()
-                .flex()
-                .flex_col()
-                .gap_0p5()
-                .child(
-                    div()
-                        .flex()
-                        .gap_2()
-                        .child(div().font_weight(FontWeight::MEDIUM).child(c.name.clone()))
-                        .child(div().flex_1())
-                        .children(status.map(|s| div().text_color(theme.secondary).child(s)))
-                        .child(c.percent_string()),
-                )
-                .child(div().flex().child(bar(c.fraction(), rgb(0x0a84ff), theme)))
-                .child(div().text_xs().text_color(theme.secondary).child(format!(
-                    "{} · {} / {}",
-                    c.building.clone().unwrap_or_default(),
-                    group_thousands(c.progress),
-                    group_thousands(c.total)
-                )))
-        }))
-    }
-
-    fn picker(&self, state: &AppState, theme: Theme, cx: &Context<Self>) -> impl IntoElement {
-        let name = state.model.settings.username.clone().unwrap_or_else(|| "Unknown".into());
-        if !state.picking {
-            return div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().text_color(theme.secondary).child("Character"))
-                .child(div().font_weight(FontWeight::MEDIUM).child(name))
-                .child(div().flex_1())
-                .child(button("change", "Change", theme).on_click(cx.listener(|this, _, window, cx| {
-                    // Non-activating popup: take the keyboard for typing.
-                    crate::platform::set_no_activate(window, false);
-                    window.activate_window();
-                    this.focus.focus(window);
-                    this.state.update(cx, |s, cx| {
-                        s.picking = true;
-                        s.query.clear();
-                        s.results.clear();
-                        cx.notify();
-                    });
-                })))
-                .into_any_element();
-        }
-
-        let query: SharedString = if state.query.is_empty() {
-            "Type a username…".into()
-        } else {
-            format!("{}▏", state.query).into()
-        };
-        let hint = if state.query.trim().chars().count() < 2 {
-            Some("Type at least 2 characters".to_string())
-        } else if let Some(e) = &state.search_error {
-            Some(format!("Search failed: {e}"))
-        } else if state.searching && state.results.is_empty() {
-            Some("Searching…".into())
-        } else if state.results.is_empty() {
-            Some("No players found".into())
-        } else if state.results.len() >= crate::net::api::SEARCH_LIMIT {
-            Some(format!("Showing the first {}; type more to narrow it down", crate::net::api::SEARCH_LIMIT))
-        } else {
-            None
-        };
-        let current = state.model.settings.user_id.clone();
-        div()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(
+                let status = if c.is_complete() {
+                    Some("Done")
+                } else if c.last_progress_at.is_none_or(|t| now - t > window) {
+                    Some("Paused")
+                } else {
+                    None
+                };
                 div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .px_2()
-                            .py_1()
-                            .rounded_md()
-                            .border_1()
-                            .border_color(status_color(HealthStatus::Warning))
-                            .text_color(if state.query.is_empty() { theme.secondary } else { theme.text })
-                            .child(query),
-                    )
-                    .child(button("cancel", "Cancel", theme).on_click(cx.listener(|this, _, _, cx| {
-                        this.state.update(cx, |s, cx| {
-                            s.picking = false;
-                            cx.notify();
-                        });
-                    }))),
-            )
-            .children(hint.map(|h| div().text_xs().text_color(theme.secondary).child(h)))
-            .child(
-                div()
-                    .id("results")
                     .flex()
                     .flex_col()
-                    .max_h(px(22.0 * MAX_RESULTS_SHOWN as f32))
-                    .overflow_y_scroll()
-                    .children(state.results.iter().cloned().enumerate().map(|(i, player)| {
-                        let selected = player.entity_id == current;
-                        let label = format!("{}{}", player.username, if player.signed_in == Some(true) { "  •" } else { "" });
+                    .gap_0p5()
+                    .child(
                         div()
-                            .id(("result", i))
-                            .h(px(22.0))
-                            .px_2()
                             .flex()
-                            .items_center()
-                            .rounded_sm()
-                            .cursor_pointer()
-                            .hover(move |s| s.bg(theme.hover))
-                            .when(selected, |d| d.font_weight(FontWeight::SEMIBOLD))
-                            .child(label)
-                            .on_click(cx.listener(move |this, _, _, cx| {
-                                let player = player.clone();
-                                this.state.update(cx, |s, cx| s.select(player, cx));
-                            }))
-                    })),
-            )
-            .into_any_element()
+                            .gap_2()
+                            .child(div().font_weight(FontWeight::MEDIUM).child(c.name.clone()))
+                            .child(div().flex_1())
+                            .children(status.map(|s| div().text_color(theme.secondary).child(s)))
+                            .child(c.percent_string()),
+                    )
+                    .child(div().flex().child(bar(c.fraction(), rgb(0x0a84ff), theme)))
+                    .child(div().text_xs().text_color(theme.secondary).child(format!(
+                        "{} · {} / {}",
+                        c.building.clone().unwrap_or_default(),
+                        group_thousands(c.progress),
+                        group_thousands(c.total)
+                    )))
+            }))
     }
 }
 

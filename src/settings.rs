@@ -11,18 +11,19 @@ pub struct Settings {
     pub user_id: String,
     /// Display only; looked up from `players/<id>`.
     pub username: Option<String>,
-    /// Info window open (reopened at launch).
-    #[serde(default)]
-    pub info_window: bool,
-    /// Info window position (top-left, logical screen coordinates), kept
-    /// when the user moves it.
-    #[serde(default)]
-    pub info_origin: Option<(f32, f32)>,
+    /// Floating window open (reopened at launch). Was called the info
+    /// window; the old keys are still read.
+    #[serde(default, alias = "info_window")]
+    pub floating_window: bool,
+    /// Floating window position (top-left, logical screen coordinates),
+    /// kept when the user moves it.
+    #[serde(default, alias = "info_origin")]
+    pub floating_origin: Option<(f32, f32)>,
     #[serde(default)]
     pub sounds: SoundSettings,
 }
 
-/// Which events play a sound, and how loud (settings in the popup).
+/// Which events play a sound, and how loud (settings in the main window).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct SoundSettings {
@@ -43,7 +44,7 @@ impl Default for SoundSettings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Self { user_id: DEFAULT_USER_ID.into(), username: None, info_window: false, info_origin: None, sounds: SoundSettings::default() }
+        Self { user_id: DEFAULT_USER_ID.into(), username: None, floating_window: false, floating_origin: None, sounds: SoundSettings::default() }
     }
 }
 

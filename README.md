@@ -47,7 +47,9 @@ Anyway*).
 ## Layout
 
 ```
-src/main.rs        GPUI app, tray click → popup placement, keepalive window
+src/main.rs        GPUI app, tray click → popup placement, opens the main window
+src/main_window.rs Main window: character search, floating window toggle, sounds
+src/floating.rs    Floating always-on-top overview
 src/ui.rs          AppState (model + tray + popup) and the Panel view
 src/model.rs       Port of AppModel: routes events, loading/offline, notifications
 src/core/          No GPUI/I/O: status monitor, trackers + rules, skills, types
@@ -72,8 +74,9 @@ commands (subscribe, reconnect, track character) and notifications that
   themselves, so the compositor decides where it appears.
 - **Reconnect on wake / network change**: not implemented; the 15s ping
   detects dead connections within ~30s instead.
-- **Keepalive window**: GPUI quits on Linux/Windows when the last window
-  closes, so an invisible 1×1 window stays open.
+- **Main window**: opens at launch (character, floating window, sounds);
+  closing it quits the app. The popup's *Settings* button brings it to the
+  front.
 - **Popup height**: the window is resized to the panel's measured height
   after layout (GPUI has no "size to content" or move API; `platform.rs`
   sets the native frame on macOS/Windows so the anchored edge stays put).

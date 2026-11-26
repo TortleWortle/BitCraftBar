@@ -25,16 +25,6 @@ pub fn scale_factor() -> f64 {
     1.0
 }
 
-/// Menu bar app: no Dock icon (GPUI starts as a regular app).
-#[cfg(target_os = "macos")]
-pub fn hide_dock_icon() {
-    use objc2::MainThreadMarker;
-    use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy};
-    if let Some(mtm) = MainThreadMarker::new() {
-        NSApplication::sharedApplication(mtm).setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-    }
-}
-
 /// The NSWindow behind a GPUI window.
 #[cfg(target_os = "macos")]
 fn ns_window(window: &Window) -> Option<objc2::rc::Retained<objc2_app_kit::NSWindow>> {
@@ -125,7 +115,7 @@ pub fn set_no_activate(window: &Window, on: bool) {
 #[cfg(not(target_os = "windows"))]
 pub fn set_no_activate(_window: &Window, _on: bool) {}
 
-/// Keep the info window above other windows. macOS: GPUI's PopUp windows
+/// Keep the floating window above other windows. macOS: GPUI's PopUp windows
 /// already float (popup level, on all Spaces, next to fullscreen apps).
 /// Windows: topmost + no activation.
 #[cfg(target_os = "windows")]

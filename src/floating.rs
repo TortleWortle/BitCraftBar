@@ -1,6 +1,6 @@
-//! Info window: a small always-on-top overview (stamina, health, food,
+//! Floating window: a small always-on-top overview (stamina, health, food,
 //! current activity/craft, crafts / passive crafts / plants), toggled from
-//! the popup. Movable by dragging; position and open state are saved.
+//! the main window. Movable by dragging; position and open state are saved.
 
 use std::time::Duration;
 
@@ -20,9 +20,9 @@ const WIDTH: f32 = 260.0;
 const INITIAL_HEIGHT: f32 = 240.0;
 const MARGIN: f32 = 16.0;
 
-/// Open or close the info window (remembered for the next launch).
+/// Open or close the floating window (remembered for the next launch).
 pub fn toggle(state: &Entity<AppState>, cx: &mut App) {
-    if let Some(handle) = state.read(cx).info {
+    if let Some(handle) = state.read(cx).floating {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
         set_open(state, false, cx);
         return;
@@ -33,11 +33,11 @@ pub fn toggle(state: &Entity<AppState>, cx: &mut App) {
 fn set_open(state: &Entity<AppState>, open: bool, cx: &mut App) {
     state.update(cx, |s, cx| {
         if !open {
-            s.info = None;
-            s.info_height = None;
+            s.floating = None;
+            s.floating_height = None;
         }
-        if s.model.settings.info_window != open {
-            s.model.settings.info_window = open;
+        if s.model.settings.floating_window != open {
+            s.model.settings.floating_window = open;
             s.model.settings.save();
         }
         cx.notify();
@@ -45,7 +45,7 @@ fn set_open(state: &Entity<AppState>, open: bool, cx: &mut App) {
 }
 
 pub fn open(state: &Entity<AppState>, cx: &mut App) {
-    let origin = match state.read(cx).model.settings.info_origin {
+    let origin = match state.read(cx).model.settings.floating_origin {
         Some((x, y)) if on_some_display(point(px(x), px(y)), cx) => point(px(x), px(y)),
         // Default: top-right corner of the main display, below the menu bar.
         _ => match cx.primary_display().map(|d| d.bounds()) {
@@ -72,13 +72,13 @@ pub fn open(state: &Entity<AppState>, cx: &mut App) {
     let st = state.clone();
     match cx.open_window(options, move |window, cx| {
         crate::platform::make_overlay(window);
-        cx.new(|cx| InfoWindow::new(st, window, cx))
+        cx.new(|cx| FloatingWindow::new(st, window, cx))
     }) {
         Ok(handle) => {
-            state.update(cx, |s, _| s.info = Some(handle));
+            state.update(cx, |s, _| s.floating = Some(handle));
             set_open(state, true, cx);
         }
-        Err(e) => eprintln!("failed to open info window: {e}"),
+        Err(e) => eprintln!("failed to open floating window: {e}"),
     }
 }
 
@@ -88,13 +88,13 @@ fn on_some_display(p: gpui::Point<Pixels>, cx: &App) -> bool {
     cx.displays().iter().any(|d| d.bounds().contains(&p))
 }
 
-pub struct InfoWindow {
+pub struct FloatingWindow {
     state: Entity<AppState>,
     save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
-impl InfoWindow {
+impl FloatingWindow {
     fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),
@@ -103,14 +103,14 @@ impl InfoWindow {
             cx.observe_window_bounds(window, |this, window, cx| {
                 let origin = window.bounds().origin;
                 let origin = (f32::from(origin.x), f32::from(origin.y));
-                if this.state.read(cx).model.settings.info_origin == Some(origin) {
+                if this.state.read(cx).model.settings.floating_origin == Some(origin) {
                     return;
                 }
                 let state = this.state.clone();
                 this.save_task = Some(cx.spawn(async move |_, cx| {
                     cx.background_executor().timer(Duration::from_millis(500)).await;
                     let _ = state.update(cx, |s, _| {
-                        s.model.settings.info_origin = Some(origin);
+                        s.model.settings.floating_origin = Some(origin);
                         s.model.settings.save();
                     });
                 }));
@@ -123,16 +123,16 @@ impl InfoWindow {
 /// Resize the window to the card's height, keeping its top-left corner.
 fn fit(state: &Entity<AppState>, height: Pixels, window: &mut Window, cx: &mut App) {
     let height = height.ceil();
-    let current = state.read(cx).info_height.unwrap_or(window.bounds().size.height);
+    let current = state.read(cx).floating_height.unwrap_or(window.bounds().size.height);
     if (height - current).abs() < px(1.0) {
         return;
     }
-    state.update(cx, |s, _| s.info_height = Some(height));
+    state.update(cx, |s, _| s.floating_height = Some(height));
     let frame = Bounds { origin: window.bounds().origin, size: size(px(WIDTH), height) };
     crate::platform::set_window_frame(window, frame, cx);
 }
 
-impl Render for InfoWindow {
+impl Render for FloatingWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let mut theme = Theme::for_appearance(window.appearance());
         theme.bg.a = 0.94;

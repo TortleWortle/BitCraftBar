@@ -6,7 +6,8 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod core;
-mod info;
+mod floating;
+mod main_window;
 mod model;
 mod net;
 mod notifier;
@@ -19,13 +20,15 @@ mod ui;
 use std::time::Duration;
 
 use gpui::{
-    App, Application, AsyncApp, Entity, Pixels, Point, Size, WindowBackgroundAppearance, WindowBounds,
-    WindowKind, WindowOptions, point, prelude::*, px, size,
+    App, Application, AsyncApp, Entity, Pixels, Point, Size, WindowBackgroundAppearance,
+    WindowBounds, WindowKind, WindowOptions, point, prelude::*, px, size,
 };
 
 use crate::model::Model;
 use crate::settings::Settings;
 use crate::ui::{AppState, Edge, PANEL_WIDTH, Panel, Placement};
+
+gpui::actions!(bitcraft_tracker, [Quit]);
 
 /// Tray click: icon rect in logical pixels (screen coordinates, top-left origin).
 #[derive(Clone, Copy, Debug)]
@@ -40,13 +43,17 @@ fn main() {
     notifier::init();
 
     Application::new().run(|cx: &mut App| {
+        // macOS: a regular Dock app (user request; it used to hide in
+        // the Dock as a menu bar-only app). App menu with Quit / ⌘Q.
         #[cfg(target_os = "macos")]
-        platform::hide_dock_icon();
-
-        // Linux and Windows quit when the last window closes; the popup
-        // comes and goes, so keep an invisible window around.
-        #[cfg(not(target_os = "macos"))]
-        open_keepalive_window(cx);
+        {
+            cx.on_action(|_: &Quit, cx| cx.quit());
+            cx.bind_keys([gpui::KeyBinding::new("cmd-q", Quit, None)]);
+            cx.set_menus(vec![gpui::Menu {
+                name: "BitCraft Tracker".into(),
+                items: vec![gpui::MenuItem::action("Quit BitCraft Tracker", Quit)],
+            }]);
+        }
 
         let (out_tx, out_rx) = async_channel::unbounded();
         let net = net::start(out_tx);
@@ -63,26 +70,39 @@ fn main() {
 
         // Tray clicks → toggle the popup.
         let (click_tx, click_rx) = async_channel::unbounded::<Anchor>();
-        tray_icon::TrayIconEvent::set_event_handler(Some(move |event: tray_icon::TrayIconEvent| {
-            if let tray_icon::TrayIconEvent::Click {
-                rect,
-                button: tray_icon::MouseButton::Left,
-                button_state: tray_icon::MouseButtonState::Up,
-                ..
-            } = event
-            {
-                let scale = platform::scale_factor();
-                let _ = click_tx.try_send(Anchor {
-                    origin: point(px((rect.position.x / scale) as f32), px((rect.position.y / scale) as f32)),
-                    size: size(px((rect.size.width as f64 / scale) as f32), px((rect.size.height as f64 / scale) as f32)),
-                });
-            }
-        }));
+        tray_icon::TrayIconEvent::set_event_handler(Some(
+            move |event: tray_icon::TrayIconEvent| {
+                if let tray_icon::TrayIconEvent::Click {
+                    rect,
+                    button: tray_icon::MouseButton::Left,
+                    button_state: tray_icon::MouseButtonState::Up,
+                    ..
+                } = event
+                {
+                    let scale = platform::scale_factor();
+                    let _ = click_tx.try_send(Anchor {
+                        origin: point(
+                            px((rect.position.x / scale) as f32),
+                            px((rect.position.y / scale) as f32),
+                        ),
+                        size: size(
+                            px((rect.size.width as f64 / scale) as f32),
+                            px((rect.size.height as f64 / scale) as f32),
+                        ),
+                    });
+                }
+            },
+        ));
 
         spawn_loops(state.clone(), out_rx, click_rx, cx);
 
-        if state.read(cx).model.settings.info_window {
-            info::open(&state, cx);
+        // The main window (character, floating window, sounds). Closing
+        // it quits the app, so it also keeps Linux/Windows alive (they
+        // quit when the last window closes).
+        main_window::open(&state, cx);
+
+        if state.read(cx).model.settings.floating_window {
+            floating::open(&state, cx);
         }
 
         // `--open`: show the panel at launch (also the fallback without a tray).
@@ -190,9 +210,13 @@ fn watch_outside_clicks(state: Entity<AppState>, handle: gpui::WindowHandle<Pane
     cx.spawn(async move |cx: &mut AsyncApp| {
         let mut was_down = true;
         loop {
-            cx.background_executor().timer(Duration::from_millis(25)).await;
+            cx.background_executor()
+                .timer(Duration::from_millis(25))
+                .await;
             let Ok(Some(bounds)) = cx.update(|cx| {
-                (state.read(cx).popup == Some(handle)).then(|| handle.update(cx, |_, w, _| w.bounds()).ok()).flatten()
+                (state.read(cx).popup == Some(handle))
+                    .then(|| handle.update(cx, |_, w, _| w.bounds()).ok())
+                    .flatten()
             }) else {
                 break;
             };
@@ -218,12 +242,21 @@ fn watch_outside_clicks(state: Entity<AppState>, handle: gpui::WindowHandle<Pane
 fn placement(anchor: Option<Anchor>, cx: &App) -> Placement {
     let displays = cx.displays();
     let display = anchor
-        .and_then(|a| displays.iter().find(|d| d.bounds().contains(&a.origin)).cloned())
+        .and_then(|a| {
+            displays
+                .iter()
+                .find(|d| d.bounds().contains(&a.origin))
+                .cloned()
+        })
         .or_else(|| cx.primary_display());
     let width = px(PANEL_WIDTH);
     let margin = px(6.0);
     let Some(screen) = display.map(|d| d.bounds()) else {
-        return Placement { x: px(100.0), edge: Edge::Top(px(100.0)), max_height: px(600.0) };
+        return Placement {
+            x: px(100.0),
+            edge: Edge::Top(px(100.0)),
+            max_height: px(600.0),
+        };
     };
     let Some(a) = anchor else {
         let top = screen.top() + px(32.0);
@@ -237,36 +270,17 @@ fn placement(anchor: Option<Anchor>, cx: &App) -> Placement {
     let x = (center_x - width / 2.0).clamp(screen.left() + margin, screen.right() - width - margin);
     if a.origin.y < screen.top() + screen.size.height / 2.0 {
         let top = a.origin.y + a.size.height + margin;
-        Placement { x, edge: Edge::Top(top), max_height: screen.bottom() - top - margin }
+        Placement {
+            x,
+            edge: Edge::Top(top),
+            max_height: screen.bottom() - top - margin,
+        }
     } else {
         let bottom = a.origin.y - margin;
-        Placement { x, edge: Edge::Bottom(bottom), max_height: bottom - screen.top() - margin }
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn open_keepalive_window(cx: &mut App) {
-    struct Empty;
-    impl gpui::Render for Empty {
-        fn render(&mut self, _: &mut gpui::Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-            gpui::div()
+        Placement {
+            x,
+            edge: Edge::Bottom(bottom),
+            max_height: bottom - screen.top() - margin,
         }
     }
-    let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(gpui::Bounds { origin: point(px(-10000.0), px(-10000.0)), size: size(px(1.0), px(1.0)) })),
-        titlebar: None,
-        focus: false,
-        show: false,
-        kind: WindowKind::PopUp,
-        is_movable: false,
-        is_resizable: false,
-        is_minimizable: false,
-        window_background: WindowBackgroundAppearance::Transparent,
-        app_id: Some("bitcraft-tracker".into()),
-        ..Default::default()
-    };
-    if let Err(e) = cx.open_window(options, |_, cx| cx.new(|_| Empty)) {
-        eprintln!("keepalive window failed: {e}");
-    }
 }
-

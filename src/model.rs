@@ -168,7 +168,7 @@ impl Model {
 
     /// The resource being gathered: hit in the last 30s, online, and more
     /// recent than the last craft progress (whichever the player did last
-    /// is what the info window shows).
+    /// is what the floating window shows).
     pub fn active_gather(&self) -> Option<&Gather> {
         let gather = self.gather.as_ref().filter(|g| !self.is_offline && g.is_active(self.now) && g.bar(self.now).is_some())?;
         let craft_at = self.crafts.last_worked.as_ref().and_then(|c| c.worked_at);
