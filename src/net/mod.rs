@@ -1,6 +1,7 @@
 //! Networking on a background Tokio runtime. The UI sends [`Command`]s and
-//! receives [`Outgoing`] messages; per-character events carry the user id so
-//! stale ones (after switching character) can be dropped. Everything comes
+//! receives [`Outgoing`] messages; per-character events carry the user id
+//! (several characters are tracked at once; events for one that was
+//! removed are dropped). Everything comes
 //! from the relay (`relay.bitcraftsync.app`): websocket feeds per region
 //! (`relay.rs`) and its HTTP API (`api.rs`: player search, region list).
 
@@ -100,8 +101,10 @@ pub enum Outgoing {
 }
 
 pub enum Command {
-    /// Start tracking a character (stops the previous one).
+    /// Start tracking a character (no-op if already tracked).
     Track(String),
+    /// Stop tracking a character (closes its relay feeds).
+    Untrack(String),
     Search(String),
 }
 
@@ -132,12 +135,20 @@ pub fn start(out: async_channel::Sender<Outgoing>) -> mpsc::UnboundedSender<Comm
 
 async fn manager(mut commands: mpsc::UnboundedReceiver<Command>, out: async_channel::Sender<Outgoing>) {
     tokio::spawn(check_updates(out.clone()));
-    // Held so the tracked character's task runs until replaced.
-    let mut _current: Option<AbortOnDrop> = None;
+    // One task per tracked character; dropping it aborts it (and its
+    // relay feeds).
+    let mut tracked: HashMap<String, AbortOnDrop> = HashMap::new();
     while let Some(command) = commands.recv().await {
         match command {
-            // Replacing the old one aborts it (and its relay feeds).
-            Command::Track(user) => _current = Some(AbortOnDrop(tokio::spawn(track(user, out.clone())))),
+            Command::Track(user) => {
+                if !tracked.contains_key(&user) {
+                    let task = AbortOnDrop(tokio::spawn(track(user.clone(), out.clone())));
+                    tracked.insert(user, task);
+                }
+            }
+            Command::Untrack(user) => {
+                tracked.remove(&user);
+            }
             Command::Search(query) => {
                 let out = out.clone();
                 tokio::spawn(async move {

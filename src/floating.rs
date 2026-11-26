@@ -1,6 +1,7 @@
 //! Floating window: a small always-on-top overview (stamina, health, food,
-//! current activity/craft, crafts / passive crafts / plants), toggled from
-//! the main window. Movable by dragging; position and open state are saved.
+//! current activity/craft, crafts / passive crafts / plants), one per
+//! character, toggled from its card in the main window. Movable by
+//! dragging; position and open state are saved per character.
 
 use std::time::Duration;
 
@@ -20,36 +21,53 @@ const WIDTH: f32 = 260.0;
 const INITIAL_HEIGHT: f32 = 240.0;
 const MARGIN: f32 = 16.0;
 
-/// Open or close the floating window (remembered for the next launch).
-pub fn toggle(state: &Entity<AppState>, cx: &mut App) {
-    if let Some(handle) = state.read(cx).floating {
+/// Open or close a character's floating window (remembered for the next
+/// launch).
+pub fn toggle(state: &Entity<AppState>, user_id: &str, cx: &mut App) {
+    if let Some(handle) = state.read(cx).floating.get(user_id).copied() {
         let _ = handle.update(cx, |_, window, _| window.remove_window());
-        set_open(state, false, cx);
+        set_open(state, user_id, false, cx);
         return;
     }
-    open(state, cx);
+    open(state, user_id, cx);
 }
 
-fn set_open(state: &Entity<AppState>, open: bool, cx: &mut App) {
+/// Close a character's floating window without saving it as closed (the
+/// character is being removed).
+pub fn close(state: &Entity<AppState>, user_id: &str, cx: &mut App) {
+    if let Some(handle) = state.read(cx).floating.get(user_id).copied() {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+    }
+}
+
+fn set_open(state: &Entity<AppState>, user_id: &str, open: bool, cx: &mut App) {
     state.update(cx, |s, cx| {
         if !open {
-            s.floating = None;
-            s.floating_height = None;
+            s.floating.remove(user_id);
+            s.floating_height.remove(user_id);
         }
-        if s.model.settings.floating_window != open {
-            s.model.settings.floating_window = open;
-            s.model.settings.save();
+        if let Some(c) = s.settings.character_mut(user_id)
+            && c.floating_window != open
+        {
+            c.floating_window = open;
+            s.settings.save();
         }
         cx.notify();
     });
 }
 
-pub fn open(state: &Entity<AppState>, cx: &mut App) {
-    let origin = match state.read(cx).model.settings.floating_origin {
+pub fn open(state: &Entity<AppState>, user_id: &str, cx: &mut App) {
+    let (saved, index) = {
+        let s = state.read(cx);
+        let index = s.settings.characters.iter().position(|c| c.user_id == user_id).unwrap_or(0);
+        (s.settings.character(user_id).and_then(|c| c.floating_origin), index)
+    };
+    let origin = match saved {
         Some((x, y)) if on_some_display(point(px(x), px(y)), cx) => point(px(x), px(y)),
-        // Default: top-right corner of the main display, below the menu bar.
+        // Default: top-right corner of the main display, below the menu
+        // bar; one column further left per character so they don't stack.
         _ => match cx.primary_display().map(|d| d.bounds()) {
-            Some(screen) => point(screen.right() - px(WIDTH + MARGIN), screen.top() + px(40.0)),
+            Some(screen) => point(screen.right() - px((WIDTH + MARGIN) * (index as f32 + 1.0)), screen.top() + px(40.0)),
             None => point(px(100.0), px(100.0)),
         },
     };
@@ -70,13 +88,16 @@ pub fn open(state: &Entity<AppState>, cx: &mut App) {
         ..Default::default()
     };
     let st = state.clone();
+    let id = user_id.to_string();
     match cx.open_window(options, move |window, cx| {
         crate::platform::make_overlay(window);
-        cx.new(|cx| FloatingWindow::new(st, window, cx))
+        cx.new(|cx| FloatingWindow::new(st, id, window, cx))
     }) {
         Ok(handle) => {
-            state.update(cx, |s, _| s.floating = Some(handle));
-            set_open(state, true, cx);
+            state.update(cx, |s, _| {
+                s.floating.insert(user_id.to_string(), handle);
+            });
+            set_open(state, user_id, true, cx);
         }
         Err(e) => eprintln!("failed to open floating window: {e}"),
     }
@@ -90,12 +111,14 @@ fn on_some_display(p: gpui::Point<Pixels>, cx: &App) -> bool {
 
 pub struct FloatingWindow {
     state: Entity<AppState>,
+    /// The character it shows.
+    user_id: String,
     save_task: Option<Task<()>>,
     _subscriptions: Vec<Subscription>,
 }
 
 impl FloatingWindow {
-    fn new(state: Entity<AppState>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(state: Entity<AppState>, user_id: String, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscriptions = vec![
             cx.observe(&state, |_, _, cx| cx.notify()),
             // Remember where the user moved it (debounced: a drag sends
@@ -103,31 +126,37 @@ impl FloatingWindow {
             cx.observe_window_bounds(window, |this, window, cx| {
                 let origin = window.bounds().origin;
                 let origin = (f32::from(origin.x), f32::from(origin.y));
-                if this.state.read(cx).model.settings.floating_origin == Some(origin) {
+                let saved = this.state.read(cx).settings.character(&this.user_id).and_then(|c| c.floating_origin);
+                if saved == Some(origin) {
                     return;
                 }
                 let state = this.state.clone();
+                let user_id = this.user_id.clone();
                 this.save_task = Some(cx.spawn(async move |_, cx| {
                     cx.background_executor().timer(Duration::from_millis(500)).await;
                     let _ = state.update(cx, |s, _| {
-                        s.model.settings.floating_origin = Some(origin);
-                        s.model.settings.save();
+                        if let Some(c) = s.settings.character_mut(&user_id) {
+                            c.floating_origin = Some(origin);
+                            s.settings.save();
+                        }
                     });
                 }));
             }),
         ];
-        Self { state, save_task: None, _subscriptions: subscriptions }
+        Self { state, user_id, save_task: None, _subscriptions: subscriptions }
     }
 }
 
 /// Resize the window to the card's height, keeping its top-left corner.
-fn fit(state: &Entity<AppState>, height: Pixels, window: &mut Window, cx: &mut App) {
+fn fit(state: &Entity<AppState>, user_id: &str, height: Pixels, window: &mut Window, cx: &mut App) {
     let height = height.ceil();
-    let current = state.read(cx).floating_height.unwrap_or(window.bounds().size.height);
+    let current = state.read(cx).floating_height.get(user_id).copied().unwrap_or(window.bounds().size.height);
     if (height - current).abs() < px(1.0) {
         return;
     }
-    state.update(cx, |s, _| s.floating_height = Some(height));
+    state.update(cx, |s, _| {
+        s.floating_height.insert(user_id.to_string(), height);
+    });
     let frame = Bounds { origin: window.bounds().origin, size: size(px(WIDTH), height) };
     crate::platform::set_window_frame(window, frame, cx);
 }
@@ -137,11 +166,13 @@ impl Render for FloatingWindow {
         let mut theme = Theme::for_appearance(window.appearance());
         theme.bg.a = 0.94;
         let state = self.state.read(cx);
-        let m = &state.model;
-        let name = m.settings.username.clone().unwrap_or_else(|| "Character".into());
+        // Removed character: the window is closing.
+        let Some(m) = state.character(&self.user_id) else { return div().into_any_element() };
+        let name = m.name();
         let overall = if m.is_loading { HealthStatus::Warning } else { m.monitor.overall() };
 
         let close_state = self.state.clone();
+        let close_id = self.user_id.clone();
         let header = div()
             .flex()
             .items_center()
@@ -169,7 +200,7 @@ impl Render for FloatingWindow {
                     // next click opened a second window).
                     .on_click(move |_, window, cx| {
                         window.remove_window();
-                        set_open(&close_state, false, cx);
+                        set_open(&close_state, &close_id, false, cx);
                     }),
             );
 
@@ -187,13 +218,14 @@ impl Render for FloatingWindow {
         }
 
         let fit_state = self.state.clone();
+        let fit_id = self.user_id.clone();
         div()
             .size_full()
             .flex()
             .flex_col()
             .on_children_prepainted(move |bounds, window, cx| {
                 if let Some(card) = bounds.first() {
-                    fit(&fit_state, card.size.height, window, cx);
+                    fit(&fit_state, &fit_id, card.size.height, window, cx);
                 }
             })
             .child(
@@ -215,12 +247,13 @@ impl Render for FloatingWindow {
                     .on_mouse_down(MouseButton::Left, |_, window, _| crate::platform::start_window_drag(window))
                     .children(body),
             )
+            .into_any_element()
     }
 }
 
 /// What the character is doing: the worst issue (or the activity report)
 /// and the current craft with its progress.
-fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
+pub(crate) fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
     let reports = m.monitor.sorted_reports();
     let shown = reports
         .iter()
@@ -320,7 +353,7 @@ fn labeled_bar(fraction: f64, color: Rgba, text: String, text_color: Rgba, theme
         )
 }
 
-fn bars(m: &Model, theme: Theme) -> impl IntoElement {
+pub(crate) fn bars(m: &Model, theme: Theme) -> impl IntoElement {
     let row = move |label: &str, fraction: f64, color: Rgba, text: String, text_color: Rgba| {
         div()
             .flex()
@@ -371,7 +404,7 @@ fn bars(m: &Model, theme: Theme) -> impl IntoElement {
 /// One row each for plants, passive crafts and crafts: "type + tier"
 /// badges (red = needs action, orange = running, gray = idle, green =
 /// done), plus when the next one finishes.
-fn summaries(m: &Model, theme: Theme) -> impl IntoElement {
+pub(crate) fn summaries(m: &Model, theme: Theme) -> impl IntoElement {
     let now = m.now;
     // Label column on the left; with several tiers, the tier headings go
     // in that column under the label (user request: keeps the badges

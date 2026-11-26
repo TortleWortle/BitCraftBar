@@ -9,7 +9,8 @@
 ## What it is
 
 A tray / menu bar app (macOS, Windows, Linux) that shows, at a glance, the
-status of the user's character in the game **BitCraft**. Written in Rust with
+status of the user's characters in the game **BitCraft** (several can be
+tracked at once; see Multiple characters). Written in Rust with
 [GPUI](https://gpui.rs) (Zed's UI framework). **All game data comes from
 one place**, the community read-only SpacetimeDB relay
 [relay.bitcraftsync.app](https://relay.bitcraftsync.app): its websocket
@@ -30,6 +31,21 @@ was then removed. Behavior was kept identical; decisions below that mention
 
 ## What it shows
 
+**Multiple characters** (user request): every tracked character has its
+own `Model` (trackers, status reports, notifications, sounds) in
+`AppState::characters`, in the order of `settings.characters`. They're
+added with the main window's *Add character* search and removed with ✕ on
+their card. Where only one fits (user choice, "worst status, one popup"):
+the **tray** (icon + label) follows the character with the **worst
+status** (`ui::tray_index`; loading counts as warning, ties go to the
+first in the list), and the label starts with its name (`Bob: No food`)
+when more than one is tracked (one character: no name, saves menu bar
+space). The **popup** shows one character at a time with a **switcher**
+(a pill per character, status dot + name) above it; it opens on the tray
+character and resets to it when closed. Desktop notifications are
+titled `<name>: <event>` for every event. With no characters the tray
+says "No character" and the popup points to Settings.
+
 **Tray icon** (`src/tray.rs`, drawn with tiny-skia, 36px for HiDPI):
 
 1. **Status indicator**: a thin ring in the overall status color, around a
@@ -38,7 +54,7 @@ was then removed. Behavior was kept identical; decisions below that mention
    12 o'clock and fills **counter-clockwise** (user preference; clockwise
    "felt wrong").
 
-**Label text** (`Model::label_text`), e.g.
+**Label text** (`Model::label_text`, of the tray character), e.g.
 `Leatherworking 22% — T2 grown; T1 needs water · Resting`. On **macOS** it's
 shown next to the icon (`set_title`, plain text, one color). Windows/Linux
 trays can't show text, so it's the **tooltip** there.
@@ -71,8 +87,10 @@ game's own value; changes instantly). Unknown (relay has no
 `player_state` row yet) counts as online. BitJita's `signedIn` used to be
 a fallback; removed with the other fallbacks.
 
-**Popup panel** (`src/ui.rs`, `Panel`), opened by clicking the tray icon:
-header (status dot, connection state of the relay),
+**Popup panel** (`src/ui.rs`, `Panel`), opened by clicking the tray icon,
+for one character (see Multiple characters):
+header (status dot, character name, connection state of the relay), the
+character switcher (several characters only),
 per-source status reports, stats rows (stamina bar `current / max`,
 **colored by stamina** (`status::stamina_rgb`, user request): green above
 30%, blending to orange at 20% and to red at 5% and below; **food bar** right below it; **satiation bar**
@@ -80,9 +98,9 @@ per-source status reports, stats rows (stamina bar `current / max`,
 skill; last gain), plants, passive crafts,
 crafts (progress bar, percent, Paused/Done), an **Update available**
 row when GitHub has a newer release (see Releases), and a bottom row with
-the tracked character's name, *Settings* (brings up the main window and
-closes the popup) and Quit. The character picker, floating window toggle
-and sound settings used to be in the popup; they moved to the main window.
+*Settings* (brings up the main window and closes the popup) and Quit. The
+character picker, floating window toggle and sound settings used to be in
+the popup; they moved to the main window.
 
 - **Plants section**: a **growth tracker listing only tiers with plants
   currently growing** (count + time until the whole tier is grown, `~` when
@@ -155,10 +173,20 @@ and sound settings used to be in the popup; they moved to the main window.
 - Light/dark colors follow the window appearance (`Theme`).
 
 **Main window** (`src/main_window.rs`, user request: replaced the
-invisible keepalive window): a normal titled window (380×520, resizable,
-scrolls) with the **character** (name + *Change* search), the **floating
-window** checkbox, the **sound settings**, the *Update available* row and
-Quit. Opened at launch (centered, activates the app) on every platform.
+invisible keepalive window): a normal titled window (680×760, room for two
+cards side by side; resizable, scrolls) with "Characters" + *Add
+character* (search), a **grid of character cards**, the **sound
+settings**, the *Update available* row and Quit.
+**Character card** (300px, wraps; user request): the floating window's
+content (status line with current craft / gather target, stamina /
+health / food bars, plants / passive / crafts badge rows) plus **total
+XP** and **every craft's progress** (name, Paused/Done, percent, bar,
+"building · progress / total"; `ui::craft_rows`, shared with the popup).
+Header: status dot, name, **Mute** (no sounds for this character;
+notifications still show; saved as `muted`), **Floating** (opens/closes
+its floating window) and ✕ (stops tracking it; closes its floating
+window, sends `Command::Untrack`). Each card is a stateful element with
+its own id so badge / tooltip ids don't collide between cards. Opened at launch (centered, activates the app) on every platform.
 **Closing it quits the app** (user request; `on_window_should_close` →
 `cx.quit()`, which GPUI defers, so it's safe from that callback). Since
 it's open for the app's whole life, it also does the keepalive window's
@@ -175,12 +203,14 @@ Windows/Linux behavior is untested.
 
 **Floating window** (`src/floating.rs`, user request; was called the
 "info window", renamed by user request): a small (260px) always-on-top
-card, toggled from the main window, for keeping an eye on the character while
-playing. Top-right corner of the main display by default; **movable** by
+card **per character**, toggled from its card in the main window, for
+keeping an eye on the character while playing. Top-right corner of the
+main display by default, one window width further left per character
+(list position) so they don't stack; **movable** by
 dragging (anywhere on macOS/Linux, the header on Windows). Position and
-open state are saved in `settings.json` (`floating_origin`,
-`floating_window`; the old `info_origin` / `info_window` keys are still
-read) and restored at launch; a saved position on a display that's gone falls back to
+open state are saved per character in `settings.json`
+(`characters[].floating_origin` / `floating_window`) and restored at
+launch; a saved position on a display that's gone falls back to
 the default. Never takes focus. Content:
 
 - header: overall status dot, character name, ✕ (closes it);
@@ -298,8 +328,9 @@ Activity rows are checked top to bottom.
 
 Desktop notifications via `notify-rust` (`src/notifier.rs`; macOS
 Notification Center, Windows toasts, freedesktop on Linux), sent from a
-thread. Produced by `Model` (`collect_notifications`,
-`collect_alert_notifications`), never while loading. Sent for:
+thread. Produced by each character's `Model` (`collect_notifications`,
+`collect_alert_notifications`), never while that character is loading,
+titled `<name>: <event>` (`Model::notify`). Sent for:
 
 | Event | Rule |
 |---|---|
@@ -308,7 +339,7 @@ thread. Produced by `Model` (`collect_notifications`,
 | Craft finished | Once per craft, when its relay progress reaches the total. |
 | Passive craft finished | When a passive craft's computed end time passes (1s tick) or it's reported complete, once per craft. **Batched**: everything finishing in the same check is one notification. Crafts already finished in the first list are silent. |
 | Resource depleted | User request. The gather target (see Gathering section) dies: **health reaches 0**, or a **fishing spot's timer reaches 0** (`Gather::is_dead`, checked on every update and the 1s tick). Once per resource (`gather_dead_handled`), only while it's still worked on (hit in the last 30s), and **only with stamina above 20%** (`GATHER_ALERT_STAMINA`; below that the player rests anyway and the idle / regen alerts cover it, user request). The went-idle alert in the next 60s is skipped (same news). Sound: see Sounds. |
-| Trade request | User request. Another player starts a trade with the character: a new `trade_session_state` row with the character as acceptor and status `sessionOffered`. "Trade request — <name> wants to trade" (initiator's `player_username_state`, "A player" until known). Once per session; sessions already open in the first list (app start, character switch) are silent. Sound: see Sounds. **Unverified live** (no trade happened while building it; the query is accepted). |
+| Trade request | User request. Another player starts a trade with the character: a new `trade_session_state` row with the character as acceptor and status `sessionOffered`. "Trade request — <name> wants to trade" (initiator's `player_username_state`, "A player" until known). Once per session; sessions already open in the first list (app start, character added) are silent. Sound: see Sounds. **Unverified live** (no trade happened while building it; the query is accepted). |
 | Plants grown | Per tier, between two updates: growing count drops to 0 **and** grown count increased. Not on the first list. |
 
 Connection reports `healthy` when connected (instead of clearing) so a later
@@ -332,7 +363,9 @@ time it becomes true), and when the **gathered resource is depleted**
 (user request; with the "Resource depleted" notification, same rules),
 and when **another player starts a trade** (user request; with the
 "Trade request" notification).
-Each is a checkbox (all off by default), plus a
+Each is a checkbox (all off by default) and applies to every character;
+a character's **Mute** button (its card) silences just that one
+(`CharacterSettings::muted`, checked in `AppState::flush`). Plus a
 **volume slider** (20 segments of 5%, click or drag; default 50%) and a
 *Test* button. Stored in `settings.json` (`sounds`).
 
@@ -349,10 +382,12 @@ enabled ones.
 
 ```
 src/main.rs        GPUI app; tray click → popup placement; opens the main window
-src/ui.rs          AppState (model + tray + popup + search) and the Panel view
+src/ui.rs          AppState (characters + settings + tray + popup + search)
+                   and the Panel view (popup)
 src/main_window.rs Main window: character search, floating toggle, sounds
 src/floating.rs    Floating window (toggle, drag, saved position)
-src/model.rs       Routes network events into trackers; loading/offline;
+src/model.rs       One character: routes its network events into trackers;
+                   loading/offline;
                    status evaluation; notifications; label text
 src/platform.rs    Native bits GPUI lacks: tray DPI scale,
                    set window frame, global mouse state, no-activate /
@@ -376,15 +411,18 @@ src/net/           Background Tokio runtime ("network" thread):
 src/tray.rs        Tray icon rendering/updates
 src/notifier.rs    Desktop notifications
 src/sound.rs       Alert sounds (synthesized chimes, rodio)
-src/settings.rs    settings.json (tracked character, floating window, sounds)
+src/settings.rs    settings.json (characters + their floating window /
+                   mute, sounds; migrates the single-character format)
 ```
 
 **Data flow is one way**: the network thread sends `net::Outgoing` messages
 (per-character events tagged with the user id, search results) over an
-`async_channel`; a GPUI foreground task feeds them into `Model::handle`. The
-model produces `net::Command`s (track character, search) and notifications, which `AppState::flush` forwards, then updates the
-tray. A 1s tick (`Model::tick`) re-evaluates time-based rules. Events for a
-character that's no longer tracked are dropped.
+`async_channel`; a GPUI foreground task hands each event to its
+character's `Model::handle`. The models produce `net::Command`s (track
+character) and notifications / sounds, which `AppState::flush` forwards,
+then updates the tray; `AppState` itself sends `Search` and `Untrack`.
+A 1s tick (`Model::tick`, every character) re-evaluates time-based rules.
+Events for a character that's no longer tracked are dropped.
 
 ### Key design decisions
 
@@ -405,8 +443,8 @@ character that's no longer tracked are dropped.
   handling (the Swift app had both); the ping detects it within ~30s.
   (A BitJita-specific "stale feed" reconnect existed for its websocket,
   which could stop delivering on a healthy connection; gone with it.)
-- **Loading state** (`Model::is_loading`): at launch and after switching
-  character, until every relay region delivered its rows
+- **Loading state** (`Model::is_loading`, per character): at launch and
+  after adding a character, until every relay region delivered its rows
   (`NetEvent::RelayLoaded`), capped at 20s. Tray shows the
   orange ring + "Loading…", the panel "Loading <name>…" instead of the data
   sections, and no notifications fire. Typically 1–2s.
@@ -414,13 +452,21 @@ character that's no longer tracked are dropped.
   until the first answer), for the region list. The panel shows a
   "Passive crafts — Loading…" placeholder until the first relay list
   arrives.
-- **Character selection** is by username search in the main window: the
-  tracked character's name with a *Change* button that opens a search field
-  (typed via key events; GPUI has no text input widget), debounced 300ms,
-  results clickable, Enter picks the first, Escape cancels. `settings.json`
-  stores `user_id` (entity ID, what all queries use) and `username`
-  (display only; refreshed from the relay's `player_username_state`). Default `user_id` is the
-  original user's character.
+- **Adding characters** is by username search in the main window: *Add
+  character* opens a search field (typed via key events; GPUI has no text
+  input widget), debounced 300ms, results clickable (already tracked ones
+  bold; picking one again does nothing), Enter picks the first, Escape
+  cancels. `settings.json` stores per character `user_id` (entity ID,
+  what all queries use) and `username` (display only; refreshed from the
+  relay's `player_username_state` and saved by `AppState::flush`). A new
+  settings file starts with the original user's character; removing every
+  character leaves the list empty.
+- **Network per character**: `net::manager` runs one `track` task per
+  character (`Command::Track` / `Untrack`), each with its own relay hub,
+  i.e. **one websocket per mirrored region per character** (9 regions →
+  9 connections each; seen: 18 subscriptions for two characters). Simple
+  and isolated; sharing connections (queries filtering on several ids)
+  would cut that if the relay minds.
 - **Popup window**: a borderless `WindowKind::PopUp` window under the tray
   icon (above it when the tray is in the bottom half of the screen, e.g. the
   Windows taskbar). **It doesn't take focus** on macOS/Windows (user
@@ -752,8 +798,12 @@ connection. Replaced by the relay (user request).
   notifications to stderr; the only way to observe the app without a
   screen), `BITCRAFT_NO_NOTIFY=1` (suppress notifications). `cargo test` for
   the core rules and date parsing.
-- **Settings file** (tracked character, floating window state/position,
-  sounds; old `cached_stats` / `food_buff_descs` keys are ignored):
+- **Settings file**: `characters` (per character: `user_id`, `username`,
+  `muted`, `floating_window`, `floating_origin`) and `sounds`. The
+  single-character format (`user_id`, `username`, `floating_window` /
+  `info_window`, `floating_origin` / `info_origin` at the top level) is
+  migrated into one character on load (`Settings::parse`, tested); old
+  `cached_stats` / `food_buff_descs` keys are ignored.
   `<config dir>/bitcraft-tracker/settings.json` (macOS
   `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`).
 - **GPUI** 0.2.2 with `runtime_shaders`: Metal shaders compile at runtime,

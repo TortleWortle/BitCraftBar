@@ -1,6 +1,7 @@
 //! GPUI views: `AppState` (owns the model, tray and popup) and the popup
 //! `Panel` (port of the Swift `StatusPanelView` + `CharacterPicker`).
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use gpui::{
@@ -19,6 +20,7 @@ use crate::core::types::{Gather, PlayerSummary};
 use crate::model::Model;
 use crate::net::{Command, Outgoing, RelayState};
 use crate::notifier;
+use crate::settings::{CharacterSettings, Settings};
 use crate::sound::Sound;
 use crate::tray::Tray;
 
@@ -59,7 +61,9 @@ const SEARCH_DEBOUNCE: Duration = Duration::from_millis(300);
 pub(crate) const MAX_RESULTS_SHOWN: usize = 10;
 
 pub struct AppState {
-    pub model: Model,
+    /// One per tracked character, in `settings.characters` order.
+    pub characters: Vec<Model>,
+    pub settings: Settings,
     net: UnboundedSender<Command>,
     tray: Option<Tray>,
     pub popup: Option<WindowHandle<Panel>>,
@@ -69,13 +73,16 @@ pub struct AppState {
     /// Clicking the tray while the popup is open first deactivates (closes)
     /// it; don't reopen it from that same click.
     pub popup_closed_at: Option<Instant>,
-    /// The main window (`crate::main_window`): always exists once
-    /// opened at launch; closing it hides it.
+    /// Character picked in the popup's switcher (user id); None = the tray
+    /// character. Reset when the popup closes.
+    pub popup_character: Option<String>,
+    /// The main window (`crate::main_window`).
     pub main: Option<WindowHandle<crate::main_window::MainWindow>>,
-    /// The floating window (`crate::floating`).
-    pub floating: Option<WindowHandle<crate::floating::FloatingWindow>>,
-    pub floating_height: Option<Pixels>,
-    /// Character search open in the main window.
+    /// Open floating windows by user id (`crate::floating`).
+    pub floating: HashMap<String, WindowHandle<crate::floating::FloatingWindow>>,
+    /// Height each floating window was last sized to.
+    pub floating_height: HashMap<String, Pixels>,
+    /// "Add character" search open in the main window.
     pub picking: bool,
     pub query: String,
     pub results: Vec<PlayerSummary>,
@@ -87,19 +94,29 @@ pub struct AppState {
     last_debug_line: Option<String>,
 }
 
+/// The character the tray shows (user choice): the worst status, ties go
+/// to the first in the list. A loading character counts as a warning.
+pub fn tray_index(statuses: &[HealthStatus]) -> Option<usize> {
+    // `max_by_key` returns the last maximum; reverse so the first wins.
+    statuses.iter().enumerate().rev().max_by_key(|(_, s)| **s).map(|(i, _)| i)
+}
+
 impl AppState {
-    pub fn new(model: Model, net: UnboundedSender<Command>, tray: Option<Tray>) -> Self {
+    pub fn new(settings: Settings, net: UnboundedSender<Command>, tray: Option<Tray>) -> Self {
+        let characters = settings.characters.iter().map(|c| Model::new(c.user_id.clone(), c.username.clone())).collect();
         let mut state = Self {
-            model,
+            characters,
+            settings,
             net,
             tray,
             popup: None,
             popup_place: None,
             popup_height: None,
             popup_closed_at: None,
+            popup_character: None,
             main: None,
-            floating: None,
-            floating_height: None,
+            floating: HashMap::new(),
+            floating_height: HashMap::new(),
             picking: false,
             query: String::new(),
             results: Vec::new(),
@@ -113,9 +130,34 @@ impl AppState {
         state
     }
 
+    pub fn character(&self, user_id: &str) -> Option<&Model> {
+        self.characters.iter().find(|m| m.user_id == user_id)
+    }
+
+    /// Status for picking the tray character (loading = warning).
+    pub(crate) fn display_status(m: &Model) -> HealthStatus {
+        if m.is_loading { HealthStatus::Warning } else { m.monitor.overall() }
+    }
+
+    /// The character shown in the tray (worst status).
+    pub fn tray_character(&self) -> Option<&Model> {
+        let statuses: Vec<_> = self.characters.iter().map(Self::display_status).collect();
+        tray_index(&statuses).map(|i| &self.characters[i])
+    }
+
+    /// The character shown in the popup: picked in its switcher, else the
+    /// tray character.
+    pub fn popup_model(&self) -> Option<&Model> {
+        self.popup_character.as_deref().and_then(|id| self.character(id)).or_else(|| self.tray_character())
+    }
+
     pub fn handle_net(&mut self, message: Outgoing, cx: &mut Context<Self>) {
         match message {
-            Outgoing::Event { user, event } => self.model.handle(&user, event),
+            Outgoing::Event { user, event } => {
+                if let Some(m) = self.characters.iter_mut().find(|m| m.user_id == user) {
+                    m.handle(&user, event);
+                }
+            }
             Outgoing::SearchResults { query, result } => {
                 if query.trim() == self.query.trim() {
                     self.searching = false;
@@ -135,88 +177,71 @@ impl AppState {
     }
 
     pub fn tick(&mut self, cx: &mut Context<Self>) {
-        self.model.tick();
+        for m in &mut self.characters {
+            m.tick();
+        }
         self.flush();
         cx.notify();
     }
 
-    /// Forward model outputs: network commands, notifications, tray.
+    /// Forward model outputs: network commands, notifications, sounds
+    /// (unless the character is muted), tray; save usernames the relay
+    /// reported.
     fn flush(&mut self) {
-        for command in self.model.take_commands() {
-            let _ = self.net.send(command);
-        }
-        for n in self.model.take_notifications() {
-            notifier::notify(n.title, n.body);
-        }
-        let prefs = self.model.settings.sounds.clone();
-        for sound in self.model.take_sounds() {
-            let enabled = match sound {
-                Sound::CraftFinished => prefs.craft_finished,
-                Sound::OutOfFood => prefs.out_of_food,
-                Sound::IdleFull => prefs.idle_full,
-                Sound::ResourceDepleted => prefs.resource_depleted,
-                Sound::TradeRequest => prefs.trade_request,
-            };
-            if enabled {
-                crate::sound::play(sound, prefs.volume);
+        let prefs = self.settings.sounds.clone();
+        let mut names_changed = false;
+        for m in &mut self.characters {
+            for command in m.take_commands() {
+                let _ = self.net.send(command);
+            }
+            for n in m.take_notifications() {
+                notifier::notify(n.title, n.body);
+            }
+            let character = self.settings.characters.iter_mut().find(|c| c.user_id == m.user_id);
+            let muted = character.as_ref().is_some_and(|c| c.muted);
+            for sound in m.take_sounds() {
+                let enabled = match sound {
+                    Sound::CraftFinished => prefs.craft_finished,
+                    Sound::OutOfFood => prefs.out_of_food,
+                    Sound::IdleFull => prefs.idle_full,
+                    Sound::ResourceDepleted => prefs.resource_depleted,
+                    Sound::TradeRequest => prefs.trade_request,
+                };
+                if enabled && !muted {
+                    crate::sound::play(sound, prefs.volume);
+                }
+            }
+            if let Some(c) = character
+                && m.username.is_some()
+                && c.username != m.username
+            {
+                c.username = m.username.clone();
+                names_changed = true;
             }
         }
+        if names_changed {
+            self.settings.save();
+        }
+        let several = self.characters.len() > 1;
         if let Some(tray) = &mut self.tray {
-            let m = &self.model;
-            let (rgb, stamina) = if m.is_loading {
-                (HealthStatus::Warning.rgb(), Some(0.0))
-            } else {
-                (m.monitor.overall().rgb(), m.stamina.fraction())
-            };
-            tray.update(rgb, stamina, &m.label_text());
+            match self.characters.iter().map(Self::display_status).collect::<Vec<_>>().as_slice() {
+                [] => tray.update(HealthStatus::Warning.rgb(), Some(0.0), "No character"),
+                statuses => {
+                    let m = &self.characters[tray_index(statuses).unwrap_or(0)];
+                    let (rgb, stamina) = if m.is_loading {
+                        (HealthStatus::Warning.rgb(), Some(0.0))
+                    } else {
+                        (m.monitor.overall().rgb(), m.stamina.fraction())
+                    };
+                    // Name only with several characters (menu bar space).
+                    let label = if several { format!("{}: {}", m.name(), m.label_text()) } else { m.label_text() };
+                    tray.update(rgb, stamina, &label);
+                }
+            }
         }
         // BITCRAFT_DEBUG=1: log label changes (no tray/screenshot needed).
         if std::env::var_os("BITCRAFT_DEBUG").is_some() {
-            let m = &self.model;
-            let line = format!(
-                "[{:?}] {} | offline {} sat_max {} | stamina {:?}/{:?} | relay {:?} | plants {} | passive {} | crafts {} | food {}",
-                m.monitor.overall(),
-                m.label_text(),
-                m.is_offline,
-                m.satiation.max,
-                m.stamina.stamina,
-                m.stamina.max,
-                m.relay_state,
-                m.plants.tiers.iter().map(|t| t.total).sum::<usize>(),
-                m.passive.crafts.len(),
-                m.crafts.crafts.len(),
-                m.food.as_ref().map_or("?".to_string(), |f| format!(
-                    "{} regen_left={:?}",
-                    f.summary(m.now),
-                    f.regen_ends_at(m.now).map(|e| (e - m.now) as i64)
-                )),
-            );
-            let texts = |list: Vec<Badge>| {
-                list.iter()
-                    .map(|b| format!("{}:{:?} ({})", b.text(), b.state, b.tooltip(m.now)))
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            };
-            let gather = m.active_gather().map_or("-".to_string(), |g| {
-                format!(
-                    "{} skill {:?} {:?} {:?}/{:?}",
-                    g.name,
-                    g.skill,
-                    g.bar(m.now).map(|b| b.1),
-                    g.health,
-                    g.max_health
-                )
-            });
-            let line = format!(
-                "{line} | gather {gather} | badges plants [{}] passive [{}] crafts [{}]",
-                texts(badges::plants(&m.plants.plants)),
-                texts(badges::passive(&m.passive.crafts, m.now)),
-                texts(badges::crafts(
-                    &m.crafts.sorted(),
-                    m.now,
-                    m.crafts.active_window
-                )),
-            );
+            let line = self.characters.iter().map(debug_line).collect::<Vec<_>>().join("\n");
             if self.last_debug_line.as_deref() != Some(line.as_str()) {
                 eprintln!("{line}");
                 self.last_debug_line = Some(line);
@@ -229,6 +254,7 @@ impl AppState {
         self.popup = None;
         self.popup_height = None;
         self.popup_closed_at = Some(Instant::now());
+        self.popup_character = None;
     }
 
     pub fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
@@ -255,14 +281,85 @@ impl AppState {
         cx.notify();
     }
 
-    pub fn select(&mut self, player: PlayerSummary, cx: &mut Context<Self>) {
-        self.model.select_player(&player);
+    /// Search result picked: add the character (if not tracked yet).
+    pub fn add_character(&mut self, player: PlayerSummary, cx: &mut Context<Self>) {
         self.picking = false;
         self.query.clear();
         self.results.clear();
+        if self.character(&player.entity_id).is_none() {
+            self.settings.characters.push(CharacterSettings {
+                user_id: player.entity_id.clone(),
+                username: Some(player.username.clone()),
+                ..Default::default()
+            });
+            self.settings.save();
+            self.characters.push(Model::new(player.entity_id, Some(player.username)));
+            self.flush();
+        }
+        cx.notify();
+    }
+
+    /// Stop tracking a character (its floating window is closed by the
+    /// caller, `main_window`).
+    pub fn remove_character(&mut self, user_id: &str, cx: &mut Context<Self>) {
+        self.characters.retain(|m| m.user_id != user_id);
+        self.settings.characters.retain(|c| c.user_id != user_id);
+        self.settings.save();
+        self.floating.remove(user_id);
+        self.floating_height.remove(user_id);
+        if self.popup_character.as_deref() == Some(user_id) {
+            self.popup_character = None;
+        }
+        let _ = self.net.send(Command::Untrack(user_id.to_string()));
         self.flush();
         cx.notify();
     }
+
+    pub fn toggle_muted(&mut self, user_id: &str, cx: &mut Context<Self>) {
+        if let Some(c) = self.settings.character_mut(user_id) {
+            c.muted = !c.muted;
+            self.settings.save();
+        }
+        cx.notify();
+    }
+}
+
+/// `BITCRAFT_DEBUG=1` status line for one character.
+fn debug_line(m: &Model) -> String {
+    let line = format!(
+        "{} [{:?}] {} | offline {} sat_max {} | stamina {:?}/{:?} | relay {:?} | plants {} | passive {} | crafts {} | food {}",
+        m.name(),
+        m.monitor.overall(),
+        m.label_text(),
+        m.is_offline,
+        m.satiation.max,
+        m.stamina.stamina,
+        m.stamina.max,
+        m.relay_state,
+        m.plants.tiers.iter().map(|t| t.total).sum::<usize>(),
+        m.passive.crafts.len(),
+        m.crafts.crafts.len(),
+        m.food.as_ref().map_or("?".to_string(), |f| format!(
+            "{} regen_left={:?}",
+            f.summary(m.now),
+            f.regen_ends_at(m.now).map(|e| (e - m.now) as i64)
+        )),
+    );
+    let texts = |list: Vec<Badge>| {
+        list.iter()
+            .map(|b| format!("{}:{:?} ({})", b.text(), b.state, b.tooltip(m.now)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let gather = m.active_gather().map_or("-".to_string(), |g| {
+        format!("{} skill {:?} {:?} {:?}/{:?}", g.name, g.skill, g.bar(m.now).map(|b| b.1), g.health, g.max_health)
+    });
+    format!(
+        "{line} | gather {gather} | badges plants [{}] passive [{}] crafts [{}]",
+        texts(badges::plants(&m.plants.plants)),
+        texts(badges::passive(&m.passive.crafts, m.now)),
+        texts(badges::crafts(&m.crafts.sorted(), m.now, m.crafts.active_window)),
+    )
 }
 
 // MARK: - Panel
@@ -523,90 +620,93 @@ impl Render for Panel {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let state = self.state.read(cx);
-        let m = &state.model;
-
-        let header_color = if m.is_loading {
-            status_color(HealthStatus::Warning)
-        } else {
-            status_color(m.monitor.overall())
-        };
-        let live = match m.relay_state {
-            RelayState::Live => "Connected",
-            RelayState::Off | RelayState::Connecting => "Connecting…",
-            RelayState::Disconnected => "Disconnected",
-            RelayState::Unavailable(_) => "Relay unavailable",
-        };
+        let selected = state.popup_model();
 
         let mut body: Vec<AnyElement> = Vec::new();
+        let (header_color, live, title) = match selected {
+            Some(m) => (
+                status_color(AppState::display_status(m)),
+                match m.relay_state {
+                    RelayState::Live => "Connected",
+                    RelayState::Off | RelayState::Connecting => "Connecting…",
+                    RelayState::Disconnected => "Disconnected",
+                    RelayState::Unavailable(_) => "Relay unavailable",
+                },
+                m.name(),
+            ),
+            None => (status_color(HealthStatus::Warning), "", "BitCraft Tracker".to_string()),
+        };
         body.push(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
                 .child(dot(header_color, 12.0))
-                .child(
-                    div()
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_size(px(14.0))
-                        .child("BitCraft Tracker"),
-                )
+                .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(14.0)).child(title))
                 .child(div().flex_1())
                 .child(div().text_xs().text_color(theme.secondary).child(live))
                 .into_any_element(),
         );
+        // Several characters: pick which one the popup shows (user choice:
+        // one at a time; starts on the tray's, the worst status).
+        if state.characters.len() > 1 {
+            let current = selected.map(|m| m.user_id.clone());
+            body.push(self.switcher(state, current.as_deref(), theme).into_any_element());
+        }
 
-        if m.is_loading {
-            let name = m
-                .settings
-                .username
-                .clone()
-                .unwrap_or_else(|| "character".into());
-            body.push(
+        match selected {
+            None => body.push(
                 div()
                     .h(px(60.0))
                     .flex()
                     .items_center()
                     .justify_center()
                     .text_color(theme.secondary)
-                    .child(format!("Loading {name}…"))
+                    .child("No characters. Add one in Settings.")
                     .into_any_element(),
-            );
-        } else {
-            body.push(self.reports(m, theme).into_any_element());
-            body.push(divider(theme).into_any_element());
-            body.push(self.stats(m, theme).into_any_element());
-            if !m.plants.tiers.is_empty() {
+            ),
+            Some(m) if m.is_loading => body.push(
+                div()
+                    .h(px(60.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.secondary)
+                    .child(format!("Loading {}…", m.name()))
+                    .into_any_element(),
+            ),
+            Some(m) => {
+                body.push(self.reports(m, theme).into_any_element());
                 body.push(divider(theme).into_any_element());
-                body.push(self.plants(m, theme).into_any_element());
-            }
-            if !m.passive.has_loaded {
-                body.push(divider(theme).into_any_element());
-                body.push(
-                    div()
-                        .flex()
-                        .items_center()
-                        .child(section_title("Passive crafts"))
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.secondary)
-                                .child("Loading…"),
-                        )
-                        .into_any_element(),
-                );
-            } else if !m.passive.crafts.is_empty() {
-                body.push(divider(theme).into_any_element());
-                body.push(self.passive(m, theme).into_any_element());
-            }
-            if let Some(gather) = m.active_gather() {
-                body.push(divider(theme).into_any_element());
-                body.push(self.gathering(gather, m.now, theme).into_any_element());
-            }
-            let crafts = m.crafts.sorted();
-            if !crafts.is_empty() {
-                body.push(divider(theme).into_any_element());
-                body.push(self.crafts(&crafts, m, theme).into_any_element());
+                body.push(self.stats(m, theme).into_any_element());
+                if !m.plants.tiers.is_empty() {
+                    body.push(divider(theme).into_any_element());
+                    body.push(self.plants(m, theme).into_any_element());
+                }
+                if !m.passive.has_loaded {
+                    body.push(divider(theme).into_any_element());
+                    body.push(
+                        div()
+                            .flex()
+                            .items_center()
+                            .child(section_title("Passive crafts"))
+                            .child(div().flex_1())
+                            .child(div().text_xs().text_color(theme.secondary).child("Loading…"))
+                            .into_any_element(),
+                    );
+                } else if !m.passive.crafts.is_empty() {
+                    body.push(divider(theme).into_any_element());
+                    body.push(self.passive(m, theme).into_any_element());
+                }
+                if let Some(gather) = m.active_gather() {
+                    body.push(divider(theme).into_any_element());
+                    body.push(self.gathering(gather, m.now, theme).into_any_element());
+                }
+                let crafts = m.crafts.sorted();
+                if !crafts.is_empty() {
+                    body.push(divider(theme).into_any_element());
+                    body.push(self.crafts(&crafts, m, theme).into_any_element());
+                }
             }
         }
 
@@ -615,22 +715,13 @@ impl Render for Panel {
             body.push(update_row(release, theme).into_any_element());
         }
         body.push(divider(theme).into_any_element());
-        let name = m.settings.username.clone().unwrap_or_else(|| "Unknown".into());
         body.push(
             div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .text_color(theme.secondary)
-                        .child(name),
-                )
-                // Character, floating window and sounds live in the main
+                .child(div().flex_1())
+                // Characters, floating windows and sounds live in the main
                 // window; this brings it up.
                 .child({
                     let st = self.state.clone();
@@ -746,6 +837,36 @@ pub(crate) fn update_row(release: &crate::net::api::Release, theme: Theme) -> im
 }
 
 impl Panel {
+    /// One pill per character (status dot + name); click to show it.
+    fn switcher(&self, state: &AppState, current: Option<&str>, theme: Theme) -> impl IntoElement {
+        div().flex().flex_wrap().gap_1().children(state.characters.iter().enumerate().map(|(i, m)| {
+            let selected = current == Some(m.user_id.as_str());
+            let st = self.state.clone();
+            let id = m.user_id.clone();
+            div()
+                .id(("switch", i))
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .px_2()
+                .py_0p5()
+                .rounded_md()
+                .border_1()
+                .border_color(if selected { theme.text } else { theme.border })
+                .when(selected, |d| d.bg(theme.hover).font_weight(FontWeight::MEDIUM))
+                .cursor_pointer()
+                .hover(move |s| s.bg(theme.hover))
+                .child(dot(status_color(AppState::display_status(m)), 7.0))
+                .child(m.name())
+                .on_click(move |_, _, cx: &mut App| {
+                    st.update(cx, |s, cx| {
+                        s.popup_character = Some(id.clone());
+                        cx.notify();
+                    })
+                })
+        }))
+    }
+
     fn reports(&self, m: &Model, theme: Theme) -> impl IntoElement {
         div()
             .flex()
@@ -1078,36 +1199,49 @@ impl Panel {
                 now,
                 theme,
             ))
-            .children(crafts.iter().cloned().map(move |c| {
-                let status = if c.is_complete() {
-                    Some("Done")
-                } else if c.last_progress_at.is_none_or(|t| now - t > window) {
-                    Some("Paused")
-                } else {
-                    None
-                };
+            .child(craft_rows(crafts, now, window, theme))
+    }
+}
+
+/// Each craft: name, Paused/Done, percent, bar, "building · progress /
+/// total" (popup Crafts section, main window cards).
+pub(crate) fn craft_rows(crafts: &[Craft], now: f64, window: f64, theme: Theme) -> impl IntoElement {
+    div().flex().flex_col().gap_2().children(crafts.iter().cloned().map(move |c| {
+        let status = if c.is_complete() {
+            Some("Done")
+        } else if c.last_progress_at.is_none_or(|t| now - t > window) {
+            Some("Paused")
+        } else {
+            None
+        };
+        div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .child(
                 div()
                     .flex()
-                    .flex_col()
-                    .gap_0p5()
+                    .gap_2()
                     .child(
                         div()
-                            .flex()
-                            .gap_2()
-                            .child(div().font_weight(FontWeight::MEDIUM).child(c.name.clone()))
-                            .child(div().flex_1())
-                            .children(status.map(|s| div().text_color(theme.secondary).child(s)))
-                            .child(c.percent_string()),
+                            .flex_1()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(c.name.clone()),
                     )
-                    .child(div().flex().child(bar(c.fraction(), rgb(0x0a84ff), theme)))
-                    .child(div().text_xs().text_color(theme.secondary).child(format!(
-                        "{} · {} / {}",
-                        c.building.clone().unwrap_or_default(),
-                        group_thousands(c.progress),
-                        group_thousands(c.total)
-                    )))
-            }))
-    }
+                    .children(status.map(|s| div().flex_none().text_color(theme.secondary).child(s)))
+                    .child(div().flex_none().child(c.percent_string())),
+            )
+            .child(div().flex().child(bar(c.fraction(), rgb(0x0a84ff), theme)))
+            .child(div().text_xs().text_color(theme.secondary).child(format!(
+                "{} · {} / {}",
+                c.building.clone().unwrap_or_default(),
+                group_thousands(c.progress),
+                group_thousands(c.total)
+            )))
+    }))
 }
 
 pub(crate) fn group_thousands(n: i64) -> String {
@@ -1125,6 +1259,15 @@ pub(crate) fn group_thousands(n: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_shows_worst_character_first_on_ties() {
+        use HealthStatus::*;
+        assert_eq!(tray_index(&[]), None);
+        assert_eq!(tray_index(&[Healthy, Alert, Warning]), Some(1));
+        assert_eq!(tray_index(&[Warning, Healthy, Warning]), Some(0));
+        assert_eq!(tray_index(&[Healthy, Healthy]), Some(0));
+    }
 
     #[test]
     fn coarse_durations() {

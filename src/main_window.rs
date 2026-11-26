@@ -1,5 +1,7 @@
-//! Main window: the character, the floating window toggle and the sound
-//! settings (user request: replaced the invisible keepalive window).
+//! Main window: a grid of every tracked character (user request: the
+//! floating window's content plus the full crafts list and total XP, with
+//! mute / floating window buttons), "Add character" search and the sound
+//! settings. Replaced the invisible keepalive window.
 //! Opened at launch; closing it quits the app (user request). The popup's
 //! Settings button brings it to the front.
 
@@ -10,12 +12,17 @@ use gpui::{
 
 use crate::core::status::HealthStatus;
 use crate::sound::Sound;
-use crate::net::RelayState;
 use crate::settings::SoundSettings;
-use crate::ui::{AppState, MAX_RESULTS_SHOWN, Theme, button, divider, dot, section_title, status_color, update_row};
+use crate::model::Model;
+use crate::ui::{
+    AppState, MAX_RESULTS_SHOWN, Theme, button, craft_rows, divider, dot, group_thousands, section_title, status_color,
+    update_row,
+};
 
-const WIDTH: f32 = 380.0;
-const HEIGHT: f32 = 520.0;
+/// Room for two cards side by side.
+const WIDTH: f32 = 680.0;
+const HEIGHT: f32 = 760.0;
+const CARD_WIDTH: f32 = 300.0;
 
 /// Bring the main window to the front (or open it if it failed to open
 /// at launch). GPUI's `activate_window` defers the native call (and
@@ -42,7 +49,7 @@ pub fn open(state: &Entity<AppState>, cx: &mut App) {
         is_movable: true,
         is_resizable: true,
         is_minimizable: true,
-        window_min_size: Some(size(px(320.0), px(240.0))),
+        window_min_size: Some(size(px(CARD_WIDTH + 40.0), px(300.0))),
         app_id: Some("bitcraft-tracker".into()),
         ..Default::default()
     };
@@ -102,7 +109,7 @@ impl MainWindow {
             }
             "enter" => {
                 if let Some(first) = state.read(cx).results.first().cloned() {
-                    state.update(cx, |s, cx| s.select(first, cx));
+                    state.update(cx, |s, cx| s.add_character(first, cx));
                 }
                 return;
             }
@@ -114,31 +121,90 @@ impl MainWindow {
         state.update(cx, |s, cx| s.set_query(query, cx));
     }
 
-    /// Floating window toggle (open state is saved).
-    fn floating(&self, open: bool, theme: Theme) -> impl IntoElement {
-        let st = self.state.clone();
+    /// One character: the floating window's content (status line, bars,
+    /// plants / passive / crafts badges) plus total XP and every craft's
+    /// progress. Header buttons: mute sounds, floating window, remove.
+    fn card(&self, i: usize, m: &Model, muted: bool, floating: bool, theme: Theme) -> impl IntoElement {
+        let overall = AppState::display_status(m);
+        let (st_mute, st_float, st_remove) = (self.state.clone(), self.state.clone(), self.state.clone());
+        let (id_mute, id_float, id_remove) = (m.user_id.clone(), m.user_id.clone(), m.user_id.clone());
+        let header = div()
+            .flex()
+            .items_center()
+            .gap_1p5()
+            .child(dot(status_color(overall), 9.0))
+            .child(
+                div()
+                    .flex_1()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(m.name()),
+            )
+            .child(toggle_button(("mute", i), if muted { "Muted" } else { "Mute" }, muted, theme).on_click(
+                move |_, _, cx: &mut App| st_mute.update(cx, |s, cx| s.toggle_muted(&id_mute, cx)),
+            ))
+            .child(toggle_button(("float", i), "Floating", floating, theme).on_click(
+                move |_, _, cx: &mut App| crate::floating::toggle(&st_float, &id_float, cx),
+            ))
+            .child(
+                div()
+                    .id(("remove", i))
+                    .px_1()
+                    .rounded_sm()
+                    .cursor_pointer()
+                    .text_color(theme.secondary)
+                    .hover(move |s| s.bg(theme.hover))
+                    .child("✕")
+                    .tooltip(move |_, cx| {
+                        cx.new(|_| crate::ui::Tooltip { text: "Stop tracking this character".into(), theme }).into()
+                    })
+                    .on_click(move |_, _, cx: &mut App| {
+                        crate::floating::close(&st_remove, &id_remove, cx);
+                        st_remove.update(cx, |s, cx| s.remove_character(&id_remove, cx));
+                    }),
+            );
+
+        let mut body: Vec<gpui::AnyElement> = vec![header.into_any_element()];
+        if m.is_loading {
+            body.push(div().text_color(theme.secondary).child("Loading…").into_any_element());
+        } else {
+            body.push(crate::floating::status_line(m, theme).into_any_element());
+            if !m.is_offline {
+                body.push(crate::floating::bars(m, theme).into_any_element());
+            }
+            body.push(
+                div()
+                    .flex()
+                    .gap_2()
+                    .child(div().w(px(50.0)).flex_none().text_color(theme.secondary).child("Total XP"))
+                    .child(m.experience.total.map_or("–".into(), group_thousands))
+                    .into_any_element(),
+            );
+            body.push(divider(theme).into_any_element());
+            body.push(crate::floating::summaries(m, theme).into_any_element());
+            let crafts = m.crafts.sorted();
+            if !crafts.is_empty() {
+                body.push(divider(theme).into_any_element());
+                body.push(craft_rows(&crafts, m.now, m.crafts.active_window, theme).into_any_element());
+            }
+        }
+        // Stateful per card: keeps element ids (badges, tooltips) unique
+        // between cards.
         div()
+            .id(("card", i))
+            .w(px(CARD_WIDTH))
+            .flex_none()
             .flex()
             .flex_col()
-            .gap_1p5()
-            .child(section_title("Floating window"))
-            .child(
-                div()
-                    .id("floating")
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .cursor_pointer()
-                    .child(checkbox(open, theme))
-                    .child("Show floating window")
-                    .on_click(move |_, _, cx: &mut App| crate::floating::toggle(&st, cx)),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.secondary)
-                    .child("Always-on-top overview; drag it anywhere."),
-            )
+            .gap_2()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(theme.border)
+            .text_size(px(12.0))
+            .children(body)
     }
 
     /// Sound settings: which events play a sound, volume slider, test.
@@ -157,8 +223,8 @@ impl MainWindow {
                     .child(label.to_string())
                     .on_click(move |_, _, cx: &mut App| {
                         state.update(cx, |s, cx| {
-                            set(&mut s.model.settings.sounds, !on);
-                            s.model.settings.save();
+                            set(&mut s.settings.sounds, !on);
+                            s.settings.save();
                             cx.notify();
                         })
                     })
@@ -177,9 +243,9 @@ impl MainWindow {
                 let (down, moved) = (state.clone(), state.clone());
                 let set = move |state: &Entity<AppState>, cx: &mut App| {
                     state.update(cx, |s, cx| {
-                        if (s.model.settings.sounds.volume - set_to).abs() > f32::EPSILON {
-                            s.model.settings.sounds.volume = set_to;
-                            s.model.settings.save();
+                        if (s.settings.sounds.volume - set_to).abs() > f32::EPSILON {
+                            s.settings.sounds.volume = set_to;
+                            s.settings.save();
                             cx.notify();
                         }
                     })
@@ -272,32 +338,25 @@ impl MainWindow {
             )
     }
 
+    /// "Characters" title with an *Add character* button; while adding,
+    /// the username search (typed via key events, see `on_key`).
     fn picker(&self, state: &AppState, theme: Theme, cx: &Context<Self>) -> impl IntoElement {
-        let name = state
-            .model
-            .settings
-            .username
-            .clone()
-            .unwrap_or_else(|| "Unknown".into());
         if !state.picking {
             return div()
                 .flex()
                 .items_center()
                 .gap_2()
-                .child(div().text_color(theme.secondary).child("Character"))
-                .child(div().font_weight(FontWeight::MEDIUM).child(name))
+                .child(section_title("Characters"))
                 .child(div().flex_1())
-                .child(button("change", "Change", theme).on_click(cx.listener(
-                    |this, _, window, cx| {
-                        this.focus.focus(window);
-                        this.state.update(cx, |s, cx| {
-                            s.picking = true;
-                            s.query.clear();
-                            s.results.clear();
-                            cx.notify();
-                        });
-                    },
-                )))
+                .child(button("add", "Add character", theme).on_click(cx.listener(|this, _, window, cx| {
+                    this.focus.focus(window);
+                    this.state.update(cx, |s, cx| {
+                        s.picking = true;
+                        s.query.clear();
+                        s.results.clear();
+                        cx.notify();
+                    });
+                })))
                 .into_any_element();
         }
 
@@ -322,7 +381,6 @@ impl MainWindow {
         } else {
             None
         };
-        let current = state.model.settings.user_id.clone();
         div()
             .flex()
             .flex_col()
@@ -371,7 +429,8 @@ impl MainWindow {
                             .cloned()
                             .enumerate()
                             .map(|(i, player)| {
-                                let selected = player.entity_id == current;
+                                // Already tracked: bold (picking it does nothing).
+                                let selected = state.character(&player.entity_id).is_some();
                                 let label = format!(
                                     "{}{}",
                                     player.username,
@@ -394,7 +453,7 @@ impl MainWindow {
                                     .child(label)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         let player = player.clone();
-                                        this.state.update(cx, |s, cx| s.select(player, cx));
+                                        this.state.update(cx, |s, cx| s.add_character(player, cx));
                                     }))
                             }),
                     ),
@@ -407,33 +466,28 @@ impl Render for MainWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::for_appearance(window.appearance());
         let state = self.state.read(cx);
-        let m = &state.model;
-        let header_color =
-            if m.is_loading { status_color(HealthStatus::Warning) } else { status_color(m.monitor.overall()) };
-        let live = match m.relay_state {
-            RelayState::Live => "Connected",
-            RelayState::Off | RelayState::Connecting => "Connecting…",
-            RelayState::Disconnected => "Disconnected",
-            RelayState::Unavailable(_) => "Relay unavailable",
-        };
-
+        let cards: Vec<gpui::AnyElement> = state
+            .characters
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let muted = state.settings.character(&m.user_id).is_some_and(|c| c.muted);
+                let floating = state.floating.contains_key(&m.user_id);
+                self.card(i, m, muted, floating, theme).into_any_element()
+            })
+            .collect();
+        let empty = cards.is_empty();
         let mut body: Vec<gpui::AnyElement> = vec![
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(dot(header_color, 12.0))
-                .child(div().font_weight(FontWeight::SEMIBOLD).text_size(px(14.0)).child("BitCraft Tracker"))
-                .child(div().flex_1())
-                .child(div().text_xs().text_color(theme.secondary).child(live))
-                .into_any_element(),
-            divider(theme).into_any_element(),
             self.picker(state, theme, cx).into_any_element(),
-            divider(theme).into_any_element(),
-            self.floating(state.floating.is_some(), theme).into_any_element(),
-            divider(theme).into_any_element(),
-            self.sounds(&m.settings.sounds, theme).into_any_element(),
+            div().flex().flex_wrap().gap_3().children(cards).into_any_element(),
         ];
+        if empty {
+            body.push(
+                div().text_color(theme.secondary).child("No characters yet. Add one to start tracking.").into_any_element(),
+            );
+        }
+        body.push(divider(theme).into_any_element());
+        body.push(self.sounds(&state.settings.sounds, theme).into_any_element());
         if let Some(release) = &state.update {
             body.push(divider(theme).into_any_element());
             body.push(update_row(release, theme).into_any_element());
@@ -476,4 +530,19 @@ fn checkbox(on: bool, theme: Theme) -> impl IntoElement {
         .text_size(px(10.0))
         .text_color(rgb(0xffffff))
         .child(if on { "✓" } else { "" })
+}
+
+/// A small header button that shows an on/off state (mute, floating).
+fn toggle_button(id: (&'static str, usize), label: &'static str, on: bool, theme: Theme) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .px_1p5()
+        .rounded_md()
+        .border_1()
+        .border_color(if on { theme.text } else { theme.border })
+        .text_xs()
+        .when(on, |d| d.bg(theme.hover).font_weight(FontWeight::MEDIUM))
+        .cursor_pointer()
+        .hover(move |s| s.bg(theme.hover))
+        .child(label)
 }

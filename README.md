@@ -13,7 +13,7 @@ cargo run --release -- --open  # also open the panel at launch
 BITCRAFT_DEBUG=1 cargo run     # log status/label changes to stderr
 ```
 
-Settings (tracked character) are stored in
+Settings (tracked characters, sounds) are stored in
 `<config dir>/bitcraft-tracker/settings.json`
 (macOS `~/Library/Application Support`, Linux `~/.config`, Windows `%APPDATA%`).
 

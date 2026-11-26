@@ -1,6 +1,7 @@
-//! Wires network events into the trackers and status rules (port of the
-//! Swift `AppModel`). No GPUI here: `main.rs` drives it and drains its
-//! outputs (commands for the network, notifications).
+//! One tracked character: wires its network events into the trackers and
+//! status rules (port of the Swift `AppModel`). No GPUI here: `AppState`
+//! keeps one per character, drives them and drains their outputs (commands
+//! for the network, notifications, sounds).
 
 use std::collections::HashMap;
 
@@ -9,10 +10,9 @@ use crate::core::trackers::{
     ActivityCheck, Craft, CraftTracker, ExperienceTracker, PassiveCraftTracker, PlantTracker, SatiationTracker,
     StaminaTracker,
 };
-use crate::core::types::{FoodBuffDesc, FoodState, Gather, PlayerSummary, Position, RawBuff, now};
+use crate::core::types::{FoodBuffDesc, FoodState, Gather, Position, RawBuff, now};
 use crate::sound::Sound;
 use crate::net::{Command, NetEvent, RelayPlayer, RelayState};
-use crate::settings::Settings;
 
 pub const LOADING_TIMEOUT: f64 = 20.0;
 pub const ALERT_COOLDOWN: f64 = 5.0 * 60.0;
@@ -39,7 +39,10 @@ pub struct Notification {
 }
 
 pub struct Model {
-    pub settings: Settings,
+    /// Entity id (what the relay queries use).
+    pub user_id: String,
+    /// Display name; from the settings, then the relay.
+    pub username: Option<String>,
     pub monitor: StatusMonitor,
     pub experience: ExperienceTracker,
     pub stamina: StaminaTracker,
@@ -89,10 +92,11 @@ pub struct Model {
 }
 
 impl Model {
-    pub fn new(settings: Settings) -> Self {
+    pub fn new(user_id: String, username: Option<String>) -> Self {
         let now = now();
         let mut model = Self {
-            settings,
+            user_id,
+            username,
             monitor: StatusMonitor::default(),
             experience: ExperienceTracker::default(),
             stamina: StaminaTracker::default(),
@@ -126,7 +130,7 @@ impl Model {
             commands: Vec::new(),
             notifications: Vec::new(),
         };
-        model.commands.push(Command::Track(model.settings.user_id.clone()));
+        model.commands.push(Command::Track(model.user_id.clone()));
         model.evaluate();
         model
     }
@@ -175,44 +179,20 @@ impl Model {
         craft_at.is_none_or(|t| gather.last_hit_at >= t).then_some(gather)
     }
 
-    /// Switch to another character (from the search).
-    pub fn select_player(&mut self, player: &PlayerSummary) {
-        self.settings.username = Some(player.username.clone());
-        if player.entity_id != self.settings.user_id {
-            self.settings.user_id = player.entity_id.clone();
-            self.experience = ExperienceTracker::default();
-            self.stamina = StaminaTracker::default();
-            self.satiation = SatiationTracker::default();
-            self.crafts = CraftTracker::default();
-            self.plants = PlantTracker::default();
-            self.passive = PassiveCraftTracker::default();
-            self.food = None;
-            self.buffs = None;
-            self.gather = None;
-            self.gather_dead_handled = None;
-            self.gather_alert_at = None;
-            self.seen_trades = None;
-            self.health = None;
-            self.max_health = None;
-            self.position = None;
-            self.moved_at = None;
-            self.idle_after_moving = false;
-            self.monitor = StatusMonitor::default();
-            self.relay_state = RelayState::Off;
-            self.relay_player = None;
-            self.is_offline = false;
-            self.is_loading = true;
-            self.loading_started_at = now();
-            self.relay_loaded = false;
-            self.commands.push(Command::Track(self.settings.user_id.clone()));
-        }
-        self.settings.save();
-        self.evaluate();
+    /// Display name, or the entity id until it's known.
+    pub fn name(&self) -> String {
+        self.username.clone().unwrap_or_else(|| format!("Character {}", self.user_id))
     }
 
-    /// Events for another character (before a switch) are dropped.
+    /// Notification titled "<name>: <title>" (several characters).
+    fn notify(&mut self, title: &str, body: String) {
+        let title = format!("{}: {title}", self.name());
+        self.notifications.push(Notification { title, body });
+    }
+
+    /// Events for another character are ignored.
     pub fn handle(&mut self, user: &str, event: NetEvent) {
-        if user != self.settings.user_id {
+        if user != self.user_id {
             return;
         }
         let now = now();
@@ -242,11 +222,9 @@ impl Model {
                 if let Some(position) = player.as_ref().and_then(|p| p.position) {
                     self.update_position(position, now);
                 }
-                if let Some(name) = player.as_ref().and_then(|p| p.username.clone())
-                    && self.settings.username.as_ref() != Some(&name)
-                {
-                    self.settings.username = Some(name);
-                    self.settings.save();
+                // Saved to the settings by `AppState`.
+                if let Some(name) = player.as_ref().and_then(|p| p.username.clone()) {
+                    self.username = Some(name);
                 }
                 self.relay_player = player;
             }
@@ -404,14 +382,13 @@ impl Model {
             if turned_red && report.source == FOOD_SOURCE {
                 self.sounds.push(Sound::OutOfFood);
             }
-            let who = self.settings.username.clone().unwrap_or_else(|| "BitCraft".into());
-            self.notifications.push(Notification { title: format!("{who}: {}", report.source), body: report.message });
+            self.notify(&report.source, report.message);
         }
     }
 
     /// A player starts a trade with the character (user request):
     /// notification + sound, once per session. Sessions open in the first
-    /// list (app start, character switch) aren't news.
+    /// list (app start, character added) aren't news.
     fn handle_trades(&mut self, offers: Vec<crate::core::types::TradeOffer>) {
         let first = self.seen_trades.is_none();
         let seen = self.seen_trades.get_or_insert_with(Default::default);
@@ -421,7 +398,7 @@ impl Model {
         }
         for offer in new {
             let who = offer.from.unwrap_or_else(|| "A player".into());
-            self.notifications.push(Notification { title: "Trade request".into(), body: format!("{who} wants to trade") });
+            self.notify("Trade request", format!("{who} wants to trade"));
             self.sounds.push(Sound::TradeRequest);
         }
     }
@@ -441,7 +418,7 @@ impl Model {
             return;
         }
         let body = if g.shows_timer() { format!("{}: time's up", g.name) } else { format!("{} is used up", g.name) };
-        self.notifications.push(Notification { title: "Resource depleted".into(), body });
+        self.notify("Resource depleted", body);
         self.sounds.push(Sound::ResourceDepleted);
         self.gather_alert_at = Some(self.now);
     }
@@ -453,10 +430,7 @@ impl Model {
             self.sounds.push(Sound::CraftFinished);
         }
         for craft in completed {
-            self.notifications.push(Notification {
-                title: "Craft finished".into(),
-                body: format!("{} at {} is done", craft.name, craft.building.as_deref().unwrap_or("station")),
-            });
+            self.notify("Craft finished", format!("{} at {} is done", craft.name, craft.building.as_deref().unwrap_or("station")));
         }
         let finished = self.passive.take_finished();
         if !finished.is_empty() {
@@ -469,13 +443,10 @@ impl Model {
                 .map(|(k, n)| if n > 1 { format!("{n}× {k}") } else { k })
                 .collect::<Vec<_>>()
                 .join("\n");
-            self.notifications.push(Notification { title: "Passive craft finished".into(), body });
+            self.notify("Passive craft finished", body);
         }
         for tier in self.plants.take_finished() {
-            self.notifications.push(Notification {
-                title: "Plants grown".into(),
-                body: format!("All T{} plants have finished growing ({} ready to harvest)", tier.tier, tier.grown),
-            });
+            self.notify("Plants grown", format!("All T{} plants have finished growing ({} ready to harvest)", tier.tier, tier.grown));
         }
         if self.is_loading {
             self.notifications.clear();

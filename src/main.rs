@@ -24,7 +24,6 @@ use gpui::{
     WindowBounds, WindowKind, WindowOptions, point, prelude::*, px, size,
 };
 
-use crate::model::Model;
 use crate::settings::Settings;
 use crate::ui::{AppState, Edge, PANEL_WIDTH, Panel, Placement};
 
@@ -66,7 +65,7 @@ fn main() {
             }
         };
         let has_tray = tray.is_some();
-        let state = cx.new(|_| AppState::new(Model::new(Settings::load()), net, tray));
+        let state = cx.new(|_| AppState::new(Settings::load(), net, tray));
 
         // Tray clicks → toggle the popup.
         let (click_tx, click_rx) = async_channel::unbounded::<Anchor>();
@@ -101,8 +100,10 @@ fn main() {
         // quit when the last window closes).
         main_window::open(&state, cx);
 
-        if state.read(cx).model.settings.floating_window {
-            floating::open(&state, cx);
+        let floating: Vec<String> =
+            state.read(cx).settings.characters.iter().filter(|c| c.floating_window).map(|c| c.user_id.clone()).collect();
+        for user_id in floating {
+            floating::open(&state, &user_id, cx);
         }
 
         // `--open`: show the panel at launch (also the fallback without a tray).
