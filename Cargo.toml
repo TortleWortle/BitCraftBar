@@ -1,6 +1,6 @@
 [package]
 name = "bitcraft-tracker"
-version = "0.0.10"
+version = "0.0.11"
 edition = "2024"
 description = "Tray app showing the status of a BitCraft character (data from BitJita). Rust/GPUI port of the macOS BitCraftTrackerBar."
 license = "MIT"
