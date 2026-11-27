@@ -176,6 +176,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rough_durations() {
+        let r = |secs: f64| rough_duration_string(secs);
+        assert_eq!([r(5.0), r(15.0), r(30.0), r(61.0), r(599.0), r(601.0), r(3500.0), r(3700.0), r(8000.0)], [
+            "<15s", "<30s", "<1m", "2m", "10m", "15m", "1h", "1h 15m", "2h 15m"
+        ]);
+    }
+
+    #[test]
     fn short_durations() {
         let s = |secs: f64| short_duration_string(secs);
         assert_eq!([s(0.0), s(14.2), s(59.0), s(61.0), s(299.0), s(3599.0), s(3600.0), s(4500.0), s(4501.0), s(7200.0)], [
@@ -240,6 +248,22 @@ pub fn short_duration_string(seconds: f64) -> String {
         (0, m) => format!("{m}m"),
         (h, 0) => format!("{h}h"),
         (h, m) => format!("{h}h {m}m"),
+    }
+}
+
+/// A rough estimate (craft time left; no "~", user: it's implied):
+/// "<15s", "<30s", "<1m", "4m", "25m" (5-minute steps from 10m), "1h 15m"
+/// (15-minute steps from an hour). Coarse so it doesn't tick with every
+/// action.
+pub fn rough_duration_string(seconds: f64) -> String {
+    let step = |s: f64, unit: f64| (s / unit).ceil() * unit;
+    match seconds.max(0.0) {
+        s if s < 15.0 => "<15s".to_string(),
+        s if s < 30.0 => "<30s".to_string(),
+        s if s < 60.0 => "<1m".to_string(),
+        s if s < 600.0 => short_duration_string(step(s, 60.0)),
+        s if s < 3600.0 => short_duration_string(step(s, 300.0)),
+        s => short_duration_string(step(s, 900.0)),
     }
 }
 

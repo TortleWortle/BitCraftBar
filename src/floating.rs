@@ -17,7 +17,7 @@ use crate::core::status::Report;
 use crate::core::trackers::{ActivityCheck, Craft, XpDrop};
 use crate::model::Model;
 use crate::core::badges::{self, Badge, TierChip};
-use crate::core::types::short_duration_string;
+use crate::core::types::{rough_duration_string, short_duration_string};
 use crate::ui::{AppState, PULSE_WITHIN, Theme, Tooltip, badge_wrap, bar, dot, duration_string, status_color};
 
 const WIDTH: f32 = 260.0;
@@ -406,6 +406,7 @@ fn current_work(m: &Model) -> Option<Work> {
 }
 
 pub(crate) fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
+    let now = m.now;
     let shown = shown_report(m);
     let skill = (!m.is_offline).then(|| m.experience.last_skill_name()).flatten();
     let (craft, gather) = match current_work(m) {
@@ -437,7 +438,11 @@ pub(crate) fn status_line(m: &Model, theme: Theme) -> impl IntoElement {
                         .flex()
                         .gap_2()
                         .child(div().overflow_hidden().whitespace_nowrap().text_ellipsis().flex_1().child(c.name.clone()))
-                        .child(div().flex_none().child(c.percent_string())),
+                        // Rough time left (user request): "65% · 12m".
+                        .child(div().flex_none().child(match c.eta_left(now) {
+                            Some(left) => format!("{} · {}", c.percent_string(), rough_duration_string(left)),
+                            None => c.percent_string(),
+                        })),
                 )
                 .child(div().flex().child(bar(c.fraction(), gpui::rgb(CRAFT_RGB), theme)))
         }))
@@ -851,7 +856,9 @@ fn compact_bars(m: &Model, shown: Option<Report>, theme: Theme) -> impl IntoElem
     );
     let work = match current_work(m) {
         Some(Work::Craft(c)) => {
-            let bar = labeled_bar(c.fraction(), gpui::rgb(CRAFT_RGB), String::new(), theme.text, theme).into_any_element();
+            // Rough time left inside the bar (user request).
+            let left = c.eta_left(m.now).map(|s| format!("{} left", rough_duration_string(s))).unwrap_or_default();
+            let bar = labeled_bar(c.fraction(), gpui::rgb(CRAFT_RGB), left, theme.text, theme).into_any_element();
             cell(c.name.clone(), theme.text, Some(c.percent_string()), bar).into_any_element()
         }
         Some(Work::Gather(name, (fraction, text), inside)) => {

@@ -232,7 +232,7 @@ impl SatiationTracker {
 
 // MARK: - Crafts
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Craft {
     pub id: String,
     pub name: String,
@@ -246,7 +246,18 @@ pub struct Craft {
     pub skill: Option<i64>,
     /// Last progress made by the player (see [`CraftTracker::mark_worked`]).
     pub worked_at: Option<f64>,
+    /// The player's own progress (time, progress), last `ETA_WINDOW`
+    /// seconds: the rate for the time estimate.
+    samples: Vec<(f64, i64)>,
+    /// Estimated finish time (see `Craft::eta_left`).
+    eta_end: Option<f64>,
 }
+
+/// Rate window for the craft time estimate: long enough to include short
+/// rests, so it's the real pace rather than the swing speed.
+pub const ETA_WINDOW: f64 = 300.0;
+/// Need this much time between the first and last sample.
+const ETA_MIN_SPAN: f64 = 20.0;
 
 impl Craft {
     pub fn fraction(&self) -> f64 {
@@ -260,6 +271,33 @@ impl Craft {
     /// Rounded down so it never shows 100% early.
     pub fn percent_string(&self) -> String {
         format!("{}%", (self.fraction() * 100.0).floor() as i64)
+    }
+
+    /// Rough time left at the player's recent pace (user request; an
+    /// earlier exact ETA was removed for flickering). None while unknown,
+    /// done, or not worked on for `ETA_WINDOW`.
+    pub fn eta_left(&self, now: f64) -> Option<f64> {
+        let end = self.eta_end?;
+        let recent = self.worked_at.is_some_and(|t| now - t <= ETA_WINDOW);
+        (recent && !self.is_complete()).then(|| (end - now).max(0.0))
+    }
+
+    /// Own progress at `now`: new sample, and a new estimated end when it
+    /// differs enough from the current one. Between re-anchors the shown
+    /// time just counts down, so it doesn't jump with every action.
+    fn record_own_progress(&mut self, now: f64) {
+        self.samples.push((now, self.progress));
+        self.samples.retain(|(t, _)| now - t <= ETA_WINDOW);
+        let (Some(&(t0, p0)), Some(&(t1, p1))) = (self.samples.first(), self.samples.last()) else { return };
+        if self.samples.len() < 3 || t1 - t0 < ETA_MIN_SPAN || p1 <= p0 {
+            return;
+        }
+        let rate = (p1 - p0) as f64 / (t1 - t0);
+        let estimate = now + (self.total - self.progress).max(0) as f64 / rate;
+        let keep = self.eta_end.is_some_and(|end| (estimate - end).abs() <= (0.2 * (end - now).max(0.0)).max(30.0));
+        if !keep {
+            self.eta_end = Some(estimate);
+        }
     }
 }
 
@@ -324,6 +362,9 @@ impl CraftTracker {
     pub fn mark_worked(&mut self, id: &str) {
         let Some(craft) = self.crafts.get_mut(id) else { return };
         craft.worked_at = craft.last_progress_at;
+        if let Some(t) = craft.worked_at {
+            craft.record_own_progress(t);
+        }
         self.last_worked = Some(craft.clone());
     }
 
@@ -357,6 +398,8 @@ impl CraftTracker {
                 tier: info.tier,
                 skill: info.skill,
                 worked_at: None,
+                samples: Vec::new(),
+                eta_end: None,
             });
             entry.name = info.name.clone();
             entry.skill = info.skill;
@@ -786,6 +829,7 @@ mod tests {
             tier: None,
             skill: None,
             worked_at: Some(t),
+            ..Default::default()
         };
         // Action: spend + XP, then regen tops stamina back up to full.
         stamina.handle(98.0, 1.0);
@@ -838,6 +882,41 @@ mod tests {
         assert_eq!((xp.last_gain_at, xp.last_skill_id, xp.total), (None, None, Some(15)));
         xp.handle(&[(2, 10), (12, 9)], 1.0);
         assert_eq!((xp.last_gain_at, xp.last_skill_id, xp.last_gain_amount), (Some(1.0), Some(12), 4));
+    }
+
+    #[test]
+    fn craft_eta_is_rough_and_steady() {
+        let info = CraftInfo {
+            id: "1".into(),
+            name: "Plank".into(),
+            building: None,
+            progress: 0,
+            total: 1000,
+            completed: false,
+            kind: None,
+            tier: None,
+            skill: None,
+        };
+        let mut crafts = CraftTracker::default();
+        crafts.update(&[info]);
+        // 10 progress every 2s = 5/s, own progress.
+        let work = |crafts: &mut CraftTracker, t: f64, p: i64| {
+            crafts.handle_progress("1", p, t);
+            crafts.mark_worked("1");
+        };
+        for i in 1..=10 {
+            work(&mut crafts, i as f64 * 2.0, i * 10);
+        }
+        // Too short a span (18s) for an estimate yet.
+        assert_eq!(crafts.crafts["1"].eta_left(20.0), None);
+        work(&mut crafts, 22.0, 110);
+        // 890 left at 5/s = 178s.
+        assert_eq!(crafts.crafts["1"].eta_left(22.0).map(f64::round), Some(178.0));
+        // A slightly slower action doesn't move it; it counts down.
+        work(&mut crafts, 25.0, 120);
+        assert_eq!(crafts.crafts["1"].eta_left(25.0).map(f64::round), Some(175.0));
+        // Not worked on for 5 minutes: unknown again.
+        assert_eq!(crafts.crafts["1"].eta_left(25.0 + ETA_WINDOW + 1.0), None);
     }
 
     #[test]
@@ -939,6 +1018,7 @@ mod tests {
             tier: None,
             skill: None,
             worked_at: Some(5.0),
+            ..Default::default()
         };
         ActivityCheck::default().evaluate(&xp, &stamina, Some(&craft), None, &mut monitor, 6.0);
         let report = &monitor.sorted_reports()[0];

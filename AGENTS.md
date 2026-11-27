@@ -815,8 +815,22 @@ connection. Replaced by the relay (user request).
   skill = skill with the largest increase in that update. (Observed: XP the
   user expected as Forestry arrived as skill 12 = Fishing; ids follow
   BitJita's `skillMap`, the source of the hardcoded `skill.rs`.)
-- **Craft time remaining was removed** (rate-based ETA was too inaccurate).
-  Show percent done instead, rounded down so it never shows 100% early.
+- **Craft time left is a rough estimate** (user request, after an exact
+  rate-based ETA had been removed as too inaccurate / flickery). Shown
+  only for the current craft in the floating windows (normal: `65% ·
+  12m` next to the name; compact: `12m left` inside the bar) and the
+  main window card's status line. `Craft::eta_left`: rate = the
+  player's **own** progress (`mark_worked` samples) over the last 5 min
+  (`ETA_WINDOW`; includes short rests, so it's the real pace, not the
+  swing speed), needs ≥ 3 samples over ≥ 20s. Stored as an **end time**
+  that counts down; a new estimate replaces it only when it differs by
+  more than 20% of the time left (min 30s), so it doesn't jump with
+  every action. Shown coarse, without `~` (user: being an estimate is
+  implied) (`types::rough_duration_string`: `<15s`, `<30s`, `<1m`,
+  minutes under 10m, 5-minute steps under an hour, 15-minute steps
+  after). Hidden when not worked on for 5 min. Percent done is still
+  rounded down so it never shows 100% early. Badges' hover text and the
+  popup's craft rows have no time left.
 - A craft is **active** if it progressed in the last 30s; otherwise "Paused".
 - **Finished crafts stay listed until collected** (user report: they
   didn't show). The relay keeps a finished craft's
