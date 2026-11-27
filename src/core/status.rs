@@ -57,6 +57,31 @@ pub fn health_rgb(fraction: f64) -> u32 {
     }
 }
 
+/// Compact floating window heart (user request): red under 20% health,
+/// orange (the user's "yellow") under 70%, else green.
+pub fn compact_health_status(fraction: f64) -> HealthStatus {
+    match fraction {
+        f if f < 0.20 => HealthStatus::Alert,
+        f if f < 0.70 => HealthStatus::Warning,
+        _ => HealthStatus::Healthy,
+    }
+}
+
+/// Compact floating window food icon: orange under this many seconds of
+/// food regen left (user's number; the food bar turns orange at 5 min).
+pub const COMPACT_FOOD_WARNING: f64 = 15.0;
+
+/// Compact floating window food icon (user request): red without a food
+/// regen buff, orange when it's about to run out, else green.
+/// `time_left`: None = no food regen buff.
+pub fn compact_food_status(time_left: Option<f64>) -> HealthStatus {
+    match time_left {
+        None => HealthStatus::Alert,
+        Some(t) if t < COMPACT_FOOD_WARNING => HealthStatus::Warning,
+        Some(_) => HealthStatus::Healthy,
+    }
+}
+
 /// Linear blend of two RGB colors per channel; `t` = 0 → `a`, 1 → `b`.
 fn blend(a: u32, b: u32, t: f64) -> u32 {
     let channel = |shift: u32| {
@@ -127,6 +152,13 @@ impl StatusMonitor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_icons() {
+        use HealthStatus::*;
+        assert_eq!([0.1, 0.2, 0.69, 0.7, 1.0].map(compact_health_status), [Alert, Warning, Warning, Healthy, Healthy]);
+        assert_eq!([None, Some(10.0), Some(15.0), Some(3600.0)].map(compact_food_status), [Alert, Warning, Healthy, Healthy]);
+    }
 
     #[test]
     fn stamina_color_stops() {

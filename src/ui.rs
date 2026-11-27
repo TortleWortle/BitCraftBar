@@ -80,8 +80,8 @@ pub struct AppState {
     pub main: Option<WindowHandle<crate::main_window::MainWindow>>,
     /// Open floating windows by user id (`crate::floating`).
     pub floating: HashMap<String, WindowHandle<crate::floating::FloatingWindow>>,
-    /// Height each floating window was last sized to.
-    pub floating_height: HashMap<String, Pixels>,
+    /// Size each floating window was last set to (`floating::fit`).
+    pub floating_size: HashMap<String, gpui::Size<Pixels>>,
     /// "Add character" search open in the main window.
     pub picking: bool,
     pub query: String,
@@ -116,7 +116,7 @@ impl AppState {
             popup_character: None,
             main: None,
             floating: HashMap::new(),
-            floating_height: HashMap::new(),
+            floating_size: HashMap::new(),
             picking: false,
             query: String::new(),
             results: Vec::new(),
@@ -306,7 +306,7 @@ impl AppState {
         self.settings.characters.retain(|c| c.user_id != user_id);
         self.settings.save();
         self.floating.remove(user_id);
-        self.floating_height.remove(user_id);
+        self.floating_size.remove(user_id);
         if self.popup_character.as_deref() == Some(user_id) {
             self.popup_character = None;
         }
@@ -356,7 +356,7 @@ fn debug_line(m: &Model) -> String {
     });
     format!(
         "{line} | gather {gather} | badges plants [{}] passive [{}] crafts [{}]",
-        texts(badges::plants(&m.plants.plants)),
+        texts(badges::plants(&m.plants.plants, m.now)),
         texts(badges::passive(&m.passive.crafts, m.now)),
         texts(badges::crafts(&m.crafts.sorted(), m.now, m.crafts.active_window)),
     )
@@ -527,17 +527,22 @@ pub(crate) fn badge_wrap(
 }
 
 /// Badges of things finishing within this many seconds pulse (user request).
-const PULSE_WITHIN: f64 = 10.0;
+pub(crate) const PULSE_WITHIN: f64 = 10.0;
 
-fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Theme) -> AnyElement {
-    let pulse = b.ends_soon(now, PULSE_WITHIN);
-    let tip: SharedString = b.tooltip(now).into();
-    let color = match b.state {
+/// Red = action needed, orange = running, gray = idle, green = done.
+pub(crate) fn badge_color(state: BadgeState) -> Rgba {
+    match state {
         BadgeState::Action => status_color(HealthStatus::Alert),
         BadgeState::Processing => status_color(HealthStatus::Warning),
         BadgeState::Idle => rgb(0x8e8e93),
         BadgeState::Finished => status_color(HealthStatus::Healthy),
-    };
+    }
+}
+
+fn pill(b: &Badge, id: (&'static str, usize), grouped: bool, now: f64, theme: Theme) -> AnyElement {
+    let pulse = b.ends_soon(now, PULSE_WITHIN);
+    let tip: SharedString = b.tooltip(now).into();
+    let color = badge_color(b.state);
     let mut tint = color;
     tint.a = 0.18;
     let pill = div()
@@ -1054,7 +1059,7 @@ impl Panel {
             .child(section_title("Plants"))
             .child(badges(
                 "plant-badge",
-                &badges::plants(&m.plants.plants),
+                &badges::plants(&m.plants.plants, m.now),
                 m.now,
                 theme,
             ))

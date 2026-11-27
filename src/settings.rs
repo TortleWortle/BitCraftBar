@@ -31,6 +31,9 @@ pub struct CharacterSettings {
     /// coordinates), kept when the user moves it.
     #[serde(default)]
     pub floating_origin: Option<(f32, f32)>,
+    /// Its floating window shows the compact layout.
+    #[serde(default)]
+    pub floating_compact: bool,
 }
 
 /// The single-character format (before multiple characters): read once
@@ -94,6 +97,7 @@ impl Settings {
                     muted: false,
                     floating_window: legacy.floating_window,
                     floating_origin: legacy.floating_origin,
+                    floating_compact: false,
                 });
             }
         }

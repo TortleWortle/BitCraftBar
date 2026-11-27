@@ -5,6 +5,7 @@
 // Release builds on Windows: no console window next to the tray icon.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod assets;
 mod core;
 mod floating;
 mod main_window;
@@ -41,7 +42,7 @@ fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     notifier::init();
 
-    Application::new().run(|cx: &mut App| {
+    Application::new().with_assets(assets::Assets).run(|cx: &mut App| {
         // macOS: a regular Dock app (user request; it used to hide in
         // the Dock as a menu bar-only app). App menu with Quit / ⌘Q.
         #[cfg(target_os = "macos")]

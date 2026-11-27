@@ -41,6 +41,9 @@ pub struct Badge {
     pub count: usize,
     pub state: BadgeState,
     pub details: Vec<Detail>,
+    /// Fraction done (0–1) of each item where it's known (craft progress,
+    /// time elapsed); the compact chips' tiny bars.
+    pub progress: Vec<f64>,
 }
 
 impl Badge {
@@ -114,20 +117,97 @@ impl Badge {
     }
 }
 
+/// Compact floating window (user request: "tiny lists"): one chip per
+/// tier and state ("T1" in the state's color); the kinds go in the hover
+/// text.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TierChip {
+    pub tier: Option<i64>,
+    pub state: BadgeState,
+    /// The badges merged into it (one per kind).
+    pub members: Vec<Badge>,
+}
+
+impl TierChip {
+    /// "T1", or "–" without a tier.
+    pub fn text(&self) -> String {
+        self.tier.map_or("–".to_string(), |t| format!("T{t}"))
+    }
+
+    /// One line per kind: "Grain ×6 · 4m left".
+    pub fn tooltip(&self, now: f64) -> String {
+        self.members
+            .iter()
+            .map(|b| {
+                let tip = b.tooltip(now);
+                if tip.is_empty() { b.text() } else { format!("{} · {tip}", b.text()) }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn ends_soon(&self, now: f64, within: f64) -> bool {
+        self.members.iter().any(|b| b.ends_soon(now, within))
+    }
+
+    /// The tiny bar under the chip: the least done item, so the bar is
+    /// full when the whole chip is (like "all grown in"). None when no
+    /// item has a known progress (done, needs action, queued).
+    pub fn progress(&self) -> Option<f64> {
+        self.members.iter().flat_map(|b| b.progress.iter().copied()).reduce(f64::min)
+    }
+}
+
+/// Badges merged per (tier, state): by tier (untiered last), then most
+/// urgent first.
+pub fn tier_chips(list: &[Badge]) -> Vec<TierChip> {
+    // Key: (untiered, tier, state), so untiered sorts last.
+    type Key = (bool, Option<i64>, BadgeState);
+    let mut groups: BTreeMap<Key, Vec<Badge>> = BTreeMap::new();
+    for b in list {
+        groups.entry((b.tier.is_none(), b.tier, b.state)).or_default().push(b.clone());
+    }
+    groups.into_iter().map(|((_, tier, state), members)| TierChip { tier, state, members }).collect()
+}
+
 fn with_count(label: String, count: usize) -> String {
     if count > 1 { format!("{label} ×{count}") } else { label }
 }
 
 /// Group equal (kind, tier, state), most urgent first, then by kind/tier.
-pub fn group(items: impl IntoIterator<Item = ((String, Option<i64>), BadgeState, Detail)>) -> Vec<Badge> {
-    let mut groups: BTreeMap<(BadgeState, String, Option<i64>), Vec<Detail>> = BTreeMap::new();
-    for ((kind, tier), state, detail) in items {
-        groups.entry((state, kind, tier)).or_default().push(detail);
+/// One item: label, state, hover detail, fraction done if known.
+pub type Item = ((String, Option<i64>), BadgeState, Detail, Option<f64>);
+
+pub fn group(items: impl IntoIterator<Item = Item>) -> Vec<Badge> {
+    // (state, kind, tier) → (details, known fractions done).
+    type Groups = BTreeMap<(BadgeState, String, Option<i64>), (Vec<Detail>, Vec<f64>)>;
+    let mut groups = Groups::new();
+    for ((kind, tier), state, detail, progress) in items {
+        let (details, fractions) = groups.entry((state, kind, tier)).or_default();
+        details.push(detail);
+        fractions.extend(progress.map(|f| f.clamp(0.0, 1.0)));
     }
     groups
         .into_iter()
-        .map(|((state, kind, tier), details)| Badge { kind, tier, count: details.len(), state, details })
+        .map(|((state, kind, tier), (details, progress))| Badge { kind, tier, count: details.len(), state, details, progress })
         .collect()
+}
+
+/// The soonest end of anything still running (plants growing, passive
+/// crafts), and whether it's an estimate.
+pub fn next_end(list: &[Badge], now: f64) -> Option<(f64, bool)> {
+    list.iter()
+        .flat_map(|b| &b.details)
+        .filter_map(|d| match d {
+            Detail::EndsAt(Some(end), estimate) if *end > now => Some((*end, *estimate)),
+            _ => None,
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+}
+
+/// Fraction of `start..end` passed at `now`.
+fn elapsed(start: f64, end: f64, now: f64) -> Option<f64> {
+    (end > start).then(|| (now - start) / (end - start))
 }
 
 /// Rows for display: one per tier (ascending, untiered last) when the list
@@ -166,11 +246,11 @@ pub fn plant_kind(name: &str) -> String {
     .to_string()
 }
 
-pub fn plants(plants: &[Plant]) -> Vec<Badge> {
+pub fn plants(plants: &[Plant], now: f64) -> Vec<Badge> {
     group(plants.iter().filter_map(|p| {
-        let (state, detail) = match PlantTracker::stage(p)? {
-            Stage::NeedsFertilizer => (BadgeState::Action, Detail::Need("fertilizer")),
-            Stage::NeedsWater => (BadgeState::Action, Detail::Need("water")),
+        let (state, detail, progress) = match PlantTracker::stage(p)? {
+            Stage::NeedsFertilizer => (BadgeState::Action, Detail::Need("fertilizer"), None),
+            Stage::NeedsWater => (BadgeState::Action, Detail::Need("water"), None),
             Stage::Growing => {
                 // Same rule as the tier summary: reported end, else estimate.
                 let end = match (p.reported_end, p.growth_duration, p.started_growing_at) {
@@ -178,25 +258,35 @@ pub fn plants(plants: &[Plant]) -> Vec<Badge> {
                     (None, Some(d), Some(start)) => Detail::EndsAt(Some(start + d), true),
                     _ => Detail::EndsAt(None, false),
                 };
-                (BadgeState::Processing, end)
+                // Seen start → end when known; else the catalog duration
+                // (its max: the real growth time is random between min
+                // and max, so this can start partly filled).
+                let progress = match (p.started_growing_at, p.reported_end, p.growth_duration) {
+                    (Some(start), Some(end), _) => elapsed(start, end, now),
+                    (_, Some(end), Some(d)) => elapsed(end - d, end, now),
+                    (Some(start), None, Some(d)) => elapsed(start, start + d, now),
+                    _ => None,
+                };
+                (BadgeState::Processing, end, progress)
             }
-            Stage::Grown => (BadgeState::Finished, Detail::Note("Ready to harvest")),
+            Stage::Grown => (BadgeState::Finished, Detail::Note("Ready to harvest"), None),
         };
-        Some((label(Some(&plant_kind(&p.name)), Some(p.tier), &p.name), state, detail))
+        Some((label(Some(&plant_kind(&p.name)), Some(p.tier), &p.name), state, detail, progress))
     }))
 }
 
 pub fn passive(crafts: &[PassiveCraft], now: f64) -> Vec<Badge> {
     group(crafts.iter().map(|c| {
-        let (state, detail) = if c.is_finished(now) {
-            (BadgeState::Finished, Detail::Note("Ready to collect"))
+        let (state, detail, progress) = if c.is_finished(now) {
+            (BadgeState::Finished, Detail::Note("Ready to collect"), None)
         } else if c.started_at.is_none() {
             // Queued: not started, so 0% (no end time yet).
-            (BadgeState::Idle, Detail::Note("Queued"))
+            (BadgeState::Idle, Detail::Note("Queued"), None)
         } else {
-            (BadgeState::Processing, Detail::EndsAt(c.ends_at(), true))
+            let progress = c.started_at.zip(c.ends_at()).and_then(|(start, end)| elapsed(start, end, now));
+            (BadgeState::Processing, Detail::EndsAt(c.ends_at(), true), progress)
         };
-        (label(c.kind.as_deref(), c.tier, &c.name), state, detail)
+        (label(c.kind.as_deref(), c.tier, &c.name), state, detail, progress)
     }))
 }
 
@@ -212,8 +302,9 @@ pub fn crafts(crafts: &[Craft], now: f64, active_window: f64) -> Vec<Badge> {
         } else {
             BadgeState::Idle
         };
-        let detail = if state == BadgeState::Finished { Detail::Note("Done") } else { Detail::Percent(c.fraction()) };
-        (label(c.kind.as_deref(), c.tier, &c.name), state, detail)
+        let (detail, progress) =
+            if state == BadgeState::Finished { (Detail::Note("Done"), None) } else { (Detail::Percent(c.fraction()), Some(c.fraction())) };
+        (label(c.kind.as_deref(), c.tier, &c.name), state, detail, progress)
     }))
 }
 
@@ -240,7 +331,7 @@ mod tests {
             plant("Grown Simple Wispweave", 2),
             plant("Some Sift Collector", 1),
         ];
-        let texts: Vec<(String, BadgeState)> = plants(&list).iter().map(|b| (b.text(), b.state)).collect();
+        let texts: Vec<(String, BadgeState)> = plants(&list, 0.0).iter().map(|b| (b.text(), b.state)).collect();
         assert_eq!(
             texts,
             vec![
@@ -259,20 +350,68 @@ mod tests {
         let mut later = growing.clone();
         later.started_growing_at = Some(600.0);
         let list = [growing, later, plant("Planted Basic Embergrain", 1), plant("Fertilized Planted Basic Embergrain", 1)];
-        let b = plants(&list);
+        let b = plants(&list, 0.0);
         assert_eq!(b[0].tooltip(0.0), "1 needs fertilizer · 1 needs water");
         assert_eq!(b[1].tooltip(60.0), "next ~4m · all ~14m");
         assert!(!b[1].ends_soon(60.0, 30.0));
         assert!(b[1].ends_soon(280.0, 30.0));
-        let single = plants(&[plant("Planted Basic Starbulb", 2)]);
+        let single = plants(&[plant("Planted Basic Starbulb", 2)], 0.0);
         assert_eq!(single[0].tooltip(0.0), "Needs fertilizer");
+    }
+
+    #[test]
+    fn chips() {
+        let list = [
+            plant("Grown Basic Embergrain", 1),
+            plant("Growing Basic Starbulb", 2),
+            plant("Planted Basic Starbulb", 1),
+            plant("Grown Basic Starbulb", 1),
+        ];
+        let chips = tier_chips(&plants(&list, 0.0));
+        let got: Vec<(String, BadgeState, usize)> = chips.iter().map(|c| (c.text(), c.state, c.members.len())).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("T1".into(), BadgeState::Action, 1),
+                ("T1".into(), BadgeState::Finished, 2),
+                ("T2".into(), BadgeState::Processing, 1),
+            ]
+        );
+        assert_eq!(chips[1].tooltip(0.0), "Bulbs T1 · Ready to harvest\nGrain T1 · Ready to harvest");
+        assert_eq!(chips[1].progress(), None);
+    }
+
+    #[test]
+    fn chip_progress() {
+        // Timer end + catalog duration; seen start + end; nothing known.
+        let mut a = plant("Growing Basic Embergrain", 1);
+        a.reported_end = Some(100.0);
+        a.growth_duration = Some(100.0);
+        let mut b = a.clone();
+        b.started_growing_at = Some(40.0);
+        let c = plant("Growing Basic Embergrain", 1);
+        let progress = |list: &[Plant], now: f64| tier_chips(&plants(list, now))[0].progress();
+        assert_eq!(progress(&[a.clone()], 50.0), Some(0.5));
+        assert_eq!(progress(&[b.clone()], 70.0), Some(0.5));
+        // The least done item; unknown ones don't count.
+        assert_eq!(progress(&[a, b, c.clone()], 70.0), Some(0.5));
+        assert_eq!(progress(&[c], 70.0), None);
+    }
+
+    #[test]
+    fn next_plant_end() {
+        let growing = |end: f64| Plant { reported_end: Some(end), ..plant("Growing Basic Embergrain", 1) };
+        let list = plants(&[growing(500.0), growing(300.0), growing(50.0), plant("Grown Basic Embergrain", 2)], 100.0);
+        // Already past (any moment) doesn't count.
+        assert_eq!(next_end(&list, 100.0), Some((300.0, false)));
+        assert_eq!(next_end(&plants(&[plant("Planted Basic Starbulb", 1)], 0.0), 0.0), None);
     }
 
     #[test]
     fn labels() {
         assert_eq!(label(Some("Ingot"), Some(3), "Simple Ingot"), ("Ingot".into(), Some(3)));
         assert_eq!(label(None, Some(0), "Rope"), ("Rope".into(), None));
-        let rows = by_tier(&plants(&[plant("Planted Basic Starbulb", 1), plant("Grown Simple Embergrain", 2)]));
+        let rows = by_tier(&plants(&[plant("Planted Basic Starbulb", 1), plant("Grown Simple Embergrain", 2)], 0.0));
         assert_eq!(rows.iter().map(|(t, b)| (*t, b.len())).collect::<Vec<_>>(), vec![(Some(Some(1)), 1), (Some(Some(2)), 1)]);
     }
 }

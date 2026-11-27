@@ -213,7 +213,9 @@ open state are saved per character in `settings.json`
 launch; a saved position on a display that's gone falls back to
 the default. Never takes focus. Content:
 
-- header: overall status dot, character name, ✕ (closes it);
+- header: overall status dot, character name, the **XP drops** (same as
+  the compact layout below; user request; hidden offline / loading), the
+  **compact toggle** (switches to the compact layout) and ✕ (closes it);
 - status line: the worst issue, or the Activity message when all is well,
   with the last skill; the current craft (active, else the last worked on)
   with percent and bar, or, while gathering and more recent than the
@@ -231,6 +233,56 @@ the default. Never takes focus. Content:
   offline");
 - one row each for plants, passive crafts and crafts: **badges** (see
   below), with "next grown in 5m" / "next done in 4m" underneath.
+
+**Compact layout** (user request, from their sketch; per character,
+saved as `floating_compact`; 300px wide, the window resizes and keeps
+its top-left corner):
+
+- header: status dot and name (hover on either, user request: every
+  issue, or the Activity message), then **XP drops** like the game
+  shows them (user request; replaced a skill icon with "+18" above it):
+  the skill's **icon** (BitCraft's own glyph, see
+  `assets/icons/README.md`) + `32 EXP`, rising through a fixed 84×32px
+  area and fading out over 2.4s (`XP_DROP_SECONDS`), **at most 2 at
+  once** (`XP_DROPS_SHOWN`; the game shows 3, user's choice for compact).
+  One drop per XP update, for the skill with the largest gain
+  (`ExperienceTracker::drops`, last 3 kept; the animation runs once per
+  drop id, and the drop leaves the list once its time is up). Then a
+  **heart** (red under 20% health, orange under 70%, else green;
+  `status::compact_health_status`, user's thresholds, stricter than the
+  health bar's) and a **fork and knife** (red without a food regen buff,
+  orange in its last **15 seconds**, else green;
+  `status::compact_food_status`; the user wrote "15sec", unlike the food
+  bar's 5 min; hover: the food buff list). Gray
+  while unknown. Icons hidden while offline or loading.
+- stamina bar (left) and the current work (right) side by side, each with
+  a small label line above a 16px `labeled_bar`: the craft (name,
+  percent, blue bar) or the gather target (same rules as the normal
+  layout); the status message when there's neither. Offline: just the
+  status message ("Player offline").
+- **Plants | Crafts | Passive** columns (vertical dividers) of tiny
+  **tier chips** (`badges::tier_chips`): one `T1` chip per tier *and*
+  state in the badge colors (so a tier with growing and grown plants
+  shows an orange and a green `T1`), kinds merged; hover lists them one
+  per line (`Grain T1 ×6 · 4m left`); pulses like the badges. `–` when
+  empty, `…` while passive crafts load. A **tiny progress bar** (2px,
+  state color) along each chip's bottom edge (user request;
+  `TierChip::progress`): crafts' progress, plants' and passive crafts'
+  time elapsed (`Badge::progress`); the *least* done item, so it's full
+  when the whole chip is (like "all grown in"). Plants: seen start →
+  timer end, else timer end − catalog duration (the max of a random
+  range, so it may start partly filled), else seen start + duration.
+  No bar when nothing has a known progress (done, needs action, queued).
+  Plants' label line also shows the **time until the next plant is
+  grown** (user request), compact: `15s`, `5m`, `1h 15m`, `2h`
+  (`types::short_duration_string`: minutes rounded up, no leading zero;
+  `~` = estimate; `badges::next_end`).
+- **Buttons**: expand and ✕ appear in the header only while the mouse is
+  over the card (the user wasn't sure where they'd go; this keeps the
+  card clean). Hover is tracked with window-level mouse move / exit
+  listeners (`hover_tracker`), not `on_hover`: GPUI clears `on_hover`
+  only on a mouse move, and leaving the window sends an exit event.
+  The main window's *Floating* button still closes it either way.
 
 Same data and timer format as the popup; it re-renders on every model
 change and the 1s tick, and is sized to its content like the popup.
@@ -421,6 +473,8 @@ src/net/           Background Tokio runtime ("network" thread):
 src/tray.rs        Tray icon rendering/updates
 src/notifier.rs    Desktop notifications
 src/sound.rs       Alert sounds (synthesized chimes, rodio)
+src/assets.rs      Embedded SVG icons for GPUI's `svg()` (assets/icons:
+                   skill glyphs, heart, food, compact/expand)
 src/settings.rs    settings.json (characters + their floating window /
                    mute, sounds; migrates the single-character format)
 ```
@@ -809,7 +863,8 @@ connection. Replaced by the relay (user request).
   screen), `BITCRAFT_NO_NOTIFY=1` (suppress notifications). `cargo test` for
   the core rules and date parsing.
 - **Settings file**: `characters` (per character: `user_id`, `username`,
-  `muted`, `floating_window`, `floating_origin`) and `sounds`. The
+  `muted`, `floating_window`, `floating_origin`, `floating_compact`) and
+  `sounds`. The
   single-character format (`user_id`, `username`, `floating_window` /
   `info_window`, `floating_origin` / `info_origin` at the top level) is
   migrated into one character on load (`Settings::parse`, tested); old
@@ -911,7 +966,11 @@ connection. Replaced by the relay (user request).
 - **Food via REST** (`players/<id>/buffs`) was tried in the Swift app and
   removed: BitJita doesn't keep buffs up to date.
 - Skill names are hardcoded from BitJita's old `skillMap`; the relay's
-  `skill_desc` (global database) could replace them.
+  `skill_desc` (global database) could replace them. Its
+  `icon_asset_name` is a code point in the game's icon font (Forestry =
+  U+FFEA), not an image: the skill icons are that font's glyphs as SVGs
+  (`assets/icons/skills/<id>.svg`), so a new skill needs its glyph added
+  there and in `src/assets.rs`.
 - Passive crafts: whether crafts in one building queue (end times would need
   chaining) is unverified; only Processing (parallel slots) and Complete were
   seen.

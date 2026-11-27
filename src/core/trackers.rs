@@ -9,8 +9,22 @@ use super::types::{CraftInfo, PassiveCraft, Plant};
 
 // MARK: - Experience
 
+/// One XP gain, for the compact floating window's in-game style "32 EXP"
+/// drops.
+#[derive(Clone, Debug, PartialEq)]
+pub struct XpDrop {
+    /// Unique per drop (animation id).
+    pub id: u64,
+    pub skill_id: i64,
+    pub amount: i64,
+    pub at: f64,
+}
+
 #[derive(Default)]
 pub struct ExperienceTracker {
+    /// Latest gains, oldest first (at most `MAX_DROPS`).
+    pub drops: Vec<XpDrop>,
+    next_drop_id: u64,
     pub last_gain_at: Option<f64>,
     /// Last gain per skill (attributes craft progress to the player).
     gain_by_skill: HashMap<i64, f64>,
@@ -22,6 +36,8 @@ pub struct ExperienceTracker {
 }
 
 impl ExperienceTracker {
+    pub const MAX_DROPS: usize = 3;
+
     pub fn last_gain_in(&self, skill: i64) -> Option<f64> {
         self.gain_by_skill.get(&skill).copied()
     }
@@ -55,7 +71,15 @@ impl ExperienceTracker {
             let gained = per_skill.iter().map(|(_, d)| d).sum();
             if gained > 0 {
                 self.last_gain_amount = gained;
-                self.last_skill_id = per_skill.iter().max_by_key(|(_, d)| *d).map(|(s, _)| *s);
+                let top = per_skill.iter().max_by_key(|(_, d)| *d).copied();
+                self.last_skill_id = top.map(|(s, _)| s);
+                // One drop per update: the skill with the largest gain.
+                if let Some((skill_id, amount)) = top {
+                    self.next_drop_id += 1;
+                    self.drops.push(XpDrop { id: self.next_drop_id, skill_id, amount, at: now });
+                    let excess = self.drops.len().saturating_sub(Self::MAX_DROPS);
+                    self.drops.drain(..excess);
+                }
             }
             gained
         };
@@ -703,6 +727,23 @@ impl ActivityCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn xp_drops() {
+        let mut xp = ExperienceTracker::default();
+        // The first list is a snapshot: no drop.
+        xp.handle(&[(2, 10), (3, 5)], 0.0);
+        assert!(xp.drops.is_empty());
+        xp.handle(&[(2, 42), (3, 6)], 1.0);
+        assert_eq!(xp.drops, vec![XpDrop { id: 1, skill_id: 2, amount: 32, at: 1.0 }]);
+        // Unchanged list: no drop. Older drops fall off past the cap.
+        xp.handle(&[(2, 42), (3, 6)], 2.0);
+        for i in 0..4 {
+            xp.handle(&[(2, 43 + i), (3, 6)], 3.0 + i as f64);
+        }
+        assert_eq!(xp.drops.len(), ExperienceTracker::MAX_DROPS);
+        assert_eq!(xp.drops.iter().map(|d| d.id).collect::<Vec<_>>(), vec![3, 4, 5]);
+    }
 
     #[test]
     fn regen_means_resting_and_full_means_idle() {

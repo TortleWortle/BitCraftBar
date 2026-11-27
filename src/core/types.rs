@@ -176,6 +176,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn short_durations() {
+        let s = |secs: f64| short_duration_string(secs);
+        assert_eq!([s(0.0), s(14.2), s(59.0), s(61.0), s(299.0), s(3599.0), s(3600.0), s(4500.0), s(4501.0), s(7200.0)], [
+            "0s", "15s", "59s", "2m", "5m", "1h", "1h", "1h 15m", "1h 16m", "2h"
+        ]);
+    }
+
+    #[test]
     fn parses_relay_player_search() {
         let json = r#"[{"entity_id":"648518346633885895","last_active_timestamp":1795629491,"region":14,"signed_in":true,"username":"Tortle"}]"#;
         let players: Vec<PlayerSummary> = serde_json::from_str(json).unwrap();
@@ -216,6 +224,22 @@ pub fn duration_string(seconds: f64) -> String {
         }
     } else {
         format!("{s}s")
+    }
+}
+
+/// Compact timers (user request, compact floating window): "15s", "5m",
+/// "1h 15m", "2h". Minutes round up like `duration_string` (never "0m"
+/// with time left).
+pub fn short_duration_string(seconds: f64) -> String {
+    let total = seconds.max(0.0).ceil() as i64;
+    if total < 60 {
+        return format!("{total}s");
+    }
+    let minutes = (total + 59) / 60;
+    match (minutes / 60, minutes % 60) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h {m}m"),
     }
 }
 
