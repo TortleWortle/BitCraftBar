@@ -228,7 +228,7 @@ impl Model {
                 }
                 self.relay_player = player;
             }
-            NetEvent::RelayPlants(plants) => self.plants.update(&plants),
+            NetEvent::RelayPlants(plants) => self.plants.update(&plants, now),
             NetEvent::RelayPassiveCrafts(crafts) => self.passive.update(crafts, now),
             NetEvent::Relay(state) => self.relay_state = state,
             NetEvent::RelayLoaded => self.relay_loaded = true,
@@ -252,6 +252,7 @@ impl Model {
         self.now = now();
         self.stamina.tick(self.now);
         self.passive.tick(self.now);
+        self.plants.tick(self.now);
         self.collect_notifications();
         self.update_loading();
         self.evaluate();
@@ -445,8 +446,13 @@ impl Model {
                 .join("\n");
             self.notify("Passive craft finished", body);
         }
-        for tier in self.plants.take_finished() {
-            self.notify("Plants grown", format!("All T{} plants have finished growing ({} ready to harvest)", tier.tier, tier.grown));
+        // Tiers finishing close together: one notification.
+        let mut grown_tiers = self.plants.take_finished();
+        if !grown_tiers.is_empty() {
+            grown_tiers.sort_by_key(|t| t.tier);
+            let names = grown_tiers.iter().map(|t| format!("T{}", t.tier)).collect::<Vec<_>>().join(", ");
+            let ready: usize = grown_tiers.iter().map(|t| t.grown).sum();
+            self.notify("Plants grown", format!("All {names} plants have finished growing ({ready} ready to harvest)"));
         }
         if self.is_loading {
             self.notifications.clear();

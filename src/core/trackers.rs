@@ -490,6 +490,8 @@ pub struct PlantTracker {
     /// Last list (for badges).
     pub plants: Vec<Plant>,
     has_loaded: bool,
+    /// Tiers that finished, waiting while another plant is about to.
+    pending: Vec<TierSummary>,
     finished: Vec<TierSummary>,
 }
 
@@ -538,8 +540,23 @@ impl PlantTracker {
         (!parts.is_empty()).then(|| parts.join("; "))
     }
 
+    /// Release finished tiers once no growing plant (any tier) finishes
+    /// within `PASSIVE_BATCH_GAP` (user request, like passive crafts):
+    /// tiers finishing close together are one notification. A plant whose
+    /// end passed more than the gap ago (relay hasn't flipped it) doesn't
+    /// hold them back.
+    pub fn tick(&mut self, now: f64) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let about_to_finish = self.tiers.iter().flat_map(|t| &t.growth_ends).any(|end| (end - now).abs() <= PASSIVE_BATCH_GAP);
+        if !about_to_finish {
+            self.finished.append(&mut self.pending);
+        }
+    }
+
     /// The first list sets the baseline (no notifications).
-    pub fn update(&mut self, plants: &[Plant]) {
+    pub fn update(&mut self, plants: &[Plant], now: f64) {
         self.plants = plants.to_vec();
         let mut by_tier: BTreeMap<i64, TierSummary> = BTreeMap::new();
         for plant in plants {
@@ -570,11 +587,13 @@ impl PlantTracker {
                     && tier.growing == 0
                     && tier.grown > before.grown
                 {
-                    self.finished.push(tier.clone());
+                    self.pending.retain(|p| p.tier != tier.tier);
+                    self.pending.push(tier.clone());
                 }
             }
         }
         self.has_loaded = true;
+        self.tick(now);
     }
 }
 
@@ -590,11 +609,18 @@ pub struct PassiveGroup {
     pub has_unknown_end: bool,
 }
 
+/// Passive crafts started in bulk finish a few seconds apart (user: 5–10s
+/// between batches): a finished one waits while another of the same item
+/// finishes within this many seconds, so the bulk is one notification.
+pub const PASSIVE_BATCH_GAP: f64 = 20.0;
+
 #[derive(Default)]
 pub struct PassiveCraftTracker {
     pub crafts: Vec<PassiveCraft>,
     pub has_loaded: bool,
     finished_ids: HashSet<String>,
+    /// Finished, waiting for the rest of their bulk.
+    pending: Vec<PassiveCraft>,
     finished: Vec<PassiveCraft>,
 }
 
@@ -620,7 +646,19 @@ impl PassiveCraftTracker {
             .cloned()
             .collect();
         self.finished_ids.extend(newly.iter().map(|c| c.id.clone()));
-        self.finished.extend(newly);
+        self.pending.extend(newly);
+        // Release an item's finished crafts once no other craft of that
+        // item (still running, end known) finishes within the gap. Queued
+        // ones (no end yet) don't hold it back.
+        let waiting: HashSet<&str> = self
+            .crafts
+            .iter()
+            .filter(|c| !c.is_finished(now) && c.ends_at().is_some_and(|end| end - now <= PASSIVE_BATCH_GAP))
+            .map(|c| c.name.as_str())
+            .collect();
+        let (hold, release): (Vec<_>, Vec<_>) = std::mem::take(&mut self.pending).into_iter().partition(|c| waiting.contains(c.name.as_str()));
+        self.pending = hold;
+        self.finished.extend(release);
     }
 
     pub fn take_finished(&mut self) -> Vec<PassiveCraft> {
@@ -920,6 +958,40 @@ mod tests {
     }
 
     #[test]
+    fn passive_bulk_is_one_notification() {
+        let craft = |id: &str, name: &str, end: f64| PassiveCraft {
+            id: id.into(),
+            name: name.into(),
+            building: "Loom".into(),
+            started_at: Some(end - 60.0),
+            reported_complete: false,
+            duration: Some(60.0),
+            kind: None,
+            tier: None,
+        };
+        let mut passive = PassiveCraftTracker::default();
+        // A bulk 7s apart, another item, and a far-off one of the same item.
+        let list = vec![
+            craft("1", "Cloth", 100.0),
+            craft("2", "Cloth", 107.0),
+            craft("3", "Cloth", 114.0),
+            craft("4", "Rope", 100.0),
+            craft("5", "Cloth", 500.0),
+        ];
+        passive.update(list, 0.0);
+        let names = |p: &mut PassiveCraftTracker| p.take_finished().iter().map(|c| c.id.clone()).collect::<Vec<_>>();
+        passive.tick(100.0);
+        assert_eq!(names(&mut passive), vec!["4"]);
+        passive.tick(107.0);
+        assert!(names(&mut passive).is_empty());
+        // The last of the bulk: all three at once (500 is too far off).
+        passive.tick(114.0);
+        assert_eq!(names(&mut passive), vec!["1", "2", "3"]);
+        passive.tick(500.0);
+        assert_eq!(names(&mut passive), vec!["5"]);
+    }
+
+    #[test]
     fn finished_crafts_stay_until_collected() {
         let info = |id: &str, progress| CraftInfo {
             id: id.into(),
@@ -1035,7 +1107,33 @@ mod tests {
             growth_duration: None,
         };
         let mut tracker = PlantTracker::default();
-        tracker.update(&[plant("Grown Starbulb", 1), plant("Planted Embergrain", 2), plant("Sift", 1)]);
+        tracker.update(&[plant("Grown Starbulb", 1), plant("Planted Embergrain", 2), plant("Sift", 1)], 0.0);
         assert_eq!(tracker.summary().as_deref(), Some("T1 grown; T2 needs fertilizer"));
+    }
+
+    #[test]
+    fn plant_tiers_finishing_together_are_one_notification() {
+        let growing = |tier, end| Plant {
+            name: "Growing Basic Embergrain".into(),
+            tier,
+            reported_end: Some(end),
+            started_growing_at: None,
+            growth_duration: None,
+        };
+        let grown = |tier| Plant { name: "Grown Basic Embergrain".into(), reported_end: None, ..growing(tier, 0.0) };
+        let tiers = |t: &mut PlantTracker| t.take_finished().iter().map(|s| s.tier).collect::<Vec<_>>();
+        let mut tracker = PlantTracker::default();
+        tracker.update(&[growing(1, 100.0), growing(2, 108.0), growing(3, 900.0)], 0.0);
+        // T1 done; T2 finishes in 8s: wait.
+        tracker.update(&[grown(1), growing(2, 108.0), growing(3, 900.0)], 100.0);
+        assert!(tiers(&mut tracker).is_empty());
+        tracker.tick(105.0);
+        assert!(tiers(&mut tracker).is_empty());
+        // T2 done too; T3 is far off: both at once.
+        tracker.update(&[grown(1), grown(2), growing(3, 900.0)], 108.0);
+        assert_eq!(tiers(&mut tracker), vec![1, 2]);
+        // T3 later, on its own.
+        tracker.update(&[grown(1), grown(2), grown(3)], 900.0);
+        assert_eq!(tiers(&mut tracker), vec![3]);
     }
 }
